@@ -66,7 +66,7 @@ pub fn definitions() -> Vec<Value> {
 			"List posts from Reddit's site-wide feeds. Use for 'what's trending on Reddit' when no specific community is named.",
 			schema(
 				json!({
-					"feed": s_enum("Which site-wide feed. 'popular' is curated and excludes some NSFW communities; 'all' is unfiltered.", &["popular", "all"], "popular"),
+					"feed": s_enum("Which site-wide feed. 'popular' is curated and excludes some NSFW communities, 'all' is unfiltered, 'best' is Reddit's ranked default feed.", &["popular", "all", "best"], "popular"),
 					"sort": s_enum("Listing order.", &reddit::LISTING_SORTS, "hot"),
 					"time": s_enum("Time window. Only affects sort=top and sort=controversial.", &reddit::TIME_FILTERS, "day"),
 					"limit": int(LIMIT_DESC, 1, 100, 25),
@@ -200,6 +200,19 @@ pub fn definitions() -> Vec<Value> {
 			),
 		),
 		tool(
+			"get_user_gilded",
+			"Get a user's awarded content",
+			"List posts and comments by an account that received awards. A quick proxy for their best-received contributions.",
+			schema(
+				json!({
+					"username": s("Username."),
+					"limit": int(LIMIT_DESC, 1, 100, 25),
+					"after": s(AFTER_DESC),
+				}),
+				&["username"],
+			),
+		),
+		tool(
 			"get_subreddit_about",
 			"Get subreddit details",
 			"Fetch a community's description, subscriber count, and settings. Use this to judge how large or active a subreddit is before browsing it.",
@@ -241,15 +254,113 @@ pub fn definitions() -> Vec<Value> {
 			),
 		),
 		tool(
-			"get_popular_subreddits",
-			"List popular subreddits",
-			"Fetch the communities Reddit currently ranks as most popular. Use for open-ended discovery; use search_subreddits when looking for a specific topic.",
+			"list_subreddits",
+			"List subreddits by category",
+			"Enumerate communities Reddit ranks as popular, newly created, or in its default set. Use for open-ended discovery; use search_subreddits when looking for a specific topic.",
 			schema(
 				json!({
+					"kind": s_enum("Which catalogue to list.", &["popular", "new", "default"], "popular"),
 					"limit": int(LIMIT_DESC, 1, 100, 25),
 					"after": s(AFTER_DESC),
 				}),
 				&[],
+			),
+		),
+		tool(
+			"get_subreddit_comments",
+			"Get a subreddit's recent comments",
+			"Stream the newest comments across an entire subreddit, independent of any single post. Use this to gauge what a community is actively discussing; use get_post when you care about one thread.",
+			schema(
+				json!({
+					"subreddit": s("Subreddit name."),
+					"limit": int(LIMIT_DESC, 1, 100, 25),
+					"after": s(AFTER_DESC),
+				}),
+				&["subreddit"],
+			),
+		),
+		tool(
+			"get_sticky_post",
+			"Get a subreddit's pinned post",
+			"Fetch a community's pinned post with its comments. These are usually megathreads, rules posts, or recurring discussion threads, so this is often the best starting point for a subreddit.",
+			schema(
+				json!({
+					"subreddit": s("Subreddit name."),
+					"num": int("Which sticky slot; a subreddit may pin two.", 1, 2, 1),
+					"max_depth": int("How many reply levels to descend.", 0, 10, 4),
+				}),
+				&["subreddit"],
+			),
+		),
+		tool(
+			"get_comment_thread",
+			"Get one comment and its replies",
+			"Fetch a single comment, the replies beneath it, and optionally its parent chain. Use this to follow a specific subthread without pulling the whole post, and when someone links a comment permalink.",
+			schema(
+				json!({
+					"post_id": s(POST_ID_DESC),
+					"comment_id": s("Comment id, with or without the t1_ prefix."),
+					"context": int("How many ancestors to include above the comment.", 0, 8, 2),
+					"comment_sort": s_enum("Reply ordering.", &reddit::COMMENT_SORTS, "confidence"),
+					"max_depth": int("How many reply levels to descend.", 0, 10, 4),
+				}),
+				&["post_id", "comment_id"],
+			),
+		),
+		tool(
+			"browse_domain",
+			"Get posts linking to a domain",
+			"List submissions across all of Reddit that link to a given site. Use this to find where an article or site has been discussed.",
+			schema(
+				json!({
+					"domain": s("Domain such as 'github.com'. A full URL is accepted and reduced to its host."),
+					"sort": s_enum("Listing order.", &reddit::LISTING_SORTS, "hot"),
+					"time": s_enum("Time window. Only affects top and controversial.", &reddit::TIME_FILTERS, "all"),
+					"limit": int(LIMIT_DESC, 1, 100, 25),
+					"after": s(AFTER_DESC),
+				}),
+				&["domain"],
+			),
+		),
+		tool(
+			"lookup",
+			"Look up items by id or URL",
+			"Resolve posts, comments, or subreddits by fullname (t3_/t1_/t5_) in one batched call, or find the Reddit post that submitted a given URL. Cheaper than fetching each item separately.",
+			schema(
+				json!({
+					"ids": json!({
+						"type": "array",
+						"description": "Fullnames such as ['t3_abc123', 't1_def456']. Mutually exclusive with url.",
+						"items": {"type": "string"},
+					}),
+					"url": s("An external URL to find submissions of. Mutually exclusive with ids."),
+				}),
+				&[],
+			),
+		),
+		tool(
+			"get_user_trophies",
+			"Get a user's trophies",
+			"Fetch the awards and badges on an account's profile, such as cake day and moderator trophies.",
+			schema(json!({"username": s("Username.")}), &["username"]),
+		),
+		tool(
+			"get_user_moderated_subreddits",
+			"Get subreddits a user moderates",
+			"List the communities an account moderates. Note the reverse direction is not available: Reddit refuses to list a subreddit's moderators to an anonymous caller.",
+			schema(json!({"username": s("Username.")}), &["username"]),
+		),
+		tool(
+			"get_wiki_revisions",
+			"Get wiki edit history",
+			"List revisions to a subreddit's wiki, either across all pages or for one page. Use this to see when community rules or FAQs last changed.",
+			schema(
+				json!({
+					"subreddit": s("Subreddit name."),
+					"page": s("Restrict to one page, e.g. 'index'. Omit for all pages."),
+					"limit": int(LIMIT_DESC, 1, 100, 25),
+				}),
+				&["subreddit"],
 			),
 		),
 		tool(
@@ -388,7 +499,38 @@ pub async fn call(name: &str, args: &Value) -> Result<Value, String> {
 		"get_subreddit_rules" => reddit::get_subreddit_rules(&req_str(args, "subreddit")?).await,
 		"get_subreddit_wiki" => reddit::get_wiki(&req_str(args, "subreddit")?, opt_str(args, "page").as_deref()).await,
 		"get_duplicates" => reddit::get_duplicates(&req_str(args, "post_id")?, limit_of(args), after).await,
-		"get_popular_subreddits" => reddit::get_popular_subreddits(limit_of(args), after).await,
+		"list_subreddits" => reddit::list_subreddits(&str_or(args, "kind", "popular"), limit_of(args), after).await,
+		"get_subreddit_comments" => reddit::get_subreddit_comments(&req_str(args, "subreddit")?, limit_of(args), after).await,
+		"get_sticky_post" => {
+			let num = args.get("num").and_then(Value::as_u64).unwrap_or(1);
+			let max_depth = args.get("max_depth").and_then(Value::as_u64).unwrap_or(4).min(10) as u32;
+			reddit::get_sticky(&req_str(args, "subreddit")?, num, max_depth).await
+		}
+		"get_comment_thread" => {
+			let context = args.get("context").and_then(Value::as_u64).unwrap_or(2);
+			let max_depth = args.get("max_depth").and_then(Value::as_u64).unwrap_or(4).min(10) as u32;
+			reddit::get_comment_thread(
+				&req_str(args, "post_id")?,
+				&req_str(args, "comment_id")?,
+				context,
+				&str_or(args, "comment_sort", "confidence"),
+				max_depth,
+			)
+			.await
+		}
+		"browse_domain" => reddit::browse_domain(&req_str(args, "domain")?, &str_or(args, "sort", "hot"), &str_or(args, "time", "all"), limit_of(args), after).await,
+		"lookup" => {
+			let ids: Vec<String> = args
+				.get("ids")
+				.and_then(Value::as_array)
+				.map(|a| a.iter().filter_map(|v| v.as_str().map(ToString::to_string)).collect())
+				.unwrap_or_default();
+			reddit::lookup(&ids, opt_str(args, "url").as_deref()).await
+		}
+		"get_user_trophies" => reddit::get_user_trophies(&req_str(args, "username")?).await,
+		"get_user_moderated_subreddits" => reddit::get_user_moderated_subreddits(&req_str(args, "username")?).await,
+		"get_user_gilded" => reddit::get_user_listing(&req_str(args, "username")?, "gilded", "new", "all", limit_of(args), after).await,
+		"get_wiki_revisions" => reddit::get_wiki_revisions(&req_str(args, "subreddit")?, opt_str(args, "page").as_deref(), limit_of(args)).await,
 		"reddit_api_raw" => reddit::raw_api(&req_str(args, "path")?).await,
 		other => Err(format!("unimplemented tool: {other}")),
 	}

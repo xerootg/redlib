@@ -422,8 +422,287 @@ pub async fn browse_subreddit(sub: &str, sort: &str, time: Option<&str>, limit: 
 }
 
 pub async fn browse_frontpage(feed: &str, sort: &str, time: Option<&str>, limit: u64, after: Option<&str>) -> Result<Value, String> {
-	validate("feed", feed, &["popular", "all"])?;
+	validate("feed", feed, &["popular", "all", "best"])?;
+
+	// `best` is served from the root, not from a pseudo-subreddit, so it
+	// cannot go through browse_subreddit like the other two.
+	if feed == "best" {
+		let q = query(&[
+			("limit", limit.to_string()),
+			("after", after.unwrap_or_default().to_string()),
+			("raw_json", "1".to_string()),
+		]);
+		let res = get(format!("/best.json?{q}"), true).await?;
+		return Ok(listing_result(&res, project_children(&res, project_post)));
+	}
+
 	browse_subreddit(feed, sort, time, limit, after).await
+}
+
+/// Applies a projection to a standard listing's `data.children`.
+fn project_children(res: &Value, f: fn(&Value) -> Value) -> Vec<Value> {
+	res
+		.get("data")
+		.and_then(|d| d.get("children"))
+		.and_then(Value::as_array)
+		.map(|c| c.iter().map(f).collect())
+		.unwrap_or_default()
+}
+
+/// Posts across all subreddits that link to a given domain.
+pub async fn browse_domain(domain: &str, sort: &str, time: &str, limit: u64, after: Option<&str>) -> Result<Value, String> {
+	validate("sort", sort, &LISTING_SORTS)?;
+	validate("time", time, &TIME_FILTERS)?;
+
+	let domain = domain
+		.trim()
+		.trim_start_matches("http://")
+		.trim_start_matches("https://")
+		.trim_start_matches("www.")
+		.split('/')
+		.next()
+		.unwrap_or_default();
+	if domain.is_empty() {
+		return Err("domain is required".to_string());
+	}
+
+	let q = query(&[
+		("limit", limit.to_string()),
+		("t", if sort == "top" || sort == "controversial" { time.to_string() } else { String::new() }),
+		("after", after.unwrap_or_default().to_string()),
+		("raw_json", "1".to_string()),
+	]);
+
+	let res = get(format!("/domain/{domain}/{sort}.json?{q}"), true).await?;
+	Ok(listing_result(&res, project_children(&res, project_post)))
+}
+
+/// Recent comments across a whole subreddit, newest first.
+///
+/// This is the comment firehose, unrelated to any single post -- useful for
+/// gauging what a community is actively talking about.
+pub async fn get_subreddit_comments(sub: &str, limit: u64, after: Option<&str>) -> Result<Value, String> {
+	let sub = normalize_subreddit(sub);
+	if sub.is_empty() {
+		return Err("subreddit is required".to_string());
+	}
+
+	let q = query(&[
+		("limit", limit.to_string()),
+		("after", after.unwrap_or_default().to_string()),
+		("raw_json", "1".to_string()),
+	]);
+
+	let res = get(format!("/r/{sub}/comments.json?{q}"), true).await?;
+	let children = res.get("data").and_then(|d| d.get("children")).and_then(Value::as_array).cloned().unwrap_or_default();
+	Ok(listing_result(&res, project_mixed(&children)))
+}
+
+/// A subreddit's pinned post. `num` is 1 or 2 -- Reddit allows two.
+pub async fn get_sticky(sub: &str, num: u64, max_depth: u32) -> Result<Value, String> {
+	let sub = normalize_subreddit(sub);
+	if sub.is_empty() {
+		return Err("subreddit is required".to_string());
+	}
+	if num != 1 && num != 2 {
+		return Err(format!("invalid num: {num} (a subreddit has at most two stickies, so this must be 1 or 2)"));
+	}
+
+	// Reddit answers 404 when the slot is empty, which is an ordinary state --
+	// most subreddits pin nothing. Passing the raw HTTP error through would
+	// read as a broken call rather than "there isn't one".
+	let res = get(format!("/r/{sub}/about/sticky.json?num={num}&raw_json=1"), true).await.map_err(|e| {
+		if e.contains("404") {
+			format!("r/{sub} has no sticky post in slot {num}")
+		} else {
+			e
+		}
+	})?;
+
+	// Same two-element [post, comments] shape as /comments/<id>.
+	let arr = res.as_array().ok_or_else(|| format!("r/{sub} has no sticky post in slot {num}"))?;
+	let post = arr
+		.first()
+		.and_then(|l| l.get("data"))
+		.and_then(|d| d.get("children"))
+		.and_then(Value::as_array)
+		.and_then(|c| c.first())
+		.map(project_post)
+		.ok_or_else(|| format!("r/{sub} has no sticky post at position {num}"))?;
+
+	let comments = arr.get(1).map(|l| project_comments(l, 0, max_depth)).unwrap_or_default();
+	Ok(json!({ "post": post, "comments": comments }))
+}
+
+/// One comment plus the replies beneath it, and optionally its ancestors.
+///
+/// Reddit exposes this through the post endpoint with a `comment` parameter,
+/// which is why this takes both ids.
+pub async fn get_comment_thread(post_id: &str, comment_id: &str, context: u64, sort: &str, max_depth: u32) -> Result<Value, String> {
+	validate("comment_sort", sort, &COMMENT_SORTS)?;
+	let post = extract_post_id(post_id)?;
+	let comment = comment_id.trim().trim_start_matches("t1_");
+	if comment.is_empty() {
+		return Err("comment_id is required".to_string());
+	}
+
+	let q = query(&[
+		("comment", comment.to_string()),
+		("context", context.min(8).to_string()),
+		("sort", sort.to_string()),
+		("raw_json", "1".to_string()),
+	]);
+
+	let res = get(format!("/comments/{post}.json?{q}"), true).await?;
+	let arr = res.as_array().ok_or("unexpected response shape from Reddit")?;
+
+	let post_obj = arr
+		.first()
+		.and_then(|l| l.get("data"))
+		.and_then(|d| d.get("children"))
+		.and_then(Value::as_array)
+		.and_then(|c| c.first())
+		.map(project_post);
+
+	let comments = arr.get(1).map(|l| project_comments(l, 0, max_depth)).unwrap_or_default();
+	if comments.is_empty() {
+		return Err(format!("comment {comment} was not found on post {post}"));
+	}
+
+	Ok(json!({ "post": post_obj, "comments": comments }))
+}
+
+/// Looks things up by fullname (`t3_abc`, `t1_def`, `t5_ghi`) or by URL.
+///
+/// The cheapest way to resolve a batch of ids in one call, and the only way to
+/// go from an arbitrary link back to the post that submitted it.
+pub async fn lookup(ids: &[String], url: Option<&str>) -> Result<Value, String> {
+	let q = if let Some(url) = url.map(str::trim).filter(|u| !u.is_empty()) {
+		query(&[("url", url.to_string()), ("raw_json", "1".to_string())])
+	} else if !ids.is_empty() {
+		query(&[("id", ids.join(",")), ("raw_json", "1".to_string())])
+	} else {
+		return Err("provide either ids or url".to_string());
+	};
+
+	let res = get(format!("/api/info.json?{q}"), true).await?;
+	let children = res.get("data").and_then(|d| d.get("children")).and_then(Value::as_array).cloned().unwrap_or_default();
+	Ok(listing_result(&res, project_mixed(&children)))
+}
+
+/// `kind` is popular / new / default.
+pub async fn list_subreddits(kind: &str, limit: u64, after: Option<&str>) -> Result<Value, String> {
+	validate("kind", kind, &["popular", "new", "default"])?;
+	let q = query(&[
+		("limit", limit.to_string()),
+		("after", after.unwrap_or_default().to_string()),
+		("raw_json", "1".to_string()),
+	]);
+	let res = get(format!("/subreddits/{kind}.json?{q}"), false).await?;
+	Ok(listing_result(&res, project_children(&res, project_subreddit)))
+}
+
+pub async fn get_user_trophies(name: &str) -> Result<Value, String> {
+	let name = normalize_username(name);
+	if name.is_empty() {
+		return Err("username is required".to_string());
+	}
+
+	let res = get(format!("/user/{name}/trophies.json?raw_json=1"), false).await?;
+	let trophies: Vec<Value> = res
+		.get("data")
+		.and_then(|d| d.get("trophies"))
+		.and_then(Value::as_array)
+		.map(|ts| {
+			ts.iter()
+				.filter_map(|t| {
+					let d = t.get("data")?;
+					Some(json!({
+						"name": str_of(d, "name"),
+						"description": str_of(d, "description"),
+						"granted_at": num_of(d, "granted_at"),
+						"url": str_of(d, "url"),
+					}))
+				})
+				.collect()
+		})
+		.unwrap_or_default();
+
+	Ok(json!({ "username": name, "count": trophies.len(), "trophies": trophies }))
+}
+
+/// Subreddits an account moderates.
+///
+/// Note this works even though `/r/<sub>/about/moderators` does not: Reddit
+/// permits the user-to-subreddit direction anonymously but not the reverse.
+pub async fn get_user_moderated_subreddits(name: &str) -> Result<Value, String> {
+	let name = normalize_username(name);
+	if name.is_empty() {
+		return Err("username is required".to_string());
+	}
+
+	let res = get(format!("/user/{name}/moderated_subreddits.json?raw_json=1"), false).await?;
+
+	// `data` is a bare array here, not the usual listing-with-children.
+	let subs: Vec<Value> = res
+		.get("data")
+		.and_then(Value::as_array)
+		.map(|ss| {
+			ss.iter()
+				.map(|s| {
+					json!({
+						"name": str_of(s, "display_name"),
+						"title": str_of(s, "title"),
+						"url": str_of(s, "url").map(|u| format!("https://www.reddit.com{u}")),
+						"subscribers": num_of(s, "subscribers"),
+						"over_18": bool_of(s, "over_18"),
+						"subreddit_type": str_of(s, "subreddit_type"),
+					})
+				})
+				.collect()
+		})
+		.unwrap_or_default();
+
+	Ok(json!({ "username": name, "count": subs.len(), "subreddits": subs }))
+}
+
+/// Edit history for a subreddit's wiki, either overall or for one page.
+pub async fn get_wiki_revisions(sub: &str, page: Option<&str>, limit: u64) -> Result<Value, String> {
+	let sub = normalize_subreddit(sub);
+	if sub.is_empty() {
+		return Err("subreddit is required".to_string());
+	}
+
+	let path = match page.map(str::trim).filter(|p| !p.is_empty()) {
+		Some(page) => format!("/r/{sub}/wiki/revisions/{page}.json?limit={limit}&raw_json=1"),
+		None => format!("/r/{sub}/wiki/revisions.json?limit={limit}&raw_json=1"),
+	};
+
+	let res = get(path, true).await?;
+	if let Some(reason) = str_of(&res, "reason") {
+		return Err(format!("wiki revisions for r/{sub} are unavailable: {reason}"));
+	}
+
+	let revisions: Vec<Value> = res
+		.get("data")
+		.and_then(|d| d.get("children"))
+		.and_then(Value::as_array)
+		.map(|rs| {
+			rs.iter()
+				.map(|r| {
+					json!({
+						"id": str_of(r, "id"),
+						"page": str_of(r, "page"),
+						"timestamp": num_of(r, "timestamp"),
+						"reason": str_of(r, "reason"),
+						"author": r.get("author").and_then(|a| a.get("data")).and_then(|d| str_of(d, "name")),
+					})
+				})
+				.collect()
+		})
+		.unwrap_or_default();
+
+	Ok(json!({ "subreddit": sub, "count": revisions.len(), "revisions": revisions }))
 }
 
 /// Fetches a post together with its comment tree.
@@ -586,7 +865,7 @@ pub async fn get_user(name: &str) -> Result<Value, String> {
 
 /// `listing` is one of submitted / comments / overview.
 pub async fn get_user_listing(name: &str, listing: &str, sort: &str, time: &str, limit: u64, after: Option<&str>) -> Result<Value, String> {
-	validate("listing", listing, &["submitted", "comments", "overview"])?;
+	validate("listing", listing, &["submitted", "comments", "overview", "gilded"])?;
 	validate("sort", sort, &["hot", "new", "top", "controversial"])?;
 	validate("time", time, &TIME_FILTERS)?;
 
@@ -681,27 +960,6 @@ pub async fn get_wiki(sub: &str, page: Option<&str>) -> Result<Value, String> {
 	}
 }
 
-/// Communities Reddit currently ranks as most popular.
-///
-/// Note this is `/subreddits/popular`, not `/api/trending_subreddits`. The
-/// latter is only served by www.reddit.com and 404s on the OAuth host that
-/// [`crate::client::json`] talks to.
-pub async fn get_popular_subreddits(limit: u64, after: Option<&str>) -> Result<Value, String> {
-	let qs = query(&[
-		("limit", limit.to_string()),
-		("after", after.unwrap_or_default().to_string()),
-		("raw_json", "1".to_string()),
-	]);
-	let res = get(format!("/subreddits/popular.json?{qs}"), false).await?;
-	let items: Vec<Value> = res
-		.get("data")
-		.and_then(|d| d.get("children"))
-		.and_then(Value::as_array)
-		.map(|c| c.iter().map(project_subreddit).collect())
-		.unwrap_or_default();
-	Ok(listing_result(&res, items))
-}
-
 /// Other submissions of the same link -- Reddit's "other discussions".
 pub async fn get_duplicates(post_id: &str, limit: u64, after: Option<&str>) -> Result<Value, String> {
 	let id = extract_post_id(post_id)?;
@@ -750,7 +1008,7 @@ pub async fn raw_api(path: &str) -> Result<Value, String> {
 
 	// Allow the handful of /api/ read endpoints we know are safe; reject the
 	// rest, which are all mutations.
-	const ALLOWED_API_READS: [&str; 3] = ["/api/morechildren", "/api/info", "/api/subreddit_autocomplete"];
+	const ALLOWED_API_READS: [&str; 4] = ["/api/morechildren", "/api/info", "/api/subreddit_autocomplete", "/api/multi"];
 	if path.starts_with("/api/") && !ALLOWED_API_READS.iter().any(|a| path.starts_with(a)) {
 		return Err(format!(
 			"refusing to call {path}: only read endpoints are permitted. Allowed /api/ paths: {}",
@@ -758,7 +1016,19 @@ pub async fn raw_api(path: &str) -> Result<Value, String> {
 		));
 	}
 
-	get(path.to_string(), true).await
+	let res = get(path.to_string(), true).await?;
+
+	// Some endpoints answer 200 with an error envelope instead of an HTTP
+	// error -- the flair endpoints return {"json":{"errors":[["USER_REQUIRED",
+	// ...]]}} for an anonymous token. Without this the caller would treat a
+	// refusal as a successful empty result.
+	if let Some(errors) = res.get("json").and_then(|j| j.get("errors")).and_then(Value::as_array) {
+		if !errors.is_empty() {
+			return Err(format!("Reddit refused {path}: {}", Value::Array(errors.clone())));
+		}
+	}
+
+	Ok(res)
 }
 
 #[cfg(test)]

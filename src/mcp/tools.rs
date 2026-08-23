@@ -51,7 +51,10 @@ pub fn definitions() -> Vec<Value> {
 			"List posts in one subreddit. Use this when the user names a specific community. Returns post metadata and self-post text, but not comments -- follow up with get_post for those.",
 			schema(
 				json!({
-					"subreddit": s("Subreddit name. 'rust', 'r/rust', and '/r/rust' are all accepted."),
+					"subreddit": s(
+						"Subreddit name. 'rust', 'r/rust', and '/r/rust' are all accepted. \
+Several may be combined with '+' to read them as one feed, e.g. 'rust+golang+cpp'.",
+					),
 					"sort": s_enum("Listing order.", &reddit::LISTING_SORTS, "hot"),
 					"time": s_enum("Time window. Only affects sort=top and sort=controversial.", &reddit::TIME_FILTERS, "day"),
 					"limit": int(LIMIT_DESC, 1, 100, 25),

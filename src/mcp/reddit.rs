@@ -94,7 +94,9 @@ pub fn normalize_username(user: &str) -> String {
 pub fn extract_post_id(input: &str) -> Result<String, String> {
 	let input = input.trim();
 	if input.is_empty() {
-		return Err("post id is empty".to_string());
+		return Err(
+			"post_id is empty. Post ids come from browse_subreddit, search_posts, or lookup -- take the \"id\" field of a result. A full Reddit URL also works.".to_string(),
+		);
 	}
 
 	if let Some(rest) = input.strip_prefix("t3_") {
@@ -400,7 +402,7 @@ pub async fn browse_subreddit(sub: &str, sort: &str, time: Option<&str>, limit: 
 
 	let sub = normalize_subreddit(sub);
 	if sub.is_empty() {
-		return Err("subreddit is required".to_string());
+		return Err("subreddit is required. Pass a community name such as \"rust\", or call search_subreddits to find one.".to_string());
 	}
 
 	let q = query(&[
@@ -463,7 +465,7 @@ pub async fn browse_domain(domain: &str, sort: &str, time: &str, limit: u64, aft
 		.next()
 		.unwrap_or_default();
 	if domain.is_empty() {
-		return Err("domain is required".to_string());
+		return Err("domain is required. Pass a site such as \"github.com\".".to_string());
 	}
 
 	let q = query(&[
@@ -484,7 +486,7 @@ pub async fn browse_domain(domain: &str, sort: &str, time: &str, limit: u64, aft
 pub async fn get_subreddit_comments(sub: &str, limit: u64, after: Option<&str>) -> Result<Value, String> {
 	let sub = normalize_subreddit(sub);
 	if sub.is_empty() {
-		return Err("subreddit is required".to_string());
+		return Err("subreddit is required. Pass a community name such as \"rust\", or call search_subreddits to find one.".to_string());
 	}
 
 	let q = query(&[
@@ -502,7 +504,7 @@ pub async fn get_subreddit_comments(sub: &str, limit: u64, after: Option<&str>) 
 pub async fn get_sticky(sub: &str, num: u64, max_depth: u32) -> Result<Value, String> {
 	let sub = normalize_subreddit(sub);
 	if sub.is_empty() {
-		return Err("subreddit is required".to_string());
+		return Err("subreddit is required. Pass a community name such as \"rust\", or call search_subreddits to find one.".to_string());
 	}
 	if num != 1 && num != 2 {
 		return Err(format!("invalid num: {num} (a subreddit has at most two stickies, so this must be 1 or 2)"));
@@ -543,7 +545,7 @@ pub async fn get_comment_thread(post_id: &str, comment_id: &str, context: u64, s
 	let post = extract_post_id(post_id)?;
 	let comment = comment_id.trim().trim_start_matches("t1_");
 	if comment.is_empty() {
-		return Err("comment_id is required".to_string());
+		return Err("comment_id is required. Take the \"id\" field of a comment returned by get_post.".to_string());
 	}
 
 	let q = query(&[
@@ -566,7 +568,9 @@ pub async fn get_comment_thread(post_id: &str, comment_id: &str, context: u64, s
 
 	let comments = arr.get(1).map(|l| project_comments(l, 0, max_depth)).unwrap_or_default();
 	if comments.is_empty() {
-		return Err(format!("comment {comment} was not found on post {post}"));
+		return Err(format!(
+			"comment {comment} was not found on post {post}. Check that both ids came from the same post -- call get_post first and take a comment id from its result."
+		));
 	}
 
 	Ok(json!({ "post": post_obj, "comments": comments }))
@@ -582,7 +586,7 @@ pub async fn lookup(ids: &[String], url: Option<&str>) -> Result<Value, String> 
 	} else if !ids.is_empty() {
 		query(&[("id", ids.join(",")), ("raw_json", "1".to_string())])
 	} else {
-		return Err("provide either ids or url".to_string());
+		return Err("provide either ids or url. Use ids for fullnames like \"t3_abc123\", or url to find the post that submitted a link.".to_string());
 	};
 
 	let res = get(format!("/api/info.json?{q}"), true).await?;
@@ -605,7 +609,7 @@ pub async fn list_subreddits(kind: &str, limit: u64, after: Option<&str>) -> Res
 pub async fn get_user_trophies(name: &str) -> Result<Value, String> {
 	let name = normalize_username(name);
 	if name.is_empty() {
-		return Err("username is required".to_string());
+		return Err("username is required. Pass an account name such as \"spez\", or call search_users to find one.".to_string());
 	}
 
 	let res = get(format!("/user/{name}/trophies.json?raw_json=1"), false).await?;
@@ -638,7 +642,7 @@ pub async fn get_user_trophies(name: &str) -> Result<Value, String> {
 pub async fn get_user_moderated_subreddits(name: &str) -> Result<Value, String> {
 	let name = normalize_username(name);
 	if name.is_empty() {
-		return Err("username is required".to_string());
+		return Err("username is required. Pass an account name such as \"spez\", or call search_users to find one.".to_string());
 	}
 
 	let res = get(format!("/user/{name}/moderated_subreddits.json?raw_json=1"), false).await?;
@@ -670,7 +674,7 @@ pub async fn get_user_moderated_subreddits(name: &str) -> Result<Value, String> 
 pub async fn get_wiki_revisions(sub: &str, page: Option<&str>, limit: u64) -> Result<Value, String> {
 	let sub = normalize_subreddit(sub);
 	if sub.is_empty() {
-		return Err("subreddit is required".to_string());
+		return Err("subreddit is required. Pass a community name such as \"rust\", or call search_subreddits to find one.".to_string());
 	}
 
 	let path = match page.map(str::trim).filter(|p| !p.is_empty()) {
@@ -722,7 +726,7 @@ pub async fn get_post(post_id: &str, sort: &str, limit: u64, max_depth: u32) -> 
 		.and_then(Value::as_array)
 		.and_then(|c| c.first())
 		.map(project_post)
-		.ok_or("post not found")?;
+		.ok_or("no post found with that id. Post ids come from browse_subreddit, search_posts, or lookup; they cannot be constructed by hand.")?;
 
 	let comments = arr.get(1).map(|l| project_comments(l, 0, max_depth)).unwrap_or_default();
 
@@ -734,7 +738,7 @@ pub async fn get_more_comments(post_id: &str, comment_ids: &[String], sort: &str
 	validate("comment_sort", sort, &COMMENT_SORTS)?;
 	let id = extract_post_id(post_id)?;
 	if comment_ids.is_empty() {
-		return Err("comment_ids is empty".to_string());
+		return Err("comment_ids is empty. These come from an entry with type \"more\" in a get_post result; copy its comment_ids array here.".to_string());
 	}
 
 	// The api/morechildren endpoint needs a t3_ fullname for link_id.
@@ -781,7 +785,7 @@ pub async fn search_posts(q: &str, sub: Option<&str>, sort: &str, time: &str, li
 	validate("sort", sort, &SEARCH_SORTS)?;
 	validate("time", time, &TIME_FILTERS)?;
 	if q.trim().is_empty() {
-		return Err("query is required".to_string());
+		return Err("query is required. Pass the words to search for.".to_string());
 	}
 
 	let mut pairs = vec![
@@ -816,7 +820,7 @@ pub async fn search_posts(q: &str, sub: Option<&str>, sort: &str, time: &str, li
 
 pub async fn search_subreddits(q: &str, limit: u64, after: Option<&str>) -> Result<Value, String> {
 	if q.trim().is_empty() {
-		return Err("query is required".to_string());
+		return Err("query is required. Pass the words to search for.".to_string());
 	}
 	let qs = query(&[
 		("q", q.to_string()),
@@ -836,7 +840,7 @@ pub async fn search_subreddits(q: &str, limit: u64, after: Option<&str>) -> Resu
 
 pub async fn search_users(q: &str, limit: u64, after: Option<&str>) -> Result<Value, String> {
 	if q.trim().is_empty() {
-		return Err("query is required".to_string());
+		return Err("query is required. Pass the words to search for.".to_string());
 	}
 	let qs = query(&[
 		("q", q.to_string()),
@@ -857,7 +861,7 @@ pub async fn search_users(q: &str, limit: u64, after: Option<&str>) -> Result<Va
 pub async fn get_user(name: &str) -> Result<Value, String> {
 	let name = normalize_username(name);
 	if name.is_empty() {
-		return Err("username is required".to_string());
+		return Err("username is required. Pass an account name such as \"spez\", or call search_users to find one.".to_string());
 	}
 	let res = get(format!("/user/{name}/about.json?raw_json=1"), false).await?;
 	Ok(project_user(&res))
@@ -871,7 +875,7 @@ pub async fn get_user_listing(name: &str, listing: &str, sort: &str, time: &str,
 
 	let name = normalize_username(name);
 	if name.is_empty() {
-		return Err("username is required".to_string());
+		return Err("username is required. Pass an account name such as \"spez\", or call search_users to find one.".to_string());
 	}
 
 	let qs = query(&[
@@ -890,7 +894,7 @@ pub async fn get_user_listing(name: &str, listing: &str, sort: &str, time: &str,
 pub async fn get_subreddit_about(sub: &str) -> Result<Value, String> {
 	let sub = normalize_subreddit(sub);
 	if sub.is_empty() {
-		return Err("subreddit is required".to_string());
+		return Err("subreddit is required. Pass a community name such as \"rust\", or call search_subreddits to find one.".to_string());
 	}
 	let res = get(format!("/r/{sub}/about.json?raw_json=1"), true).await?;
 	Ok(project_subreddit(&res))
@@ -899,7 +903,7 @@ pub async fn get_subreddit_about(sub: &str) -> Result<Value, String> {
 pub async fn get_subreddit_rules(sub: &str) -> Result<Value, String> {
 	let sub = normalize_subreddit(sub);
 	if sub.is_empty() {
-		return Err("subreddit is required".to_string());
+		return Err("subreddit is required. Pass a community name such as \"rust\", or call search_subreddits to find one.".to_string());
 	}
 	let res = get(format!("/r/{sub}/about/rules.json?raw_json=1"), true).await?;
 
@@ -927,7 +931,7 @@ pub async fn get_subreddit_rules(sub: &str) -> Result<Value, String> {
 pub async fn get_wiki(sub: &str, page: Option<&str>) -> Result<Value, String> {
 	let sub = normalize_subreddit(sub);
 	if sub.is_empty() {
-		return Err("subreddit is required".to_string());
+		return Err("subreddit is required. Pass a community name such as \"rust\", or call search_subreddits to find one.".to_string());
 	}
 
 	match page.map(str::trim).filter(|p| !p.is_empty()) {

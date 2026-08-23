@@ -232,17 +232,78 @@ fn initialize(params: &Value) -> Value {
 			"title": "Reddit (via redlib)",
 			"version": env!("CARGO_PKG_VERSION"),
 		},
-		"instructions": "Read-only access to Reddit. Listings, posts with comment trees, search, \
-	users, and subreddit metadata are available. This server authenticates to Reddit anonymously, \
-	so there is no logged-in account: voting, commenting, submitting, subscribing, saved items, and \
-	inbox are not available and no tool exposes them. Post ids may be given bare, as t3_ fullnames, \
-	or as full Reddit URLs. Listings return an `after` cursor to page with.",
+		"instructions": INSTRUCTIONS,
 	})
 }
+
+/// Operating guidance handed to the model on every connection.
+///
+/// This is the only guidance channel that costs the model nothing to receive:
+/// `prompts` are user-invoked slash commands and `resources` are
+/// user-attached, so both require a deliberate action that a weak model will
+/// not take. The spec says a client MAY fold this into the system prompt, and
+/// the MCP project's own evaluation found it moves a small model far more than
+/// a large one -- which is exactly who this text is for.
+///
+/// It is written as decision rules rather than prose, and deliberately does
+/// not restate what `tools/list` already says. The failure modes it targets
+/// are the ones a weak model actually hits: inventing a post id instead of
+/// looking one up, picking a neighbouring tool, paging by guesswork, and
+/// misreading a hidden score as a real zero.
+const INSTRUCTIONS: &str = "\
+Reddit, read-only. No account is signed in: voting, commenting, posting, subscribing, saved \
+items, and inbox do not exist here and no tool performs them. Never state that you have voted, \
+replied, or posted.
+
+CHOOSING A TOOL
+- User names a community -> browse_subreddit. Read several at once with '+': 'rust+golang'.
+- No community named -> browse_frontpage.
+- Looking for something specific -> search_posts. To find the community first -> search_subreddits.
+- Reading the discussion on a post -> get_post.
+- About a person -> get_user_overview. Use get_user only for karma and account age.
+- Given a link and asked who discussed it -> lookup with url, or browse_domain for the whole site.
+
+ORDER MATTERS
+post_id and comment_id come from a previous result. Never invent or guess one. Call \
+browse_subreddit, search_posts, or lookup first, take the 'id' field from an item, then pass it \
+to get_post. A full Reddit URL works in place of an id. If you do not have an id, you are not \
+ready to call get_post.
+
+PAGING
+Listings return 'after'. To get the next page, repeat the same call with 'after' set to that \
+value. If 'after' is null, there are no more results; do not call again.
+
+COST
+The defaults (limit 25, max_depth 4) suit most questions. Raise limit only when the user asks \
+for many items. Raise max_depth only when nested replies matter. Large values return a lot of \
+text and are rarely needed.
+
+READING RESULTS
+- score_hidden true means Reddit is withholding the score; a score of 0 is not a real zero.
+- An entry with type 'more' is a collapsed branch of replies. To read it, pass its comment_ids \
+to get_more_comments.
+- selftext is the author's original markdown and may be empty for link posts.
+
+ON FAILURE
+An error tells you what to fix. Correct the arguments and retry the same tool rather than \
+switching to a different one. If you are unsure how to proceed, call reddit_guide.";
 
 enum CallError {
 	UnknownTool(String),
 	BadParams(String),
+}
+
+/// Renders a tool result as the text the model will read.
+///
+/// A tool that already returns prose (the guide) must not be JSON-encoded, or
+/// the model receives escaped `\n` sequences inside quotes instead of readable
+/// markdown -- which defeats the point of the one tool whose entire job is to
+/// be read.
+fn render(value: &Value) -> String {
+	match value {
+		Value::String(text) => text.clone(),
+		other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+	}
 }
 
 async fn call_tool(params: &Value) -> Result<Value, CallError> {
@@ -260,7 +321,7 @@ async fn call_tool(params: &Value) -> Result<Value, CallError> {
 
 	match tools::call(name, &args).await {
 		Ok(value) => Ok(json!({
-			"content": [{"type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())}],
+			"content": [{"type": "text", "text": render(&value)}],
 			"isError": false,
 		})),
 		Err(message) => {
@@ -310,13 +371,59 @@ mod tests {
 		let out = initialize(&json!({}));
 		let text = out["instructions"].as_str().unwrap().to_lowercase();
 		// An agent that does not know this will hallucinate voting tools.
-		assert!(text.contains("voting") && text.contains("not available"));
+		assert!(text.contains("voting") && text.contains("do not exist here"));
+	}
+
+	#[test]
+	fn instructions_teach_the_ordering_constraint() {
+		// The failure this targets: a weak model inventing a plausible-looking
+		// post id instead of taking one from a listing.
+		let text = INSTRUCTIONS.to_lowercase();
+		assert!(text.contains("never invent"), "must forbid guessing ids");
+		assert!(text.contains("get_post"), "must name the tool the rule applies to");
+		assert!(text.contains("after"), "must explain pagination");
+		assert!(text.contains("score_hidden"), "must warn that a hidden score is not zero");
+	}
+
+	#[test]
+	fn instructions_point_at_the_fallback_tool() {
+		// A client only MAY forward instructions, so the escape hatch has to be
+		// discoverable from within them too.
+		assert!(INSTRUCTIONS.contains("reddit_guide"));
+	}
+
+	#[test]
+	fn instructions_stay_dense() {
+		// Guidance long enough to be skimmed past is guidance that does not
+		// work; the MCP project's advice is explicitly "don't write a manual".
+		// The long form lives in the reddit_guide tool instead.
+		assert!(
+			INSTRUCTIONS.len() < 3000,
+			"instructions grew to {} chars; move detail into the guide tool",
+			INSTRUCTIONS.len()
+		);
 	}
 
 	#[test]
 	fn notifications_are_accepted_without_a_body() {
 		let res = futures_lite::future::block_on(dispatch(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})));
 		assert_eq!(res.status(), StatusCode::ACCEPTED);
+	}
+
+	#[test]
+	fn prose_results_are_not_json_encoded() {
+		// The guide is markdown meant to be read. Passing it through
+		// to_string_pretty would wrap it in quotes and escape every newline.
+		let text = render(&json!("# Heading\n\nbody"));
+		assert_eq!(text, "# Heading\n\nbody");
+		assert!(!text.starts_with('"'), "prose must not arrive JSON-quoted");
+	}
+
+	#[test]
+	fn structured_results_are_still_pretty_printed() {
+		let text = render(&json!({"count": 1}));
+		assert!(text.contains("\n"), "objects should stay readable: {text}");
+		assert!(text.contains("\"count\""));
 	}
 
 	#[test]

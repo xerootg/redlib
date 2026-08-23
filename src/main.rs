@@ -262,7 +262,17 @@ async fn main() {
 	app.at("/instances.json").get(|_| async move { proxy_instances().await }.boxed());
 
 	// Proxy media through Redlib
-	app.at("/vid/:id/:size").get(|r| proxy(r, "https://v.redd.it/{id}/DASH_{size}").boxed());
+	app.at("/vid/:id/:size").get(|r: Request<Body>| {
+		// The filename prefix is part of the path segment now that Reddit serves
+		// both DASH_* and CMAF_* renditions. Links generated before that carry a
+		// bare size, so keep assuming DASH_ for those.
+		let format = if r.param("size").is_some_and(|size| size.starts_with("DASH_") || size.starts_with("CMAF_")) {
+			"https://v.redd.it/{id}/{size}"
+		} else {
+			"https://v.redd.it/{id}/DASH_{size}"
+		};
+		proxy(r, format).boxed()
+	});
 	app.at("/hls/:id/*path").get(|r| proxy(r, "https://v.redd.it/{id}/{path}").boxed());
 	app.at("/img/*path").get(|r| proxy(r, "https://i.redd.it/{path}").boxed());
 	app.at("/thumb/:point/:id").get(|r| proxy(r, "https://{point}.thumbs.redditmedia.com/{id}").boxed());

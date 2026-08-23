@@ -1004,7 +1004,11 @@ static REGEX_URL_WWW: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://w
 static REGEX_URL_OLD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://old\.reddit\.com/(.*)").unwrap());
 static REGEX_URL_NP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://np\.reddit\.com/(.*)").unwrap());
 static REGEX_URL_PLAIN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://reddit\.com/(.*)").unwrap());
-static REGEX_URL_VIDEOS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://v\.redd\.it/(.*)/DASH_([0-9]{2,4}(\.mp4|$|\?source=fallback))").unwrap());
+// Reddit serves v.redd.it renditions under two filename schemes: the legacy
+// DASH_* one (which includes bitrate-named files like DASH_9_6_M and
+// extension-less ones like DASH_360) and the newer CMAF_* one. Capture the
+// whole filename so the prefix survives into the proxied URL.
+static REGEX_URL_VIDEOS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://v\.redd\.it/([^/?#]+)/((?:DASH|CMAF)_[A-Za-z0-9_]+(?:\.mp4)?)(?:\?|$)").unwrap());
 static REGEX_URL_VIDEOS_HLS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://v\.redd\.it/(.+)/(HLSPlaylist\.m3u8.*)$").unwrap());
 static REGEX_URL_IMAGES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://i\.redd\.it/(.*)").unwrap());
 static REGEX_URL_THUMBS_A: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://a\.thumbs\.redditmedia\.com/(.*)").unwrap());
@@ -1501,7 +1505,13 @@ mod tests {
 			format_url("https://preview.redd.it/qwerty.jpg?auto=webp&s=asdf"),
 			"/preview/pre/qwerty.jpg?auto=webp&s=asdf"
 		);
-		assert_eq!(format_url("https://v.redd.it/foo/DASH_360.mp4?source=fallback"), "/vid/foo/360.mp4");
+		assert_eq!(format_url("https://v.redd.it/foo/DASH_360.mp4?source=fallback"), "/vid/foo/DASH_360.mp4");
+		assert_eq!(format_url("https://v.redd.it/foo/CMAF_480.mp4?source=fallback"), "/vid/foo/CMAF_480.mp4");
+		assert_eq!(format_url("https://v.redd.it/foo/CMAF_96.mp4"), "/vid/foo/CMAF_96.mp4");
+		assert_eq!(format_url("https://v.redd.it/foo/CMAF_AUDIO_128.mp4"), "/vid/foo/CMAF_AUDIO_128.mp4");
+		// Extension-less and bitrate-named renditions predate the .mp4 suffix
+		assert_eq!(format_url("https://v.redd.it/foo/DASH_480?source=fallback"), "/vid/foo/DASH_480");
+		assert_eq!(format_url("https://v.redd.it/foo/DASH_9_6_M?source=fallback"), "/vid/foo/DASH_9_6_M");
 		assert_eq!(
 			format_url("https://v.redd.it/foo/HLSPlaylist.m3u8?a=bar&v=1&f=sd"),
 			"/hls/foo/HLSPlaylist.m3u8?a=bar&v=1&f=sd"

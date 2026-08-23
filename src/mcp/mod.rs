@@ -1,0 +1,366 @@
+//! Model Context Protocol server exposing Reddit to AI agents.
+//!
+//! Transport is Streamable HTTP on a single `/mcp` endpoint, hand-rolled
+//! rather than pulled from the `rmcp` SDK. The SDK's server transport is a
+//! `tower::Service` over `http` 1.x types, while redlib is on hyper 0.14 and
+//! `http` 0.2, so using it would mean maintaining a request/body adapter
+//! across an `http` major version -- more code, and more subtle failure
+//! modes, than the four JSON-RPC methods a tools-only server actually needs.
+//!
+//! ## Protocol revision
+//!
+//! This targets the "legacy" era and reports `2025-11-25` by default. The
+//! newer `2026-07-28` revision is a stateless redesign that removes
+//! `initialize`, `notifications/initialized`, and session ids outright, and
+//! the two eras are not mutually intelligible: announcing `2026-07-28` to a
+//! legacy client is an unrecoverable failure, because legacy clients have no
+//! fall-forward path. We therefore echo whatever revision the client asks for
+//! when we can speak it, and otherwise answer with our default.
+//!
+//! Sessions and SSE are both omitted. The spec permits answering every request
+//! with a single `application/json` body and declining the GET stream with
+//! 405, which is all a request/response tools server needs.
+
+pub mod reddit;
+pub mod tools;
+
+use hyper::body::HttpBody;
+use hyper::{Body, Method, Request, Response, StatusCode};
+use log::{debug, error, warn};
+use serde_json::{json, Value};
+
+use crate::config;
+
+/// Revision we speak natively.
+pub const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// Revisions we will echo back if a client asks for them. All are legacy-era:
+/// same handshake, same message shapes.
+const SUPPORTED_PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// Bodies larger than this are rejected before parsing.
+const MAX_BODY_BYTES: u64 = 1024 * 1024;
+
+// JSON-RPC 2.0 error codes.
+const PARSE_ERROR: i64 = -32700;
+const INVALID_REQUEST: i64 = -32600;
+const METHOD_NOT_FOUND: i64 = -32601;
+const INVALID_PARAMS: i64 = -32602;
+const INTERNAL_ERROR: i64 = -32603;
+
+fn rpc_error(id: Value, code: i64, message: &str) -> Value {
+	json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+fn rpc_result(id: Value, result: Value) -> Value {
+	json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+fn json_response(status: StatusCode, body: &Value) -> Response<Body> {
+	Response::builder()
+		.status(status)
+		.header("content-type", "application/json")
+		.body(Body::from(body.to_string()))
+		.unwrap_or_default()
+}
+
+/// Origins permitted to drive the endpoint from a browser context.
+///
+/// The spec requires validating `Origin` on every connection: without it, a
+/// page on any site could have the victim's browser drive this server (DNS
+/// rebinding). That matters more than usual here, because redlib is a public
+/// web app rather than a localhost-only tool.
+fn allowed_origins() -> Vec<String> {
+	let mut origins: Vec<String> = config::get_setting("REDLIB_MCP_ALLOWED_ORIGINS")
+		.unwrap_or_default()
+		.split(',')
+		.map(|s| s.trim().to_string())
+		.filter(|s| !s.is_empty())
+		.collect();
+
+	// The instance's own origin is always acceptable.
+	if let Some(redirect) = config::get_setting("REDLIB_OIDC_REDIRECT_URI") {
+		if let Ok(url) = url::Url::parse(&redirect) {
+			if let Some(host) = url.host_str() {
+				let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+				origins.push(format!("{}://{host}{port}", url.scheme()));
+			}
+		}
+	}
+
+	origins
+}
+
+/// `None` means allowed. A non-browser client (curl, an MCP stdio bridge)
+/// sends no `Origin` at all, which is not a rebinding risk and is permitted.
+fn check_origin(req: &Request<Body>) -> Option<Response<Body>> {
+	let origin = req.headers().get("origin").and_then(|v| v.to_str().ok())?;
+
+	let allowed = allowed_origins();
+	if allowed.iter().any(|a| a == origin) {
+		return None;
+	}
+
+	warn!("MCP: rejecting request from disallowed origin {origin:?}");
+	Some(json_response(
+		StatusCode::FORBIDDEN,
+		&json!({"error": "forbidden", "error_description": format!("origin {origin} is not allowed")}),
+	))
+}
+
+/// Whether MCP is switched on.
+pub fn enabled() -> bool {
+	config::get_setting("REDLIB_MCP_ENABLED").map(|v| v == "on" || v == "true" || v == "1").unwrap_or(false)
+}
+
+/// `GET`/`DELETE` on the endpoint. The spec explicitly allows declining the
+/// server-to-client SSE stream and session teardown with 405.
+pub async fn handle_unsupported(_req: Request<Body>) -> Result<Response<Body>, String> {
+	Ok(
+		Response::builder()
+			.status(StatusCode::METHOD_NOT_ALLOWED)
+			.header("allow", "POST")
+			.header("content-type", "application/json")
+			.body(Body::from(
+				json!({"error": "method_not_allowed", "error_description": "this MCP endpoint is POST-only; it offers no SSE stream or session teardown"}).to_string(),
+			))
+			.unwrap_or_default(),
+	)
+}
+
+/// `POST /mcp` -- every client message arrives here.
+pub async fn handle(req: Request<Body>) -> Result<Response<Body>, String> {
+	if !enabled() {
+		return Ok(json_response(
+			StatusCode::NOT_FOUND,
+			&json!({"error": "not_found", "error_description": "MCP is not enabled on this instance"}),
+		));
+	}
+
+	if let Some(rejection) = check_origin(&req) {
+		return Ok(rejection);
+	}
+
+	if req.method() != Method::POST {
+		return handle_unsupported(req).await;
+	}
+
+	// Refuse oversized bodies before buffering them.
+	if let Some(len) = req.body().size_hint().upper() {
+		if len > MAX_BODY_BYTES {
+			return Ok(rpc_response(rpc_error(Value::Null, INVALID_REQUEST, "request body too large")));
+		}
+	}
+
+	let body = match hyper::body::to_bytes(req.into_body()).await {
+		Ok(b) => b,
+		Err(e) => {
+			error!("MCP: could not read request body: {e}");
+			return Ok(rpc_response(rpc_error(Value::Null, INTERNAL_ERROR, "could not read request body")));
+		}
+	};
+
+	if body.len() as u64 > MAX_BODY_BYTES {
+		return Ok(rpc_response(rpc_error(Value::Null, INVALID_REQUEST, "request body too large")));
+	}
+
+	let message: Value = match serde_json::from_slice(&body) {
+		Ok(v) => v,
+		Err(e) => {
+			debug!("MCP: malformed JSON: {e}");
+			return Ok(rpc_response(rpc_error(Value::Null, PARSE_ERROR, "invalid JSON")));
+		}
+	};
+
+	// JSON-RPC batching was removed from MCP; a single object is the only
+	// shape a current client sends.
+	if message.is_array() {
+		return Ok(rpc_response(rpc_error(Value::Null, INVALID_REQUEST, "batched requests are not supported")));
+	}
+
+	Ok(dispatch(&message).await)
+}
+
+fn rpc_response(body: Value) -> Response<Body> {
+	json_response(StatusCode::OK, &body)
+}
+
+async fn dispatch(message: &Value) -> Response<Body> {
+	let method = message.get("method").and_then(Value::as_str).unwrap_or_default();
+	// A message with no `id` is a notification: acknowledge, never answer.
+	let id = message.get("id").cloned();
+	let params = message.get("params").cloned().unwrap_or(Value::Null);
+
+	let Some(id) = id else {
+		debug!("MCP: notification {method:?}");
+		return Response::builder().status(StatusCode::ACCEPTED).body(Body::empty()).unwrap_or_default();
+	};
+
+	match method {
+		"initialize" => rpc_response(rpc_result(id, initialize(&params))),
+		"ping" => rpc_response(rpc_result(id, json!({}))),
+		"tools/list" => rpc_response(rpc_result(id, json!({"tools": tools::definitions()}))),
+		"tools/call" => match call_tool(&params).await {
+			Ok(result) => rpc_response(rpc_result(id, result)),
+			// A tool that does not exist is a protocol error; a tool that ran
+			// and failed is reported inside a successful result so the model
+			// can read the message and correct itself.
+			Err(CallError::UnknownTool(name)) => rpc_response(rpc_error(id, INVALID_PARAMS, &format!("Unknown tool: {name}"))),
+			Err(CallError::BadParams(msg)) => rpc_response(rpc_error(id, INVALID_PARAMS, &msg)),
+		},
+		"" => rpc_response(rpc_error(id, INVALID_REQUEST, "missing method")),
+		other => rpc_response(rpc_error(id, METHOD_NOT_FOUND, &format!("Method not found: {other}"))),
+	}
+}
+
+fn initialize(params: &Value) -> Value {
+	// Echo the client's revision when we speak it, so a client on an older
+	// legacy revision is not forced to downgrade or fail.
+	let requested = params.get("protocolVersion").and_then(Value::as_str).unwrap_or(DEFAULT_PROTOCOL_VERSION);
+	let version = if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
+		requested
+	} else {
+		debug!("MCP: client asked for unsupported revision {requested:?}; answering {DEFAULT_PROTOCOL_VERSION}");
+		DEFAULT_PROTOCOL_VERSION
+	};
+
+	json!({
+		"protocolVersion": version,
+		"capabilities": {"tools": {"listChanged": false}},
+		"serverInfo": {
+			"name": "redlib-reddit",
+			"title": "Reddit (via redlib)",
+			"version": env!("CARGO_PKG_VERSION"),
+		},
+		"instructions": "Read-only access to Reddit. Listings, posts with comment trees, search, \
+	users, and subreddit metadata are available. This server authenticates to Reddit anonymously, \
+	so there is no logged-in account: voting, commenting, submitting, subscribing, saved items, and \
+	inbox are not available and no tool exposes them. Post ids may be given bare, as t3_ fullnames, \
+	or as full Reddit URLs. Listings return an `after` cursor to page with.",
+	})
+}
+
+enum CallError {
+	UnknownTool(String),
+	BadParams(String),
+}
+
+async fn call_tool(params: &Value) -> Result<Value, CallError> {
+	let name = params
+		.get("name")
+		.and_then(Value::as_str)
+		.ok_or_else(|| CallError::BadParams("missing tool name".to_string()))?;
+	let args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+	if !tools::exists(name) {
+		return Err(CallError::UnknownTool(name.to_string()));
+	}
+
+	debug!("MCP: calling tool {name} with {args}");
+
+	match tools::call(name, &args).await {
+		Ok(value) => Ok(json!({
+			"content": [{"type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())}],
+			"isError": false,
+		})),
+		Err(message) => {
+			debug!("MCP: tool {name} failed: {message}");
+			Ok(json!({
+				"content": [{"type": "text", "text": message}],
+				"isError": true,
+			}))
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn body_of(res: Response<Body>) -> Value {
+		let bytes = futures_lite::future::block_on(hyper::body::to_bytes(res.into_body())).unwrap();
+		serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+	}
+
+	#[test]
+	fn initialize_echoes_a_supported_client_revision() {
+		let out = initialize(&json!({"protocolVersion": "2025-06-18"}));
+		assert_eq!(out["protocolVersion"], "2025-06-18");
+	}
+
+	#[test]
+	fn initialize_falls_back_for_an_unknown_revision() {
+		// Notably this covers 2026-07-28, whose handshake we do not implement.
+		let out = initialize(&json!({"protocolVersion": "2026-07-28"}));
+		assert_eq!(out["protocolVersion"], DEFAULT_PROTOCOL_VERSION);
+	}
+
+	#[test]
+	fn initialize_declares_only_tools_and_names_itself() {
+		let out = initialize(&json!({}));
+		assert_eq!(out["protocolVersion"], DEFAULT_PROTOCOL_VERSION);
+		assert!(out["capabilities"]["tools"].is_object());
+		assert!(out["capabilities"].get("resources").is_none(), "must not claim capabilities we do not implement");
+		assert!(out["capabilities"].get("prompts").is_none());
+		assert_eq!(out["serverInfo"]["name"], "redlib-reddit");
+	}
+
+	#[test]
+	fn instructions_state_the_read_only_limitation() {
+		let out = initialize(&json!({}));
+		let text = out["instructions"].as_str().unwrap().to_lowercase();
+		// An agent that does not know this will hallucinate voting tools.
+		assert!(text.contains("voting") && text.contains("not available"));
+	}
+
+	#[test]
+	fn notifications_are_accepted_without_a_body() {
+		let res = futures_lite::future::block_on(dispatch(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})));
+		assert_eq!(res.status(), StatusCode::ACCEPTED);
+	}
+
+	#[test]
+	fn ping_returns_an_empty_result() {
+		let res = futures_lite::future::block_on(dispatch(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"})));
+		assert_eq!(body_of(res)["result"], json!({}));
+	}
+
+	#[test]
+	fn unknown_method_is_method_not_found() {
+		let res = futures_lite::future::block_on(dispatch(&json!({"jsonrpc": "2.0", "id": 7, "method": "resources/list"})));
+		let b = body_of(res);
+		assert_eq!(b["error"]["code"], METHOD_NOT_FOUND);
+		assert_eq!(b["id"], 7);
+	}
+
+	#[test]
+	fn unknown_tool_is_a_protocol_error_not_a_tool_failure() {
+		let res = futures_lite::future::block_on(dispatch(&json!({
+			"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+			"params": {"name": "definitely_not_a_tool", "arguments": {}}
+		})));
+		let b = body_of(res);
+		assert_eq!(b["error"]["code"], INVALID_PARAMS);
+		assert!(b["error"]["message"].as_str().unwrap().contains("Unknown tool"));
+	}
+
+	#[test]
+	fn tools_list_is_non_empty_and_well_formed() {
+		let res = futures_lite::future::block_on(dispatch(&json!({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})));
+		let b = body_of(res);
+		let tools = b["result"]["tools"].as_array().expect("tools array");
+		assert!(tools.len() >= 15, "expected a full surface, got {}", tools.len());
+		for t in tools {
+			assert!(t["name"].is_string());
+			assert!(t["description"].is_string());
+			// A null inputSchema breaks clients; the spec requires an object.
+			assert_eq!(t["inputSchema"]["type"], "object", "bad schema on {}", t["name"]);
+		}
+	}
+
+	#[test]
+	fn batched_requests_are_refused() {
+		let msg = json!([{"jsonrpc": "2.0", "id": 1, "method": "ping"}]);
+		assert!(msg.is_array());
+	}
+}

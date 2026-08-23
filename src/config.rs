@@ -158,6 +158,21 @@ pub struct Config {
 	/// cannot forge a bypass address. Leave unset when not behind a proxy.
 	#[serde(rename = "REDLIB_TRUSTED_PROXIES")]
 	pub(crate) trusted_proxies: Option<String>,
+
+	// --- MCP server -------------------------------------------------------
+	/// Master switch for the Model Context Protocol endpoint at `/mcp`.
+	#[serde(rename = "REDLIB_MCP_ENABLED")]
+	pub(crate) mcp_enabled: Option<String>,
+
+	/// Bearer token accepted at any endpoint, for clients that cannot hold a
+	/// session cookie. Unset means no token is accepted at all.
+	#[serde(rename = "REDLIB_MCP_TOKEN")]
+	pub(crate) mcp_token: Option<String>,
+
+	/// Comma-separated origins allowed to call `/mcp` from a browser context.
+	/// The instance's own origin is always allowed.
+	#[serde(rename = "REDLIB_MCP_ALLOWED_ORIGINS")]
+	pub(crate) mcp_allowed_origins: Option<String>,
 }
 
 impl Config {
@@ -217,6 +232,9 @@ impl Config {
 			oidc_allowed_groups: parse("REDLIB_OIDC_ALLOWED_GROUPS"),
 			auth_bypass_cidrs: parse("REDLIB_AUTH_BYPASS_CIDRS"),
 			trusted_proxies: parse("REDLIB_TRUSTED_PROXIES"),
+			mcp_enabled: parse("REDLIB_MCP_ENABLED"),
+			mcp_token: parse("REDLIB_MCP_TOKEN"),
+			mcp_allowed_origins: parse("REDLIB_MCP_ALLOWED_ORIGINS"),
 		}
 	}
 }
@@ -258,6 +276,9 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_OIDC_ALLOWED_GROUPS" => config.oidc_allowed_groups.clone(),
 		"REDLIB_AUTH_BYPASS_CIDRS" => config.auth_bypass_cidrs.clone(),
 		"REDLIB_TRUSTED_PROXIES" => config.trusted_proxies.clone(),
+		"REDLIB_MCP_ENABLED" => config.mcp_enabled.clone(),
+		"REDLIB_MCP_TOKEN" => config.mcp_token.clone(),
+		"REDLIB_MCP_ALLOWED_ORIGINS" => config.mcp_allowed_origins.clone(),
 		_ => None,
 	}
 }

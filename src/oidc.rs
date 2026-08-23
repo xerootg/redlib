@@ -309,6 +309,35 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 		.next()
 }
 
+/// Whether the request carries the configured API bearer token.
+///
+/// Session cookies are unusable by headless clients such as an MCP client, so
+/// a long random token stands in for them. Returns false whenever no token is
+/// configured, so an unset value can never authorise anything.
+///
+/// The comparison hashes both sides first. A plain `==` on the raw strings
+/// short-circuits at the first differing byte, which leaks the length of the
+/// matching prefix and lets an attacker recover the token byte by byte.
+/// Comparing digests makes the timing independent of how much of the token was
+/// correct.
+fn bearer_token_valid(headers: &HeaderMap) -> bool {
+	let Some(expected) = setting("REDLIB_MCP_TOKEN") else {
+		return false;
+	};
+
+	let Some(presented) = headers
+		.get("authorization")
+		.and_then(|v| v.to_str().ok())
+		.and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+		.map(str::trim)
+		.filter(|t| !t.is_empty())
+	else {
+		return false;
+	};
+
+	Sha256::digest(presented.as_bytes()) == Sha256::digest(expected.as_bytes())
+}
+
 /// Reads and validates the session cookie, if present and well-formed.
 pub fn session_from(headers: &HeaderMap) -> Option<Session> {
 	let raw = cookie_value(headers, SESSION_COOKIE)?;
@@ -673,6 +702,12 @@ pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Bo
 
 	let client = resolve_client_ip(peer, headers);
 	if is_bypassed(client) {
+		return None;
+	}
+
+	// Checked before the cookie so that headless clients (MCP, curl, CI) have
+	// a credential they can actually present.
+	if bearer_token_valid(headers) {
 		return None;
 	}
 

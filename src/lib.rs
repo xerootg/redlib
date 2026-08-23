@@ -2,6 +2,7 @@ pub mod client;
 pub mod config;
 pub mod duplicates;
 pub mod instance_info;
+pub mod mcp;
 pub mod oauth;
 pub mod oauth_resources;
 pub mod oidc;

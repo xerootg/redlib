@@ -9,6 +9,7 @@ on:
     branches:
       - main
       - "fix-**"
+      - "feat-**"
   workflow_dispatch:
 
 env:

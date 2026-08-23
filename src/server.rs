@@ -10,6 +10,7 @@ use hyper::{
 	body,
 	body::HttpBody,
 	header,
+	server::conn::AddrStream,
 	service::{make_service_fn, service_fn},
 	HeaderMap,
 };
@@ -27,7 +28,7 @@ use std::{
 };
 use time::OffsetDateTime;
 
-use crate::{config, dbg_msg};
+use crate::{config, dbg_msg, oidc};
 
 const BANNED_USER_AGENTS: &[&str] = &[
 	"AI2Bot",
@@ -305,10 +306,15 @@ impl Server {
 	}
 
 	pub fn listen(self, addr: &str) -> Boxed<Result<(), hyper::Error>> {
-		let make_svc = make_service_fn(move |_conn| {
+		let make_svc = make_service_fn(move |conn: &AddrStream| {
 			// For correct borrowing, these values need to be borrowed
 			let router = self.router.clone();
 			let default_headers = self.default_headers.clone();
+
+			// The real TCP peer. Unlike any header, this cannot be forged, so
+			// it is the anchor for the OIDC bypass allowlist -- see
+			// `oidc::resolve_client_ip`.
+			let peer_addr = conn.remote_addr().ip();
 
 			// This is the `Service` that will handle the connection.
 			// `service_fn` is a helper to convert a function that
@@ -342,6 +348,14 @@ impl Server {
 					// Remove trailing slashes
 					if path != "/" && path.ends_with('/') {
 						path.pop();
+					}
+
+					// Enforce OIDC before anything else routes. Returns None
+					// when the request is allowed through -- because auth is
+					// off, the client is in a bypass CIDR, it already holds a
+					// valid session, or it is hitting the /oidc/ endpoints.
+					if let Some(res) = oidc::gate(peer_addr, &path, &req_headers) {
+						return async move { Ok(res) }.boxed();
 					}
 
 					// Replace HEAD with GET for routing

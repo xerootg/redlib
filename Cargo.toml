@@ -61,6 +61,16 @@ revision = "0.17.0"
 fake_user_agent = "0.2.2"
 wreq = { version = "6.0.0-rc.28", features = ["brotli", "gzip", "deflate", "zstd", "json", "stream", "socks"] }
 wreq-util = { version = "3.0.0-rc.10" }
+# OIDC: RS256 ID-token verification against the provider's JWKS, and HS256
+# signing of our own stateless session/transaction cookies.
+jsonwebtoken = "9.3.0"
+# CIDR matching for the auth-bypass allowlist and the trusted-proxy list.
+ipnet = "2.12.0"
+# CSPRNG for PKCE verifiers, state, and nonces. `fastrand` is already a
+# dependency but is not cryptographically secure, so it must not be used here.
+getrandom = "0.2.15"
+# PKCE S256 challenges and session-key derivation.
+sha2 = "0.10.8"
 
 [dev-dependencies]
 lipsum = "0.9.0"

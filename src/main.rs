@@ -12,7 +12,7 @@ use log::{info, warn};
 use redlib::client::{canonical_path, proxy, rate_limit_check, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, redirect, ThemeAssets};
-use redlib::{config, duplicates, headers, instance_info, post, search, settings, subreddit, user};
+use redlib::{config, duplicates, headers, instance_info, oidc, post, search, settings, subreddit, user};
 
 use redlib::client::OAUTH_CLIENT;
 
@@ -217,6 +217,12 @@ async fn main() {
 			app.default_headers.insert("Strict-Transport-Security", val);
 		}
 	}
+
+	// OIDC endpoints. These are exempt from the auth gate in `server::listen`,
+	// since gating them would make the login redirect loop forever.
+	app.at("/oidc/login").get(|r| oidc::login(r).boxed());
+	app.at("/oidc/callback").get(|r| oidc::callback(r).boxed());
+	app.at("/oidc/logout").get(|r| oidc::logout(r).boxed());
 
 	// Read static files
 	app.at("/style.css").get(|_| style().boxed());

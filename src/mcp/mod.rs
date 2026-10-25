@@ -280,8 +280,8 @@ text and are rarely needed.
 
 READING RESULTS
 - score_hidden true means Reddit is withholding the score; a score of 0 is not a real zero.
-- An entry with type 'more' is a collapsed branch of replies. To read it, pass its comment_ids \
-to get_more_comments.
+- An entry with type 'more' is a collapsed branch of replies or the next page of comments. To \
+read it, pass its cursor and parent_id (or, on older entries, its comment_ids) to get_more_comments.
 - selftext is the author's original markdown and may be empty for link posts.
 
 ON FAILURE

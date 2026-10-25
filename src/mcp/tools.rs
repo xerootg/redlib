@@ -138,8 +138,10 @@ Page through more results:
 
 - `score_hidden: true` means Reddit is withholding the score. Do not report the
   accompanying `score: 0` as a real score.
-- `{"type": "more", "comment_ids": [...]}` is a collapsed branch. Expand it with
-  `get_more_comments {"post_id": "...", "comment_ids": [...]}`.
+- `{"type": "more", "cursor": "...", "parent_id": "..."}` is a collapsed branch
+  or the next page of comments. Expand it with
+  `get_more_comments {"post_id": "...", "cursor": "...", "parent_id": "..."}`.
+  Older entries carry `comment_ids` instead; pass those as `comment_ids`.
 - `after: null` means the last page. Stop paging.
 - `selftext` is empty on link posts; use `url` for those.
 
@@ -202,7 +204,7 @@ Several may be combined with '+' to read them as one feed, e.g. 'rust+golang+cpp
 		tool(
 			"get_post",
 			"Get a post with its comments",
-			"Fetch one post's full text plus its comment tree. This is the tool for reading discussion. Deep or long threads are elided as entries with type 'more' carrying comment_ids -- pass those to get_more_comments to expand them.",
+			"Fetch one post's full text plus its comment tree. This is the tool for reading discussion. Deep or long threads are elided as entries with type 'more' carrying a cursor and parent_id -- pass those to get_more_comments to expand them.",
 			schema(
 				json!({
 					"post_id": s(POST_ID_DESC),
@@ -216,18 +218,21 @@ Several may be combined with '+' to read them as one feed, e.g. 'rust+golang+cpp
 		tool(
 			"get_more_comments",
 			"Expand elided comments",
-			"Fetch comments hidden behind a 'more' node returned by get_post. Results are a flat list; reassemble the hierarchy using each comment's parent_id.",
+			"Fetch comments hidden behind a 'more' node returned by get_post. With cursor, results are a tree that may end in further 'more' entries. With comment_ids, results are a flat list; reassemble the hierarchy using each comment's parent_id.",
 			schema(
 				json!({
 					"post_id": s(POST_ID_DESC),
+					"cursor": s("The cursor from a 'more' entry."),
+					"parent_id": s("The parent_id from the same 'more' entry."),
 					"comment_ids": json!({
 						"type": "array",
-						"description": "The comment_ids array from a 'more' entry.",
+						"description": "The comment_ids array from a 'more' entry that has no cursor.",
 						"items": {"type": "string"},
 					}),
 					"comment_sort": s_enum("Comment ordering.", &reddit::COMMENT_SORTS, "confidence"),
+					"max_depth": int("How many reply levels to descend.", 0, 10, 4),
 				}),
-				&["post_id", "comment_ids"],
+				&["post_id"],
 			),
 		),
 		tool(
@@ -586,12 +591,18 @@ pub async fn call(name: &str, args: &Value) -> Result<Value, String> {
 			reddit::get_post(&req_str(args, "post_id")?, &str_or(args, "comment_sort", "confidence"), limit_of(args), max_depth).await
 		}
 		"get_more_comments" => {
+			let sort = str_or(args, "comment_sort", "confidence");
+			if let Some(cursor) = args.get("cursor").and_then(Value::as_str).filter(|c| !c.trim().is_empty()) {
+				let max_depth = args.get("max_depth").and_then(Value::as_u64).unwrap_or(4).min(10) as u32;
+				let parent = args.get("parent_id").and_then(Value::as_str);
+				return reddit::get_more_comments_cursor(&req_str(args, "post_id")?, cursor, parent, &sort, max_depth).await;
+			}
 			let ids: Vec<String> = args
 				.get("comment_ids")
 				.and_then(Value::as_array)
 				.map(|a| a.iter().filter_map(|v| v.as_str().map(ToString::to_string)).collect())
 				.unwrap_or_default();
-			reddit::get_more_comments(&req_str(args, "post_id")?, &ids, &str_or(args, "comment_sort", "confidence")).await
+			reddit::get_more_comments(&req_str(args, "post_id")?, &ids, &sort).await
 		}
 		"search_posts" => {
 			reddit::search_posts(

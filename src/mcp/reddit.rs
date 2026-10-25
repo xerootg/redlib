@@ -243,9 +243,10 @@ fn project_poll(poll: &Value) -> Value {
 /// Projects a comment tree, recursively, up to `max_depth`.
 ///
 /// Reddit represents elided branches as `kind: "more"` nodes. Those are
-/// surfaced as `{"type": "more", ...}` entries carrying their child ids rather
-/// than silently dropped, so a caller can decide to fetch them via
-/// `get_more_comments`.
+/// surfaced as `{"type": "more", ...}` entries rather than silently dropped,
+/// so a caller can decide to fetch them via `get_more_comments`. Threads
+/// loaded through GraphQL carry an opaque cursor in the node's `id` and no
+/// `children`; REST listings carry child ids.
 pub fn project_comments(listing: &Value, depth: u32, max_depth: u32) -> Vec<Value> {
 	let Some(children) = listing.get("data").and_then(|d| d.get("children")).and_then(Value::as_array) else {
 		return Vec::new();
@@ -259,6 +260,15 @@ pub fn project_comments(listing: &Value, depth: u32, max_depth: u32) -> Vec<Valu
 
 			match kind {
 				"more" => {
+					if d.get("children").is_none() {
+						let cursor = str_of(d, "id").filter(|c| !c.is_empty())?;
+						return Some(json!({
+							"type": "more",
+							"count": num_of(d, "count"),
+							"parent_id": str_of(d, "parent_id"),
+							"cursor": cursor,
+						}));
+					}
 					let ids: Vec<Value> = d.get("children").and_then(Value::as_array).map(|c| c.to_vec()).unwrap_or_default();
 					// A count of 0 with no ids is Reddit's "continue this
 					// thread" marker, which carries nothing useful.
@@ -548,14 +558,11 @@ pub async fn get_comment_thread(post_id: &str, comment_id: &str, context: u64, s
 		return Err("comment_id is required. Take the \"id\" field of a comment returned by get_post.".to_string());
 	}
 
-	let q = query(&[
-		("comment", comment.to_string()),
-		("context", context.min(8).to_string()),
-		("sort", sort.to_string()),
-		("raw_json", "1".to_string()),
-	]);
+	let q = query(&[("context", context.min(8).to_string()), ("sort", sort.to_string()), ("raw_json", "1".to_string())]);
 
-	let res = get(format!("/comments/{post}.json?{q}"), true).await?;
+	// Reddit 403s anonymous /comments/ JSON; the GraphQL path returns the same
+	// [post, comments] shape. It takes the comment as a path segment.
+	let res = crate::gql::thread(format!("/comments/{post}/_/{comment}.json?{q}"), true).await?;
 	let arr = res.as_array().ok_or("unexpected response shape from Reddit")?;
 
 	let post_obj = arr
@@ -566,7 +573,7 @@ pub async fn get_comment_thread(post_id: &str, comment_id: &str, context: u64, s
 		.and_then(|c| c.first())
 		.map(project_post);
 
-	let comments = arr.get(1).map(|l| project_comments(l, 0, max_depth)).unwrap_or_default();
+	let comments = with_next_page(arr.get(1), project_comments_or_empty(arr.get(1), max_depth), &post);
 	if comments.is_empty() {
 		return Err(format!(
 			"comment {comment} was not found on post {post}. Check that both ids came from the same post -- call get_post first and take a comment id from its result."
@@ -714,8 +721,10 @@ pub async fn get_post(post_id: &str, sort: &str, limit: u64, max_depth: u32) -> 
 	validate("comment_sort", sort, &COMMENT_SORTS)?;
 	let id = extract_post_id(post_id)?;
 
+	// Reddit 403s anonymous /comments/ JSON; the GraphQL path returns the same
+	// [post, comments] shape, but ignores limit (it returns up to 200).
 	let q = query(&[("sort", sort.to_string()), ("limit", limit.to_string()), ("raw_json", "1".to_string())]);
-	let res = get(format!("/comments/{id}.json?{q}"), true).await?;
+	let res = crate::gql::thread(format!("/comments/{id}.json?{q}"), true).await?;
 
 	// This endpoint returns a two-element array: the post, then the comments.
 	let arr = res.as_array().ok_or("unexpected response shape from Reddit")?;
@@ -728,9 +737,39 @@ pub async fn get_post(post_id: &str, sort: &str, limit: u64, max_depth: u32) -> 
 		.map(project_post)
 		.ok_or("no post found with that id. Post ids come from browse_subreddit, search_posts, or lookup; they cannot be constructed by hand.")?;
 
-	let comments = arr.get(1).map(|l| project_comments(l, 0, max_depth)).unwrap_or_default();
+	let comments = with_next_page(arr.get(1), project_comments_or_empty(arr.get(1), max_depth), &id);
 
 	Ok(json!({ "post": post, "comments": comments }))
+}
+
+fn project_comments_or_empty(listing: Option<&Value>, max_depth: u32) -> Vec<Value> {
+	listing.map(|l| project_comments(l, 0, max_depth)).unwrap_or_default()
+}
+
+/// GraphQL threads report the next page of top-level comments as the
+/// listing's `after`; surface it as a `more` entry like any other branch.
+fn with_next_page(listing: Option<&Value>, mut comments: Vec<Value>, post: &str) -> Vec<Value> {
+	if let Some(after) = listing.and_then(|l| l.get("data")).and_then(|d| str_of(d, "after")).filter(|a| !a.is_empty()) {
+		comments.push(json!({ "type": "more", "parent_id": format!("t3_{post}"), "cursor": after }));
+	}
+	comments
+}
+
+/// Fetches the comments behind a GraphQL `more` cursor, as a tree.
+pub async fn get_more_comments_cursor(post_id: &str, cursor: &str, parent_id: Option<&str>, sort: &str, max_depth: u32) -> Result<Value, String> {
+	validate("comment_sort", sort, &COMMENT_SORTS)?;
+	let id = extract_post_id(post_id)?;
+	let q = query(&[("sort", sort.to_string()), ("cursor", cursor.trim().to_string()), ("raw_json", "1".to_string())]);
+	// A nested cursor must name its parent comment in the path; a top-level one
+	// (parent t3_...) goes on the bare post.
+	let path = match parent_id.map(str::trim).and_then(|p| p.strip_prefix("t1_")).filter(|p| !p.is_empty()) {
+		Some(parent) => format!("/comments/{id}/_/{parent}.json?{q}"),
+		None => format!("/comments/{id}.json?{q}"),
+	};
+	let res = crate::gql::thread(path, true).await?;
+	let arr = res.as_array().ok_or("unexpected response shape from Reddit")?;
+	let comments = with_next_page(arr.get(1), project_comments_or_empty(arr.get(1), max_depth), &id);
+	Ok(json!({ "comments": comments }))
 }
 
 /// Fetches comments elided behind a `more` node.
@@ -738,7 +777,7 @@ pub async fn get_more_comments(post_id: &str, comment_ids: &[String], sort: &str
 	validate("comment_sort", sort, &COMMENT_SORTS)?;
 	let id = extract_post_id(post_id)?;
 	if comment_ids.is_empty() {
-		return Err("comment_ids is empty. These come from an entry with type \"more\" in a get_post result; copy its comment_ids array here.".to_string());
+		return Err("pass cursor and parent_id, or comment_ids, from an entry with type \"more\" in a get_post result.".to_string());
 	}
 
 	// The api/morechildren endpoint needs a t3_ fullname for link_id.
@@ -1115,6 +1154,19 @@ mod tests {
 		assert_eq!(out.len(), 1, "the empty continue-thread marker should be dropped");
 		assert_eq!(out[0]["type"], "more");
 		assert_eq!(out[0]["comment_ids"], json!(["a", "b"]));
+	}
+
+	#[test]
+	fn projects_graphql_more_cursors() {
+		let listing = json!({"data": {"after": "next", "children": [
+			{"kind": "more", "data": {"id": "Y3Vyc29y", "count": 7, "parent_id": "t1_x"}},
+			{"kind": "more", "data": {"id": "", "count": 0, "parent_id": "t1_y"}}
+		]}});
+		let out = with_next_page(Some(&listing), project_comments(&listing, 0, 5), "abc");
+		assert_eq!(out.len(), 2, "an empty cursor carries nothing to fetch");
+		assert_eq!(out[0]["cursor"], "Y3Vyc29y");
+		assert_eq!(out[0]["parent_id"], "t1_x");
+		assert_eq!(out[1], json!({"type": "more", "parent_id": "t3_abc", "cursor": "next"}));
 	}
 
 	#[test]

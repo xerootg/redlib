@@ -180,6 +180,8 @@ pub struct Media {
 	pub height: i64,
 	pub poster: String,
 	pub download_name: String,
+	/// True when the download link is a video-only file (Reddit serves audio separately)
+	pub download_silent: bool,
 }
 
 impl Media {
@@ -263,6 +265,12 @@ impl Media {
 			String::new()
 		};
 
+		// The fallback_url is video-only; any audio lives in a separate DASH track.
+		let download_silent = post_type == "video"
+			&& [&data_preview, &secure_media, &crosspost_parent_media]
+				.iter()
+				.any(|video| video["has_audio"].as_bool().unwrap_or_default());
+
 		(
 			post_type.to_string(),
 			Self {
@@ -274,6 +282,7 @@ impl Media {
 				height: source["height"].as_i64().unwrap_or_default(),
 				poster: format_url(source["url"].as_str().unwrap_or_default()),
 				download_name,
+				download_silent,
 			},
 			gallery,
 		)
@@ -422,6 +431,7 @@ impl Post {
 					height: data["thumbnail_height"].as_i64().unwrap_or_default(),
 					poster: String::new(),
 					download_name: String::new(),
+					download_silent: false,
 				},
 				media,
 				domain: val(post, "domain"),
@@ -855,6 +865,7 @@ pub async fn parse_post(post: &Value) -> Post {
 			height: post["data"]["thumbnail_height"].as_i64().unwrap_or_default(),
 			poster: String::new(),
 			download_name: String::new(),
+			download_silent: false,
 		},
 		flair: Flair {
 			flair_parts: FlairPart::parse(
@@ -1819,5 +1830,26 @@ How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or t
 			let id = part.split('\'').next().unwrap();
 			assert!(html.contains(&format!("id=\"{id}\"")), "check_update.js uses id {id:?} missing from error page");
 		}
+	}
+
+	#[tokio::test]
+	async fn video_with_audio_is_flagged_as_silent_download() {
+		let post = serde_json::json!({
+			"permalink": "/r/videos/comments/abc/title/",
+			"secure_media": {"reddit_video": {"fallback_url": "https://v.redd.it/foo/DASH_720.mp4?source=fallback", "has_audio": true, "is_gif": false}},
+		});
+		let (post_type, media, _) = super::Media::parse(&post).await;
+		assert_eq!(post_type, "video");
+		assert!(media.download_silent);
+	}
+
+	#[tokio::test]
+	async fn video_without_audio_is_not_flagged() {
+		let post = serde_json::json!({
+			"permalink": "/r/videos/comments/abc/title/",
+			"secure_media": {"reddit_video": {"fallback_url": "https://v.redd.it/foo/DASH_720.mp4?source=fallback", "has_audio": false, "is_gif": false}},
+		});
+		let (_, media, _) = super::Media::parse(&post).await;
+		assert!(!media.download_silent);
 	}
 }

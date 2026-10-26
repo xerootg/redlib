@@ -189,8 +189,8 @@
 			{% if post.media.download_name != "" %}
 			<li>
 				<a href="{{ post.media.url }}" download="{{ post.media.download_name }}">
-					<span class="mobile_item">dl</span>
-					<span class="desktop_item">download</span>
+					<span class="mobile_item">dl{% if post.media.download_silent %} (no audio){% endif %}</span>
+					<span class="desktop_item">download{% if post.media.download_silent %} (no audio){% endif %}</span>
 				</a>
 			</li>
 			{% endif %}

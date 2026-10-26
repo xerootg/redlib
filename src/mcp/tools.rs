@@ -102,7 +102,7 @@ is fine. What does not work is inventing an id that looks plausible.
 | which community discusses X | search_subreddits |
 | the discussion under a post | get_post |
 | one comment and its replies | get_comment_thread |
-| what r/X is talking about right now | get_subreddit_comments |
+| what r/X is talking about right now | browse_subreddit (sort new), then get_post |
 | a person's activity | get_user_overview |
 | a person's karma or age | get_user |
 | who discussed this link | lookup with url, or browse_domain |
@@ -110,8 +110,8 @@ is fine. What does not work is inventing an id that looks plausible.
 | the pinned megathread | get_sticky_post |
 
 Two pairs are easy to confuse. `search_posts` finds posts; `search_subreddits`
-finds communities. `get_subreddit_comments` is the whole community's recent
-comments; `get_post` is the comments on one post.
+finds communities. `get_subreddit_comments` is unavailable anonymously (Reddit
+blocks it); `get_post` is the comments on one post.
 
 ## Worked examples
 
@@ -141,7 +141,6 @@ Page through more results:
 - `{"type": "more", "cursor": "...", "parent_id": "..."}` is a collapsed branch
   or the next page of comments. Expand it with
   `get_more_comments {"post_id": "...", "cursor": "...", "parent_id": "..."}`.
-  Older entries carry `comment_ids` instead; pass those as `comment_ids`.
 - `after: null` means the last page. Stop paging.
 - `selftext` is empty on link posts; use `url` for those.
 
@@ -218,17 +217,12 @@ Several may be combined with '+' to read them as one feed, e.g. 'rust+golang+cpp
 		tool(
 			"get_more_comments",
 			"Expand elided comments",
-			"Fetch comments hidden behind a 'more' node returned by get_post. With cursor, results are a tree that may end in further 'more' entries. With comment_ids, results are a flat list; reassemble the hierarchy using each comment's parent_id.",
+			"Fetch comments hidden behind a 'more' node returned by get_post. Pass its cursor and parent_id. Results are a tree that may end in further 'more' entries.",
 			schema(
 				json!({
 					"post_id": s(POST_ID_DESC),
 					"cursor": s("The cursor from a 'more' entry."),
 					"parent_id": s("The parent_id from the same 'more' entry."),
-					"comment_ids": json!({
-						"type": "array",
-						"description": "The comment_ids array from a 'more' entry that has no cursor.",
-						"items": {"type": "string"},
-					}),
 					"comment_sort": s_enum("Comment ordering.", &reddit::COMMENT_SORTS, "confidence"),
 					"max_depth": int("How many reply levels to descend.", 0, 10, 4),
 				}),
@@ -398,7 +392,7 @@ Several may be combined with '+' to read them as one feed, e.g. 'rust+golang+cpp
 		tool(
 			"get_subreddit_comments",
 			"Get a subreddit's recent comments",
-			"Stream the newest comments across an entire subreddit, independent of any single post. Use this to gauge what a community is actively discussing; use get_post when you care about one thread.",
+			"Currently unavailable: Reddit blocks the subreddit-wide comment stream for anonymous callers, and this server has no account, so every call returns an error. To see what a community is discussing, use browse_subreddit with sort 'new' and then get_post.",
 			schema(
 				json!({
 					"subreddit": s("Subreddit name."),
@@ -454,12 +448,12 @@ Several may be combined with '+' to read them as one feed, e.g. 'rust+golang+cpp
 		tool(
 			"lookup",
 			"Look up items by id or URL",
-			"Resolve posts, comments, or subreddits by fullname (t3_/t1_/t5_) in one batched call, or find the Reddit post that submitted a given URL. Cheaper than fetching each item separately.",
+			"Resolve posts by fullname (t3_, up to 20 per call, one request each), or find the Reddit posts that submitted a given URL (a search, so results are matches). Reddit blocks anonymous lookup of comments (t1_) and subreddits (t5_); those come back as per-item entries in `errors`, with the tool to use instead.",
 			schema(
 				json!({
 					"ids": json!({
 						"type": "array",
-						"description": "Fullnames such as ['t3_abc123', 't1_def456']. Mutually exclusive with url.",
+						"description": "Post fullnames such as ['t3_abc123', 't3_def456']. Mutually exclusive with url.",
 						"items": {"type": "string"},
 					}),
 					"url": s("An external URL to find submissions of. Mutually exclusive with ids."),
@@ -591,18 +585,14 @@ pub async fn call(name: &str, args: &Value) -> Result<Value, String> {
 			reddit::get_post(&req_str(args, "post_id")?, &str_or(args, "comment_sort", "confidence"), limit_of(args), max_depth).await
 		}
 		"get_more_comments" => {
-			let sort = str_or(args, "comment_sort", "confidence");
 			if let Some(cursor) = args.get("cursor").and_then(Value::as_str).filter(|c| !c.trim().is_empty()) {
 				let max_depth = args.get("max_depth").and_then(Value::as_u64).unwrap_or(4).min(10) as u32;
 				let parent = args.get("parent_id").and_then(Value::as_str);
+				let sort = str_or(args, "comment_sort", "confidence");
 				return reddit::get_more_comments_cursor(&req_str(args, "post_id")?, cursor, parent, &sort, max_depth).await;
 			}
-			let ids: Vec<String> = args
-				.get("comment_ids")
-				.and_then(Value::as_array)
-				.map(|a| a.iter().filter_map(|v| v.as_str().map(ToString::to_string)).collect())
-				.unwrap_or_default();
-			reddit::get_more_comments(&req_str(args, "post_id")?, &ids, &sort).await
+			req_str(args, "post_id")?;
+			Err("pass cursor and parent_id from an entry with type \"more\" in a get_post result.".to_string())
 		}
 		"search_posts" => {
 			reddit::search_posts(
@@ -656,7 +646,7 @@ pub async fn call(name: &str, args: &Value) -> Result<Value, String> {
 		"get_subreddit_wiki" => reddit::get_wiki(&req_str(args, "subreddit")?, opt_str(args, "page").as_deref()).await,
 		"get_duplicates" => reddit::get_duplicates(&req_str(args, "post_id")?, limit_of(args), after).await,
 		"list_subreddits" => reddit::list_subreddits(&str_or(args, "kind", "popular"), limit_of(args), after).await,
-		"get_subreddit_comments" => reddit::get_subreddit_comments(&req_str(args, "subreddit")?, limit_of(args), after).await,
+		"get_subreddit_comments" => reddit::get_subreddit_comments(&req_str(args, "subreddit")?),
 		"get_sticky_post" => {
 			let num = args.get("num").and_then(Value::as_u64).unwrap_or(1);
 			let max_depth = args.get("max_depth").and_then(Value::as_u64).unwrap_or(4).min(10) as u32;
@@ -753,13 +743,46 @@ mod tests {
 			("browse_subreddit", json!({}), "search_subreddits"),
 			("get_user", json!({}), "search_users"),
 			("get_post", json!({"post_id": "  "}), "browse_subreddit"),
-			("get_more_comments", json!({"post_id": "abc", "comment_ids": []}), "more"),
+			("get_more_comments", json!({"post_id": "abc"}), "more"),
 			("lookup", json!({}), "ids"),
 		];
 		for (name, args, expected) in cases {
 			let err = futures_lite::future::block_on(call(name, &args)).unwrap_err();
 			assert!(err.contains(expected), "{name} error lacks a next step: {err}");
 		}
+	}
+
+	#[test]
+	fn get_more_comments_only_offers_the_cursor_path() {
+		// api/morechildren is blocked for anonymous callers, and get_post only
+		// emits cursor-based 'more' entries, so comment_ids can never work.
+		let tool = definitions().into_iter().find(|t| t["name"] == "get_more_comments").expect("tool");
+		assert!(tool["inputSchema"]["properties"].get("comment_ids").is_none());
+		assert!(!tool["description"].as_str().unwrap().contains("comment_ids"));
+		let err = futures_lite::future::block_on(call("get_more_comments", &json!({"post_id": "abc"}))).unwrap_err();
+		assert!(err.contains("cursor") && !err.contains("comment_ids"), "{err}");
+	}
+
+	#[test]
+	fn docs_do_not_mention_the_dead_morechildren_path() {
+		let guide = futures_lite::future::block_on(call("reddit_guide", &json!({}))).unwrap();
+		let guide = guide.as_str().unwrap();
+		assert!(!guide.contains("comment_ids") && !guide.contains("morechildren"), "guide still documents the dead path");
+		assert!(!super::super::INSTRUCTIONS.contains("comment_ids"), "server instructions still mention comment_ids");
+	}
+
+	#[test]
+	fn get_subreddit_comments_says_it_is_blocked_instead_of_trying() {
+		let tool = definitions().into_iter().find(|t| t["name"] == "get_subreddit_comments").expect("tool");
+		assert!(
+			tool["description"].as_str().unwrap().contains("blocks"),
+			"description should warn that Reddit blocks this anonymously"
+		);
+		let err = futures_lite::future::block_on(call("get_subreddit_comments", &json!({"subreddit": "rust"}))).unwrap_err();
+		assert!(
+			err.contains("anonymous") && err.contains("browse_subreddit"),
+			"error should explain and point at an alternative: {err}"
+		);
 	}
 
 	#[test]

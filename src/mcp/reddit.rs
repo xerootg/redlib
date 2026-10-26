@@ -489,25 +489,35 @@ pub async fn browse_domain(domain: &str, sort: &str, time: &str, limit: u64, aft
 	Ok(listing_result(&res, project_children(&res, project_post)))
 }
 
-/// Recent comments across a whole subreddit, newest first.
+/// Recent comments across a whole subreddit.
 ///
-/// This is the comment firehose, unrelated to any single post -- useful for
-/// gauging what a community is actively talking about.
-pub async fn get_subreddit_comments(sub: &str, limit: u64, after: Option<&str>) -> Result<Value, String> {
+/// Reddit answers /r/<sub>/comments.json with an HTML 403 to anonymous
+/// callers, and nothing else exposes the stream: search ignores type=comment
+/// and by_id only resolves posts. So this reports the block rather than
+/// spending a request to learn it.
+pub fn get_subreddit_comments(sub: &str) -> Result<Value, String> {
 	let sub = normalize_subreddit(sub);
 	if sub.is_empty() {
 		return Err("subreddit is required. Pass a community name such as \"rust\", or call search_subreddits to find one.".to_string());
 	}
+	Err(format!(
+		"Reddit blocks the recent-comments stream of r/{sub} for anonymous callers, and this server has no account. Call browse_subreddit with sort \"new\" for the newest posts, then get_post to read the discussion under one."
+	))
+}
 
-	let q = query(&[
-		("limit", limit.to_string()),
-		("after", after.unwrap_or_default().to_string()),
-		("raw_json", "1".to_string()),
-	]);
-
-	let res = get(format!("/r/{sub}/comments.json?{q}"), true).await?;
-	let children = res.get("data").and_then(|d| d.get("children")).and_then(Value::as_array).cloned().unwrap_or_default();
-	Ok(listing_result(&res, project_mixed(&children)))
+/// Picks the `num`th stickied post (1-based, listing order) from a subreddit
+/// listing. Reddit puts pinned posts first in hot, and allows at most two.
+fn select_sticky(listing: &Value, num: u64) -> Option<&Value> {
+	if !(1..=2).contains(&num) {
+		return None;
+	}
+	listing
+		.get("data")?
+		.get("children")?
+		.as_array()?
+		.iter()
+		.filter(|c| c.get("kind").and_then(Value::as_str) == Some("t3") && c.get("data").map(|d| bool_of(d, "stickied")).unwrap_or(false))
+		.nth(num as usize - 1)
 }
 
 /// A subreddit's pinned post. `num` is 1 or 2 -- Reddit allows two.
@@ -520,30 +530,17 @@ pub async fn get_sticky(sub: &str, num: u64, max_depth: u32) -> Result<Value, St
 		return Err(format!("invalid num: {num} (a subreddit has at most two stickies, so this must be 1 or 2)"));
 	}
 
-	// Reddit answers 404 when the slot is empty, which is an ordinary state --
-	// most subreddits pin nothing. Passing the raw HTTP error through would
-	// read as a broken call rather than "there isn't one".
-	let res = get(format!("/r/{sub}/about/sticky.json?num={num}&raw_json=1"), true).await.map_err(|e| {
-		if e.contains("404") {
-			format!("r/{sub} has no sticky post in slot {num}")
-		} else {
-			e
-		}
-	})?;
+	// /about/sticky.json is 403 for anonymous callers, but pinned posts lead
+	// the hot listing with stickied set. Most subreddits pin nothing, which is
+	// an ordinary state, so say "there isn't one" rather than failing.
+	let hot = get(format!("/r/{sub}/hot.json?limit=5&raw_json=1"), true).await?;
+	let id = select_sticky(&hot, num)
+		.and_then(|c| c.get("data"))
+		.and_then(|d| str_of(d, "id"))
+		.ok_or_else(|| format!("r/{sub} has no sticky post in slot {num}"))?;
 
-	// Same two-element [post, comments] shape as /comments/<id>.
-	let arr = res.as_array().ok_or_else(|| format!("r/{sub} has no sticky post in slot {num}"))?;
-	let post = arr
-		.first()
-		.and_then(|l| l.get("data"))
-		.and_then(|d| d.get("children"))
-		.and_then(Value::as_array)
-		.and_then(|c| c.first())
-		.map(project_post)
-		.ok_or_else(|| format!("r/{sub} has no sticky post at position {num}"))?;
-
-	let comments = arr.get(1).map(|l| project_comments(l, 0, max_depth)).unwrap_or_default();
-	Ok(json!({ "post": post, "comments": comments }))
+	// Comments come from the same GraphQL path get_post uses.
+	get_post(&id, "confidence", 50, max_depth).await
 }
 
 /// One comment plus the replies beneath it, and optionally its ancestors.
@@ -583,22 +580,88 @@ pub async fn get_comment_thread(post_id: &str, comment_id: &str, context: u64, s
 	Ok(json!({ "post": post_obj, "comments": comments }))
 }
 
-/// Looks things up by fullname (`t3_abc`, `t1_def`, `t5_ghi`) or by URL.
-///
-/// The cheapest way to resolve a batch of ids in one call, and the only way to
-/// go from an arbitrary link back to the post that submitted it.
-pub async fn lookup(ids: &[String], url: Option<&str>) -> Result<Value, String> {
-	let q = if let Some(url) = url.map(str::trim).filter(|u| !u.is_empty()) {
-		query(&[("url", url.to_string()), ("raw_json", "1".to_string())])
-	} else if !ids.is_empty() {
-		query(&[("id", ids.join(",")), ("raw_json", "1".to_string())])
-	} else {
-		return Err("provide either ids or url. Use ids for fullnames like \"t3_abc123\", or url to find the post that submitted a link.".to_string());
-	};
+/// Most ids one lookup call will resolve; each costs a request.
+const MAX_LOOKUP_IDS: usize = 20;
+/// How many /by_id requests run at once.
+const LOOKUP_CONCURRENCY: usize = 4;
 
-	let res = get(format!("/api/info.json?{q}"), true).await?;
-	let children = res.get("data").and_then(|d| d.get("children")).and_then(Value::as_array).cloned().unwrap_or_default();
-	Ok(listing_result(&res, project_mixed(&children)))
+/// Splits requested fullnames into post ids that can be fetched and per-item
+/// errors for the rest. Reddit blocks /api/info for anonymous callers and
+/// /by_id only resolves posts (t3_), so comments and subreddits cannot be
+/// looked up by fullname.
+fn plan_lookup(ids: &[String]) -> (Vec<String>, Vec<Value>) {
+	let mut fetch: Vec<String> = Vec::new();
+	let mut errors = Vec::new();
+	for raw in ids {
+		let id = raw.trim();
+		if let Some(post) = id.strip_prefix("t3_").filter(|p| !p.is_empty()) {
+			if fetch.iter().any(|f| f == post) {
+				continue;
+			}
+			if fetch.len() >= MAX_LOOKUP_IDS {
+				errors.push(json!({"id": id, "error": format!("not looked up: at most {MAX_LOOKUP_IDS} ids per call. Repeat the call with the rest.")}));
+			} else {
+				fetch.push(post.to_string());
+			}
+		} else if id.starts_with("t1_") {
+			errors.push(json!({"id": id, "error": "Reddit blocks fullname lookup of comments for anonymous callers. Use get_comment_thread with the post id and this comment id."}));
+		} else if id.starts_with("t5_") {
+			errors.push(json!({"id": id, "error": "Reddit blocks fullname lookup of subreddits for anonymous callers. Use get_subreddit_about with the subreddit name."}));
+		} else {
+			errors.push(json!({"id": id, "error": "not a fullname. Expected t3_<id> (post), t1_<id> (comment) or t5_<id> (subreddit)."}));
+		}
+	}
+	(fetch, errors)
+}
+
+/// Search path that finds submissions of a URL. The url is encoded because
+/// it carries its own `?` and `&`.
+fn lookup_search_path(url: &str) -> String {
+	let q = query(&[("q", format!("url:{url}")), ("sort", "new".to_string()), ("raw_json", "1".to_string())]);
+	format!("/search.json?{q}")
+}
+
+/// Looks things up by post fullname (`t3_abc`) or by URL.
+///
+/// Posts are fetched one /by_id request each (Reddit rejects multi-id
+/// /by_id and all of /api/info for anonymous callers); other fullnames come
+/// back as per-item errors. A URL is resolved with a `url:` search.
+pub async fn lookup(ids: &[String], url: Option<&str>) -> Result<Value, String> {
+	if let Some(url) = url.map(str::trim).filter(|u| !u.is_empty()) {
+		let res = get(lookup_search_path(url), true).await?;
+		return Ok(listing_result(&res, project_children(&res, project_post)));
+	}
+	if ids.is_empty() {
+		return Err("provide either ids or url. Use ids for fullnames like \"t3_abc123\", or url to find the post that submitted a link.".to_string());
+	}
+
+	let (fetch, mut errors) = plan_lookup(ids);
+	let mut items = Vec::new();
+	for chunk in fetch.chunks(LOOKUP_CONCURRENCY) {
+		let handles: Vec<_> = chunk
+			.iter()
+			.map(|id| {
+				let path = format!("/by_id/t3_{id}.json?raw_json=1");
+				tokio::spawn(async move { get(path, true).await })
+			})
+			.collect();
+		for (id, handle) in chunk.iter().zip(handles) {
+			match handle.await {
+				Ok(Ok(res)) => match res.get("data").and_then(|d| d.get("children")).and_then(Value::as_array).and_then(|c| c.first()) {
+					Some(post) => items.push(project_post(post)),
+					None => errors.push(json!({"id": format!("t3_{id}"), "error": "post not found"})),
+				},
+				Ok(Err(e)) => errors.push(json!({"id": format!("t3_{id}"), "error": e})),
+				Err(e) => errors.push(json!({"id": format!("t3_{id}"), "error": e.to_string()})),
+			}
+		}
+	}
+
+	let mut out = json!({ "count": items.len(), "after": null, "items": items });
+	if !errors.is_empty() {
+		out["errors"] = Value::Array(errors);
+	}
+	Ok(out)
 }
 
 /// `kind` is popular / new / default.
@@ -770,54 +833,6 @@ pub async fn get_more_comments_cursor(post_id: &str, cursor: &str, parent_id: Op
 	let arr = res.as_array().ok_or("unexpected response shape from Reddit")?;
 	let comments = with_next_page(arr.get(1), project_comments_or_empty(arr.get(1), max_depth), &id);
 	Ok(json!({ "comments": comments }))
-}
-
-/// Fetches comments elided behind a `more` node.
-pub async fn get_more_comments(post_id: &str, comment_ids: &[String], sort: &str) -> Result<Value, String> {
-	validate("comment_sort", sort, &COMMENT_SORTS)?;
-	let id = extract_post_id(post_id)?;
-	if comment_ids.is_empty() {
-		return Err("pass cursor and parent_id, or comment_ids, from an entry with type \"more\" in a get_post result.".to_string());
-	}
-
-	// The api/morechildren endpoint needs a t3_ fullname for link_id.
-	let q = query(&[
-		("link_id", format!("t3_{id}")),
-		("children", comment_ids.join(",")),
-		("sort", sort.to_string()),
-		("api_type", "json".to_string()),
-		("raw_json", "1".to_string()),
-	]);
-
-	let res = get(format!("/api/morechildren.json?{q}"), true).await?;
-	let things = res
-		.get("json")
-		.and_then(|j| j.get("data"))
-		.and_then(|d| d.get("things"))
-		.and_then(Value::as_array)
-		.cloned()
-		.unwrap_or_default();
-
-	// morechildren returns a flat list, not a tree; callers reassemble via
-	// parent_id if they need the hierarchy.
-	let comments: Vec<Value> = things
-		.iter()
-		.filter(|t| t.get("kind").and_then(Value::as_str) == Some("t1"))
-		.filter_map(|t| {
-			let d = t.get("data")?;
-			Some(json!({
-				"type": "comment",
-				"id": str_of(d, "id"),
-				"parent_id": str_of(d, "parent_id"),
-				"author": str_of(d, "author"),
-				"body": str_of(d, "body"),
-				"score": num_of(d, "score"),
-				"created_utc": d.get("created_utc").and_then(Value::as_f64).map(|f| f as i64),
-			}))
-		})
-		.collect();
-
-	Ok(json!({ "count": comments.len(), "comments": comments }))
 }
 
 pub async fn search_posts(q: &str, sub: Option<&str>, sort: &str, time: &str, limit: u64, after: Option<&str>) -> Result<Value, String> {
@@ -1037,6 +1052,11 @@ pub async fn get_duplicates(post_id: &str, limit: u64, after: Option<&str>) -> R
 
 /// Escape hatch for endpoints this module does not model.
 ///
+/// `/api/` read endpoints that work anonymously. `/api/info` and
+/// `/api/morechildren` are deliberately absent: Reddit answers both with an
+/// HTML 403, so allowing them would only produce parse errors.
+const ALLOWED_API_READS: [&str; 2] = ["/api/subreddit_autocomplete", "/api/multi"];
+
 /// Restricted to GET-shaped read paths. The token is anonymous so there is no
 /// account to damage, but a stray call to a write endpoint would still be a
 /// confusing failure, and Reddit's own `/api/` surface is mostly mutating.
@@ -1051,7 +1071,6 @@ pub async fn raw_api(path: &str) -> Result<Value, String> {
 
 	// Allow the handful of /api/ read endpoints we know are safe; reject the
 	// rest, which are all mutations.
-	const ALLOWED_API_READS: [&str; 4] = ["/api/morechildren", "/api/info", "/api/subreddit_autocomplete", "/api/multi"];
 	if path.starts_with("/api/") && !ALLOWED_API_READS.iter().any(|a| path.starts_with(a)) {
 		return Err(format!(
 			"refusing to call {path}: only read endpoints are permitted. Allowed /api/ paths: {}",

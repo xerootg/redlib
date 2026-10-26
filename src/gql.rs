@@ -445,10 +445,7 @@ mod tests {
 		for path in ["/user/someone/comments/1xdp2ww/title/.json", "/u/someone/comments/1xdp2ww.json"] {
 			assert_eq!(parse_path(path), Some(("1xdp2ww".into(), None)), "{path}");
 		}
-		assert_eq!(
-			parse_path("/user/someone/comments/1xdp2ww/title/abc.json"),
-			Some(("1xdp2ww".into(), Some("abc".into())))
-		);
+		assert_eq!(parse_path("/user/someone/comments/1xdp2ww/title/abc.json"), Some(("1xdp2ww".into(), Some("abc".into()))));
 		assert_eq!(
 			parse_path("/r/unixporn/comments/1xdp2ww/title/abc/.json?context=3"),
 			Some(("1xdp2ww".into(), Some("abc".into())))

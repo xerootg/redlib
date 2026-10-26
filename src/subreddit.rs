@@ -709,6 +709,57 @@ fn get_mime_type(url: &str) -> &'static str {
 mod tests {
 	use super::*;
 
+	#[test]
+	fn test_multi_api_path() {
+		assert_eq!(
+			multi_api_path("kjoneslol", "sfwpornnetwork", "hot", "").unwrap(),
+			"/user/kjoneslol/m/sfwpornnetwork/hot.json?&raw_json=1"
+		);
+		assert_eq!(
+			multi_api_path("kjoneslol", "sfwpornnetwork", "top", "t=week&after=t3_abc").unwrap(),
+			"/user/kjoneslol/m/sfwpornnetwork/top.json?t=week&after=t3_abc&raw_json=1"
+		);
+		for sort in ["hot", "new", "top", "rising", "controversial"] {
+			assert!(multi_api_path("a", "b", sort, "").is_ok(), "{sort} should be accepted");
+		}
+	}
+
+	#[test]
+	fn test_multi_api_path_rejects_bad_input() {
+		assert!(multi_api_path("a", "b", "bogus", "").is_err());
+		assert!(multi_api_path("a", "b", "hot/../x", "").is_err());
+		assert!(multi_api_path("a/b", "c", "hot", "").is_err());
+		assert!(multi_api_path("a", "b?c", "hot", "").is_err());
+		assert!(multi_api_path("", "b", "hot", "").is_err());
+	}
+
+	#[test]
+	fn test_multi_template_header() {
+		let html = SubredditTemplate {
+			sub: Subreddit {
+				title: "m/sfwpornnetwork".to_string(),
+				..Subreddit::default()
+			},
+			posts: Vec::new(),
+			sort: ("hot".to_string(), String::new()),
+			ends: (String::new(), String::new()),
+			prefs: Preferences::default(),
+			url: String::new(),
+			redirect_url: String::new(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			multi_root: "/user/kjoneslol/m/sfwpornnetwork".to_string(),
+			multi_owner: "kjoneslol".to_string(),
+		}
+		.render()
+		.unwrap();
+		assert!(html.contains("href=\"/user/kjoneslol/m/sfwpornnetwork/new\""), "sort links must stay inside the multi");
+		assert!(html.contains("u/kjoneslol"), "header must name the owner");
+		assert!(html.contains("sfwpornnetwork"), "header must name the multi");
+	}
+
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_fetching_subreddit() {
 		let subreddit = subreddit("rust", false).await;

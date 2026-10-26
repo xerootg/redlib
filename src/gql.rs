@@ -40,14 +40,8 @@ pub async fn thread(path: String, quarantine: bool) -> Result<Value, String> {
 	let mut comments = comment_listing(&response, &id)?;
 	if let Some(comment_id) = comment_id {
 		let context = param(&path, "context").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-		if context > 0 && param(&path, "cursor").is_none() {
-			let children = comments["data"]["children"].as_array().ok_or("Invalid comments listing")?;
-			let (mut depth, mut focused) = focused_branch(children, &comment_id).ok_or("Comment not found")?;
-			while depth > context {
-				focused = focused["data"]["replies"]["data"]["children"][0].take();
-				depth -= 1;
-			}
-			comments = listing(vec![focused]);
+		if param(&path, "cursor").is_none() {
+			comments = focus(&comments, &comment_id, context)?;
 		}
 	}
 	comments["data"]["sort"] = if sort == "best" { "confidence".into() } else { sort.into() };
@@ -138,6 +132,20 @@ fn comment_listing(response: &Value, post_id: &str) -> Result<Value, String> {
 
 fn is_next_page(tree: &Value) -> bool {
 	tree["depth"] == 0 && tree["parentId"].is_null() && !tree["more"].is_null()
+}
+
+/// Trim a comment listing down to the focused comment and `context` ancestors.
+fn focus(comments: &Value, id: &str, context: usize) -> Result<Value, String> {
+	let children = comments["data"]["children"].as_array().ok_or("Invalid comments listing")?;
+	// A removed or nonexistent comment yields an empty listing; the post page explains it.
+	let Some((mut depth, mut focused)) = focused_branch(children, id) else {
+		return Ok(listing(Vec::new()));
+	};
+	while depth > context {
+		focused = focused["data"]["replies"]["data"]["children"][0].take();
+		depth -= 1;
+	}
+	Ok(listing(vec![focused]))
 }
 
 /// Retain the ancestor chain of a focused comment without unrelated siblings.
@@ -445,10 +453,7 @@ mod tests {
 		for path in ["/user/someone/comments/1xdp2ww/title/.json", "/u/someone/comments/1xdp2ww.json"] {
 			assert_eq!(parse_path(path), Some(("1xdp2ww".into(), None)), "{path}");
 		}
-		assert_eq!(
-			parse_path("/user/someone/comments/1xdp2ww/title/abc.json"),
-			Some(("1xdp2ww".into(), Some("abc".into())))
-		);
+		assert_eq!(parse_path("/user/someone/comments/1xdp2ww/title/abc.json"), Some(("1xdp2ww".into(), Some("abc".into()))));
 		assert_eq!(
 			parse_path("/r/unixporn/comments/1xdp2ww/title/abc/.json?context=3"),
 			Some(("1xdp2ww".into(), Some("abc".into())))
@@ -542,6 +547,22 @@ mod tests {
 		assert_eq!(replies[0]["data"]["id"], "b");
 		assert_eq!(replies[0]["data"]["replies"]["data"]["children"][0]["data"]["id"], "c");
 		assert!(focused_branch(children, "missing").is_none());
+	}
+
+	#[test]
+	fn missing_focused_comment_yields_an_empty_listing_for_any_context() {
+		let response = json_value!({"data":{"postInfoById":{"commentForest":{"trees":[
+			{"depth":0,"node":{"id":"t1_a","__typename":"Comment"}},
+			{"depth":1,"parentId":"t1_a","node":{"id":"t1_b","__typename":"Comment"}}
+		]}}}});
+		let comments = comment_listing(&response, "p").unwrap();
+		for context in [0, 3] {
+			let result = focus(&comments, "gone", context).expect("a missing comment is not an error");
+			assert_eq!(result["data"]["children"], json_value!([]), "context={context}");
+		}
+		// A comment that exists is still focused, with and without context.
+		assert_eq!(focus(&comments, "b", 1).unwrap()["data"]["children"][0]["data"]["id"], "a");
+		assert_eq!(focus(&comments, "b", 0).unwrap()["data"]["children"][0]["data"]["id"], "b");
 	}
 
 	#[test]

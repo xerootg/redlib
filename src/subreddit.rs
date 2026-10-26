@@ -1,8 +1,8 @@
 #![allow(clippy::cmp_owned)]
 
 use crate::utils::{
-	catch_random, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls, setting, template, to_absolute_url, val, Post,
-	Preferences, Subreddit,
+	catch_random, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls, setting, setting_or_default, template,
+	to_absolute_url, val, Post, Preferences, Subreddit,
 };
 use crate::{client::json, server::RequestExt, server::ResponseExt};
 use crate::{config, utils};
@@ -62,7 +62,7 @@ static GEO_FILTER_MATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"geo_fil
 
 /// The post sort to use when the URL doesn't name one
 fn default_post_sort(req: &Request<Body>) -> String {
-	req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string())
+	setting_or_default(req, "post_sort", "hot".to_string())
 }
 
 // SERVICES

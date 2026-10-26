@@ -1443,9 +1443,14 @@ pub fn to_absolute_url(relative_path: &str) -> String {
 	format!("{}{}", config::get_setting("REDLIB_FULL_URL").unwrap_or_default(), relative_path)
 }
 
+/// Maps a Reddit gallery id (from `/gallery/:id`) to the post path it redirects to.
+pub fn gallery_redirect_path(_id: &str) -> Option<String> {
+	None
+}
+
 #[cfg(test)]
 mod tests {
-	use super::{deflate_compress, deflate_decompress, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, url_path_basename, Post, Preferences};
+	use super::{deflate_compress, gallery_redirect_path, deflate_decompress, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, url_path_basename, Post, Preferences};
 
 	#[test]
 	fn format_num_works() {
@@ -1688,5 +1693,20 @@ How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or t
 		let decompressed = if compression { deflate_decompress(compressed).unwrap() } else { compressed };
 		let deserialized: Preferences = bincode::deserialize(&decompressed).unwrap();
 		assert_eq!(*input, deserialized);
+	}
+
+	#[test]
+	fn gallery_redirect_path_accepts_post_ids() {
+		assert_eq!(gallery_redirect_path("1xaq1rn"), Some("/comments/1xaq1rn".to_string()));
+		assert_eq!(gallery_redirect_path("abc12"), Some("/comments/abc12".to_string()));
+	}
+
+	#[test]
+	fn gallery_redirect_path_rejects_bad_ids() {
+		assert_eq!(gallery_redirect_path(""), None);
+		assert_eq!(gallery_redirect_path("abcd"), None);
+		assert_eq!(gallery_redirect_path("abcdefgh"), None);
+		assert_eq!(gallery_redirect_path("ab/../c"), None);
+		assert_eq!(gallery_redirect_path("ab\r\nLoc"), None);
 	}
 }

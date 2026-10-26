@@ -1689,4 +1689,25 @@ How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or t
 		let deserialized: Preferences = bincode::deserialize(&decompressed).unwrap();
 		assert_eq!(*input, deserialized);
 	}
+	#[tokio::test]
+	async fn video_with_audio_is_flagged_as_silent_download() {
+		let post = serde_json::json!({
+			"permalink": "/r/videos/comments/abc/title/",
+			"secure_media": {"reddit_video": {"fallback_url": "https://v.redd.it/foo/DASH_720.mp4?source=fallback", "has_audio": true, "is_gif": false}},
+		});
+		let (post_type, media, _) = super::Media::parse(&post).await;
+		assert_eq!(post_type, "video");
+		assert!(media.download_silent);
+	}
+
+	#[tokio::test]
+	async fn video_without_audio_is_not_flagged() {
+		let post = serde_json::json!({
+			"permalink": "/r/videos/comments/abc/title/",
+			"secure_media": {"reddit_video": {"fallback_url": "https://v.redd.it/foo/DASH_720.mp4?source=fallback", "has_audio": false, "is_gif": false}},
+		});
+		let (_, media, _) = super::Media::parse(&post).await;
+		assert!(!media.download_silent);
+	}
+
 }

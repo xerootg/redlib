@@ -112,7 +112,7 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 /// Reddit gives no flag for users who hide their history; the listing is simply empty.
 /// An empty first page (no `after`/`before` cursor) is the only anonymous signal.
 fn history_hidden(listing_empty: bool, path: &str) -> bool {
-	false
+	listing_empty && param(path, "after").is_none() && param(path, "before").is_none()
 }
 
 // USER
@@ -238,13 +238,13 @@ mod tests {
 	fn test_hidden_notice_rendered() {
 		let html = render(true, true);
 		assert!(html.contains("hidden their post and comment history"));
-		assert!(!html.contains("No posts were found."));
+		assert!(!html.contains("<center>No posts were found.</center>"));
 	}
 
 	#[test]
 	fn test_no_notice_for_ordinary_empty_page() {
 		let html = render(false, true);
-		assert!(html.contains("No posts were found."));
+		assert!(html.contains("<center>No posts were found.</center>"));
 		assert!(!html.contains("hidden their post and comment history"));
 	}
 

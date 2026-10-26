@@ -50,7 +50,9 @@
 			<center>All posts are hidden because they are NSFW. Enable "Show NSFW posts" in settings to view.</center>
 			{% endif %}
 
-			{% if no_posts %}
+			{% if quarantine_empty %}
+			<center>Reddit only shows quarantined communities to logged-in accounts, so this community cannot be viewed anonymously.</center>
+			{% else if no_posts %}
 			<center>No posts were found.</center>
 			{% endif %}
 

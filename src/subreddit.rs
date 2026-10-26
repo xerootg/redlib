@@ -186,7 +186,8 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					all_posts_filtered,
 					all_posts_hidden_nsfw,
 					no_posts,
-					quarantine_empty: false,
+					// Opted in, yet Reddit sent nothing on the first page: anonymous clients get no quarantined posts.
+					quarantine_empty: no_posts && quarantined && !root && param(&path, "after").is_none(),
 				}))
 			}
 			Err(msg) => match msg.as_str() {

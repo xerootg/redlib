@@ -1444,13 +1444,17 @@ pub fn to_absolute_url(relative_path: &str) -> String {
 }
 
 /// Maps a Reddit gallery id (from `/gallery/:id`) to the post path it redirects to.
-pub fn gallery_redirect_path(_id: &str) -> Option<String> {
-	None
+pub fn gallery_redirect_path(id: &str) -> Option<String> {
+	// Same length bounds as short links; alphanumeric only so the id is safe in a Location header
+	((5..8).contains(&id.len()) && id.chars().all(|c| c.is_ascii_alphanumeric())).then(|| format!("/comments/{id}"))
 }
 
 #[cfg(test)]
 mod tests {
-	use super::{deflate_compress, gallery_redirect_path, deflate_decompress, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, url_path_basename, Post, Preferences};
+	use super::{
+		deflate_compress, deflate_decompress, format_num, format_url, gallery_redirect_path, render_bullet_lists, rewrite_emotes, rewrite_urls, url_path_basename, Post,
+		Preferences,
+	};
 
 	#[test]
 	fn format_num_works() {

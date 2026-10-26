@@ -40,7 +40,7 @@ pub async fn thread(path: String, quarantine: bool) -> Result<Value, String> {
 	let mut comments = comment_listing(&response, &id)?;
 	if let Some(comment_id) = comment_id {
 		let context = param(&path, "context").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
-		if context > 0 && param(&path, "cursor").is_none() {
+		if param(&path, "cursor").is_none() {
 			comments = focus(&comments, &comment_id, context)?;
 		}
 	}
@@ -137,7 +137,10 @@ fn is_next_page(tree: &Value) -> bool {
 /// Trim a comment listing down to the focused comment and `context` ancestors.
 fn focus(comments: &Value, id: &str, context: usize) -> Result<Value, String> {
 	let children = comments["data"]["children"].as_array().ok_or("Invalid comments listing")?;
-	let (mut depth, mut focused) = focused_branch(children, id).ok_or("Comment not found")?;
+	// A removed or nonexistent comment yields an empty listing; the post page explains it.
+	let Some((mut depth, mut focused)) = focused_branch(children, id) else {
+		return Ok(listing(Vec::new()));
+	};
 	while depth > context {
 		focused = focused["data"]["replies"]["data"]["children"][0].take();
 		depth -= 1;
@@ -450,10 +453,7 @@ mod tests {
 		for path in ["/user/someone/comments/1xdp2ww/title/.json", "/u/someone/comments/1xdp2ww.json"] {
 			assert_eq!(parse_path(path), Some(("1xdp2ww".into(), None)), "{path}");
 		}
-		assert_eq!(
-			parse_path("/user/someone/comments/1xdp2ww/title/abc.json"),
-			Some(("1xdp2ww".into(), Some("abc".into())))
-		);
+		assert_eq!(parse_path("/user/someone/comments/1xdp2ww/title/abc.json"), Some(("1xdp2ww".into(), Some("abc".into()))));
 		assert_eq!(
 			parse_path("/r/unixporn/comments/1xdp2ww/title/abc/.json?context=3"),
 			Some(("1xdp2ww".into(), Some("abc".into())))

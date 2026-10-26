@@ -92,6 +92,12 @@
 			{{ c.render().unwrap()|safe }}
 		</div>
 		{%- endfor %}
+		{% if single_thread && comments.is_empty() && comment_query == "" %}
+		<div class="thread">
+			<p class="thread_nav">This comment was removed, deleted, or doesn't exist.</p>
+			<p class="thread_nav"><a href="{{ post.permalink }}">View all comments</a></p>
+		</div>
+		{% endif %}
 		{% if next_cursor != "" %}
 		<a class="deeper_replies" href="{{ post.permalink }}?sort={{ sort }}&amp;cursor={{ next_cursor }}">&rarr; More comments</a>
 		{% endif %}

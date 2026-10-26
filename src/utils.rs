@@ -1719,5 +1719,4 @@ How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or t
 			assert!(html.contains(&format!("id=\"{id}\"")), "check_update.js uses id {id:?} missing from error page");
 		}
 	}
-
 }

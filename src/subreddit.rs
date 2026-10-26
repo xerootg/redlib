@@ -40,6 +40,8 @@ struct SubredditTemplate {
 	multi_root: String,
 	/// Owner of the multireddit being shown, empty for subreddits.
 	multi_owner: String,
+	/// Whether the empty listing is because Reddit only serves this quarantined community to logged-in accounts.
+	quarantine_empty: bool,
 }
 
 #[derive(Template)]
@@ -175,6 +177,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			no_posts: false,
 			multi_root: String::new(),
 			multi_owner: String::new(),
+			quarantine_empty: false,
 		}))
 	} else {
 		match Post::fetch(&path, quarantined).await {
@@ -200,6 +203,8 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					no_posts,
 					multi_root: String::new(),
 					multi_owner: String::new(),
+					// Opted in, yet Reddit sent nothing on the first page: anonymous clients get no quarantined posts.
+					quarantine_empty: no_posts && quarantined && !root && param(&path, "after").is_none(),
 				}))
 			}
 			Err(msg) => match msg.as_str() {
@@ -264,6 +269,7 @@ pub async fn multi(req: Request<Body>) -> Result<Response<Body>, String> {
 				no_posts,
 				multi_root: format!("/user/{name}/m/{multi}"),
 				multi_owner: name,
+				quarantine_empty: false,
 			}))
 		}
 		Err(msg) => error(req, &msg).await,
@@ -828,6 +834,7 @@ mod tests {
 			no_posts: false,
 			multi_root: "/user/kjoneslol/m/sfwpornnetwork".to_string(),
 			multi_owner: "kjoneslol".to_string(),
+			quarantine_empty: false,
 		}
 		.render()
 		.unwrap();
@@ -874,5 +881,40 @@ mod tests {
 	#[sealed_test(env = [("REDLIB_DEFAULT_POST_SORT", "new")])]
 	fn test_default_post_sort_cookie_wins() {
 		assert_eq!(default_post_sort(&request(Some("post_sort=top"))), "top");
+	}
+
+	fn empty_listing(quarantine_empty: bool) -> String {
+		SubredditTemplate {
+			sub: Subreddit::default(),
+			posts: Vec::new(),
+			sort: ("hot".to_string(), String::new()),
+			ends: (String::new(), String::new()),
+			prefs: Preferences::default(),
+			url: "/r/TheRedPill".to_string(),
+			redirect_url: "r/TheRedPill".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: true,
+			multi_root: String::new(),
+			multi_owner: String::new(),
+			quarantine_empty,
+		}
+		.render()
+		.unwrap()
+	}
+
+	#[test]
+	fn empty_quarantined_listing_explains_login_requirement() {
+		let html = empty_listing(true);
+		assert!(html.contains("only shows quarantined communities to logged-in accounts"));
+		assert!(!html.contains("No posts were found."));
+	}
+
+	#[test]
+	fn empty_regular_listing_keeps_generic_message() {
+		let html = empty_listing(false);
+		assert!(html.contains("No posts were found."));
+		assert!(!html.contains("logged-in accounts"));
 	}
 }

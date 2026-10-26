@@ -1,8 +1,8 @@
 #![allow(clippy::cmp_owned)]
 
 use crate::utils::{
-	catch_random, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls, setting, template, to_absolute_url, val, Post,
-	Preferences, Subreddit,
+	catch_random, error, filter_posts, format_num, format_url, get_filters, info, is_account_only_subreddit, nsfw_landing, param, redirect, rewrite_urls, setting, template,
+	to_absolute_url, val, Post, Preferences, Subreddit, ACCOUNT_ONLY_MSG,
 };
 use crate::{client::json, server::RequestExt, server::ResponseExt};
 use crate::{config, utils};
@@ -97,6 +97,10 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			)
 			.await;
 		}
+	}
+
+	if is_account_only_subreddit(&sub_name) {
+		return error(req, ACCOUNT_ONLY_MSG).await;
 	}
 
 	let quarantined = can_access_quarantine(&req, &sub_name) || root;

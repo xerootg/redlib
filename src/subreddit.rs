@@ -1,8 +1,8 @@
 #![allow(clippy::cmp_owned)]
 
 use crate::utils::{
-	catch_random, error, filter_posts, format_num, format_url, get_filters, info, is_account_only_subreddit, nsfw_landing, param, redirect, rewrite_urls, setting, template,
-	to_absolute_url, val, Post, Preferences, Subreddit, ACCOUNT_ONLY_MSG,
+	catch_random, error, filter_posts, format_num, format_url, get_filters, info, is_account_only_subreddit, nsfw_landing, param, redirect, rewrite_urls, setting,
+	setting_or_default, template, to_absolute_url, val, Post, Preferences, Subreddit, ACCOUNT_ONLY_MSG,
 };
 use crate::{client::json, server::RequestExt, server::ResponseExt};
 use crate::{config, utils};
@@ -64,6 +64,11 @@ struct WallTemplate {
 
 static GEO_FILTER_MATCH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"geo_filter=(?<region>\w+)").unwrap());
 
+/// The post sort to use when the URL doesn't name one
+fn default_post_sort(req: &Request<Body>) -> String {
+	setting_or_default(req, "post_sort", "hot".to_string())
+}
+
 // SERVICES
 pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	// Build Reddit API path
@@ -72,7 +77,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 	let subscribed = setting(&req, "subscriptions");
 	let front_page = setting(&req, "front_page");
 	let remove_default_feeds = setting(&req, "remove_default_feeds") == "on";
-	let post_sort = req.cookie("post_sort").map_or_else(|| "hot".to_string(), |c| c.value().to_string());
+	let post_sort = default_post_sort(&req);
 	let sort = req.param("sort").unwrap_or_else(|| req.param("id").unwrap_or(post_sort));
 
 	let sub_name = req.param("sub").unwrap_or(if front_page == "default" || front_page.is_empty() {
@@ -778,6 +783,7 @@ fn get_mime_type(url: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use sealed_test::prelude::*;
 
 	#[test]
 	fn test_multi_api_path() {
@@ -842,5 +848,31 @@ mod tests {
 		assert!(quarantined.is_ok());
 		let gated = subreddit("drugs", true).await;
 		assert!(gated.is_ok());
+	}
+
+	fn request(cookie: Option<&str>) -> Request<Body> {
+		let mut builder = Request::builder().uri("/");
+		if let Some(cookie) = cookie {
+			builder = builder.header("cookie", cookie);
+		}
+		builder.body(Body::empty()).unwrap()
+	}
+
+	#[test]
+	#[sealed_test]
+	fn test_default_post_sort_fallback() {
+		assert_eq!(default_post_sort(&request(None)), "hot");
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_DEFAULT_POST_SORT", "new")])]
+	fn test_default_post_sort_instance_default() {
+		assert_eq!(default_post_sort(&request(None)), "new");
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_DEFAULT_POST_SORT", "new")])]
+	fn test_default_post_sort_cookie_wins() {
+		assert_eq!(default_post_sort(&request(Some("post_sort=top"))), "top");
 	}
 }

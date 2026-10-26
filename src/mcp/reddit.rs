@@ -1170,6 +1170,68 @@ mod tests {
 	}
 
 	#[test]
+	fn selects_stickied_posts_in_listing_order() {
+		let hot = json!({"data": {"children": [
+			{"kind": "t3", "data": {"id": "first", "stickied": true}},
+			{"kind": "t3", "data": {"id": "second", "stickied": true}},
+			{"kind": "t3", "data": {"id": "plain", "stickied": false}},
+			{"kind": "t3", "data": {"id": "late", "stickied": true}}
+		]}});
+		assert_eq!(select_sticky(&hot, 1).unwrap()["data"]["id"], "first");
+		assert_eq!(select_sticky(&hot, 2).unwrap()["data"]["id"], "second");
+		assert!(select_sticky(&hot, 3).is_none(), "only two sticky slots exist");
+
+		let one = json!({"data": {"children": [
+			{"kind": "t3", "data": {"id": "plain"}},
+			{"kind": "t3", "data": {"id": "pinned", "stickied": true}}
+		]}});
+		assert_eq!(select_sticky(&one, 1).unwrap()["data"]["id"], "pinned");
+		assert!(select_sticky(&one, 2).is_none());
+		assert!(select_sticky(&json!({"data": {"children": []}}), 1).is_none());
+	}
+
+	#[test]
+	fn plans_lookup_into_by_id_requests_and_per_item_errors() {
+		let ids: Vec<String> = ["t3_abc", "t3_abc", "t1_def", "t5_ghi", "xyz", " t3_jkl "].iter().map(ToString::to_string).collect();
+		let (fetch, errors) = plan_lookup(&ids);
+		assert_eq!(fetch, vec!["abc", "jkl"], "t3 ids are deduplicated and stripped of the prefix");
+		assert_eq!(errors.len(), 3);
+		assert_eq!(errors[0]["id"], "t1_def");
+		assert!(errors[0]["error"].as_str().unwrap().contains("anonymous"), "{}", errors[0]);
+		assert_eq!(errors[1]["id"], "t5_ghi");
+		assert_eq!(errors[2]["id"], "xyz");
+		assert!(errors[2]["error"].as_str().unwrap().contains("fullname"), "{}", errors[2]);
+	}
+
+	#[test]
+	fn plan_lookup_bounds_the_number_of_requests() {
+		let ids: Vec<String> = (0..MAX_LOOKUP_IDS + 5).map(|i| format!("t3_id{i}")).collect();
+		let (fetch, errors) = plan_lookup(&ids);
+		assert_eq!(fetch.len(), MAX_LOOKUP_IDS);
+		assert_eq!(errors.len(), 5);
+		assert!(errors[0]["error"].as_str().unwrap().contains("at most"), "{}", errors[0]);
+	}
+
+	#[test]
+	fn url_lookup_goes_through_search() {
+		let path = lookup_search_path("https://example.com/a?b=c&d=e");
+		assert!(path.starts_with("/search.json?"), "{path}");
+		assert!(path.contains("q=url%3A"), "{path}");
+		assert!(!path.contains("b=c&d=e"), "the url must be encoded so its own & does not split the query: {path}");
+	}
+
+	#[test]
+	fn raw_api_no_longer_allows_blocked_api_endpoints() {
+		// Reddit answers these with an HTML 403 to anonymous callers, so
+		// advertising them as allowed would only produce confusing parse errors.
+		assert!(!ALLOWED_API_READS.contains(&"/api/morechildren"));
+		assert!(!ALLOWED_API_READS.contains(&"/api/info"));
+		for path in ["/api/morechildren.json", "/api/info.json?id=t3_abc"] {
+			assert!(futures_lite::future::block_on(raw_api(path)).is_err(), "{path} should be refused");
+		}
+	}
+
+	#[test]
 	fn marks_truncation_at_max_depth_instead_of_silently_stopping() {
 		let listing = json!({"data": {"children": [
 			{"kind": "t1", "data": {"id": "p", "body": "parent",

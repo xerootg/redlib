@@ -763,6 +763,33 @@ mod tests {
 	}
 
 	#[test]
+	fn get_more_comments_only_offers_the_cursor_path() {
+		// api/morechildren is blocked for anonymous callers, and get_post only
+		// emits cursor-based 'more' entries, so comment_ids can never work.
+		let tool = definitions().into_iter().find(|t| t["name"] == "get_more_comments").expect("tool");
+		assert!(tool["inputSchema"]["properties"].get("comment_ids").is_none());
+		assert!(!tool["description"].as_str().unwrap().contains("comment_ids"));
+		let err = futures_lite::future::block_on(call("get_more_comments", &json!({"post_id": "abc"}))).unwrap_err();
+		assert!(err.contains("cursor") && !err.contains("comment_ids"), "{err}");
+	}
+
+	#[test]
+	fn docs_do_not_mention_the_dead_morechildren_path() {
+		let guide = futures_lite::future::block_on(call("reddit_guide", &json!({}))).unwrap();
+		let guide = guide.as_str().unwrap();
+		assert!(!guide.contains("comment_ids") && !guide.contains("morechildren"), "guide still documents the dead path");
+		assert!(!super::super::INSTRUCTIONS.contains("comment_ids"), "server instructions still mention comment_ids");
+	}
+
+	#[test]
+	fn get_subreddit_comments_says_it_is_blocked_instead_of_trying() {
+		let tool = definitions().into_iter().find(|t| t["name"] == "get_subreddit_comments").expect("tool");
+		assert!(tool["description"].as_str().unwrap().contains("blocks"), "description should warn that Reddit blocks this anonymously");
+		let err = futures_lite::future::block_on(call("get_subreddit_comments", &json!({"subreddit": "rust"}))).unwrap_err();
+		assert!(err.contains("anonymous") && err.contains("browse_subreddit"), "error should explain and point at an alternative: {err}");
+	}
+
+	#[test]
 	fn invalid_enum_values_list_the_valid_ones() {
 		let err = futures_lite::future::block_on(call("browse_subreddit", &json!({"subreddit": "rust", "sort": "sideways"}))).unwrap_err();
 		assert!(err.contains("sideways") && err.contains("hot"), "unhelpful: {err}");

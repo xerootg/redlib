@@ -1447,14 +1447,14 @@ pub fn to_absolute_url(relative_path: &str) -> String {
 pub const ACCOUNT_ONLY_MSG: &str = "This page needs a Reddit account. Redlib browses Reddit anonymously, so it can't show it.";
 
 /// Whether a user listing (`/user/<name>/<listing>`) is private to the account owner.
-pub fn is_account_only_user_listing(_listing: &str) -> bool {
-	false
+pub fn is_account_only_user_listing(listing: &str) -> bool {
+	matches!(listing.to_ascii_lowercase().as_str(), "saved" | "upvoted" | "downvoted" | "hidden")
 }
 
 /// Whether a subreddit path component is a feed that only exists for a logged-in account
 /// (`friends`, `mod`), alone or as part of a multireddit.
-pub fn is_account_only_subreddit(_sub: &str) -> bool {
-	false
+pub fn is_account_only_subreddit(sub: &str) -> bool {
+	sub.split('+').any(|s| s.eq_ignore_ascii_case("friends") || s.eq_ignore_ascii_case("mod"))
 }
 
 #[cfg(test)]

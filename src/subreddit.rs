@@ -36,6 +36,8 @@ struct SubredditTemplate {
 	/// Whether all posts were hidden because they are NSFW (and user has disabled show NSFW)
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
+	/// Whether the empty listing is because Reddit only serves this quarantined community to logged-in accounts.
+	quarantine_empty: bool,
 }
 
 #[derive(Template)]
@@ -160,6 +162,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
+			quarantine_empty: false,
 		}))
 	} else {
 		match Post::fetch(&path, quarantined).await {
@@ -183,6 +186,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					all_posts_filtered,
 					all_posts_hidden_nsfw,
 					no_posts,
+					quarantine_empty: false,
 				}))
 			}
 			Err(msg) => match msg.as_str() {
@@ -721,5 +725,38 @@ mod tests {
 		assert!(quarantined.is_ok());
 		let gated = subreddit("drugs", true).await;
 		assert!(gated.is_ok());
+	}
+
+	fn empty_listing(quarantine_empty: bool) -> String {
+		SubredditTemplate {
+			sub: Subreddit::default(),
+			posts: Vec::new(),
+			sort: ("hot".to_string(), String::new()),
+			ends: (String::new(), String::new()),
+			prefs: Preferences::default(),
+			url: "/r/TheRedPill".to_string(),
+			redirect_url: "r/TheRedPill".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: true,
+			quarantine_empty,
+		}
+		.render()
+		.unwrap()
+	}
+
+	#[test]
+	fn empty_quarantined_listing_explains_login_requirement() {
+		let html = empty_listing(true);
+		assert!(html.contains("only shows quarantined communities to logged-in accounts"));
+		assert!(!html.contains("No posts were found."));
+	}
+
+	#[test]
+	fn empty_regular_listing_keeps_generic_message() {
+		let html = empty_listing(false);
+		assert!(html.contains("No posts were found."));
+		assert!(!html.contains("logged-in accounts"));
 	}
 }

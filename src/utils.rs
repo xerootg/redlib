@@ -1689,4 +1689,35 @@ How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or t
 		let deserialized: Preferences = bincode::deserialize(&decompressed).unwrap();
 		assert_eq!(*input, deserialized);
 	}
+
+	// iOS forces fullscreen playback for <video> without playsinline (upstream #527).
+	#[test]
+	fn all_video_tags_are_playsinline() {
+		let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/templates");
+		let mut checked = 0;
+		for entry in std::fs::read_dir(dir).unwrap() {
+			let path = entry.unwrap().path();
+			let source = std::fs::read_to_string(&path).unwrap();
+			for (start, _) in source.match_indices("<video") {
+				// Find the closing '>' of the opening tag, skipping `{% ... %}` blocks (they contain '>' comparisons).
+				let rest = &source[start..];
+				let (mut end, mut in_block) = (0, false);
+				for (i, c) in rest.char_indices() {
+					if rest[i..].starts_with("{%") {
+						in_block = true;
+					} else if rest[..i].ends_with("%}") {
+						in_block = false;
+					}
+					if c == '>' && !in_block {
+						end = i;
+						break;
+					}
+				}
+				let tag = &rest[..end];
+				assert!(tag.contains("playsinline"), "<video> without playsinline in {}: {}", path.display(), tag);
+				checked += 1;
+			}
+		}
+		assert!(checked > 0, "no <video> tags found; is the template path right?");
+	}
 }

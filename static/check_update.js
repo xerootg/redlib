@@ -21,10 +21,8 @@ async function checkInstanceUpdateStatus() {
                 statusMessage = '✅ Instance is up to date.';
             } else if (commitIndex > 0) {
                 statusMessage = `⚠️ This instance is not up to date and is ${commitIndex} commits old. Test and confirm on an up-to-date instance before reporting.`;
-                document.getElementById('error-446').remove();
             } else {
                 statusMessage = `⚠️ This instance is not up to date and is at least ${commitHashes.length} commits old. Test and confirm on an up-to-date instance before reporting.`;
-                document.getElementById('error-446').remove();
             }
         } else {
             statusMessage = '⚠️ Unable to fetch commit information.';
@@ -40,7 +38,15 @@ async function checkInstanceUpdateStatus() {
 async function checkOtherInstances() {
     try {
         const response = await fetch('/instances.json');
-        const data = await response.json();
+        // The proxy may return an HTML/plain-text error page; don't try to parse that as JSON
+        if (!response.ok) return;
+        let data;
+        try {
+            data = await response.json();
+        } catch (e) {
+            return;
+        }
+        if (!data || !Array.isArray(data.instances)) return;
         const instances = window.location.host.endsWith('.onion') ? data.instances.filter(i => i.onion) : data.instances.filter(i => i.url);
         if (instances.length == 0) return;
         const randomInstance = instances[Math.floor(Math.random() * instances.length)];
@@ -50,7 +56,7 @@ async function checkOtherInstances() {
         document.getElementById('random-instance').innerText = "Visit Random Instance";
     } catch (error) {
         console.error('Error fetching instances:', error);
-        document.getElementById('update-status').innerText = '⚠️ Error checking other instances: ' + error;
+        document.getElementById('instance-status').innerText = '⚠️ Error checking other instances: ' + error;
     }
 }
 

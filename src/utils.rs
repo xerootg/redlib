@@ -1789,4 +1789,35 @@ How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or t
 		assert_eq!(gallery_redirect_path("ab/../c"), None);
 		assert_eq!(gallery_redirect_path("ab\r\nLoc"), None);
 	}
+
+	fn error_page_html() -> String {
+		use askama::Template;
+		super::ErrorTemplate {
+			msg: "test".to_string(),
+			prefs: Preferences::default(),
+			url: "/".to_string(),
+		}
+		.render()
+		.unwrap()
+	}
+
+	#[test]
+	fn error_page_has_unique_ids() {
+		let html = error_page_html();
+		let mut seen = std::collections::HashSet::new();
+		for part in html.split(" id=\"").skip(1) {
+			let id = part.split('"').next().unwrap();
+			assert!(seen.insert(id.to_string()), "duplicate id {id:?} in error page");
+		}
+	}
+
+	#[test]
+	fn check_update_js_only_uses_ids_present_in_error_page() {
+		let html = error_page_html();
+		let js = include_str!("../static/check_update.js");
+		for part in js.split("getElementById('").skip(1) {
+			let id = part.split('\'').next().unwrap();
+			assert!(html.contains(&format!("id=\"{id}\"")), "check_update.js uses id {id:?} missing from error page");
+		}
+	}
 }

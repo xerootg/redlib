@@ -948,20 +948,6 @@ mod tests {
 	}
 
 	#[test]
-	fn falls_back_to_peer_when_chain_is_all_trusted() {
-		let trusted = [net("10.42.0.0/16")];
-		let got = resolve_with(&trusted, ip("10.42.0.7"), &xff("10.42.0.3"));
-		assert_eq!(got, ip("10.42.0.7"));
-	}
-
-	#[test]
-	fn falls_back_to_peer_without_forwarded_header() {
-		let trusted = [net("10.42.0.0/16")];
-		let got = resolve_with(&trusted, ip("10.42.0.7"), &HeaderMap::new());
-		assert_eq!(got, ip("10.42.0.7"));
-	}
-
-	#[test]
 	fn bypass_matching_covers_v4_and_v6() {
 		let nets = [net("192.168.0.0/16"), net("fd00::/8")];
 		assert!(nets.iter().any(|n| n.contains(&ip("192.168.4.20"))));
@@ -1277,6 +1263,41 @@ mod tests {
 	fn gate_ignores_forged_forwarded_for_without_trusted_proxies() {
 		let res = gate(ip(OUTSIDE), "/", &xff("192.168.1.20"));
 		assert_eq!(res.expect("forged XFF must not bypass").status(), StatusCode::UNAUTHORIZED);
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "0123456789abcdef0123456789abcdef"),
+		// The proxy's range is also a bypass range, as in the deployment.
+		("REDLIB_AUTH_BYPASS_CIDRS", "10.42.0.0/16,192.168.0.0/16"),
+		("REDLIB_TRUSTED_PROXIES", "10.42.0.0/16"),
+	])]
+	fn a_proxy_that_names_no_client_is_not_a_bypass() {
+		// Without a usable client address the proxy's own address must not
+		// stand in for it, or every request it forwards would skip the login.
+		let proxy = ip("10.42.0.7");
+		for (label, h) in [
+			("no X-Forwarded-For", HeaderMap::new()),
+			("only trusted hops", xff("10.42.0.3")),
+			("only trusted hops, several", xff("10.42.0.3, 10.42.0.4")),
+			("nothing parseable", xff("unknown")),
+		] {
+			let res = gate(proxy, "/", &h).unwrap_or_else(|| panic!("{label}: must not bypass"));
+			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{label}");
+		}
+
+		// A forwarded bypass address still gets through the proxy.
+		assert!(gate(proxy, "/", &xff("192.168.1.20")).is_none());
+		// A peer that is not a proxy is the client, e.g. a kubelet probe from a node.
+		assert!(gate(ip("192.168.1.20"), "/", &HeaderMap::new()).is_none());
+		// An unknown client can still log in.
+		let token = sign(&session(now() + 3600)).unwrap();
+		assert!(gate(proxy, "/", &session_cookie(&token)).is_none());
 	}
 
 	fn session(exp: u64) -> Session {

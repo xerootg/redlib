@@ -19,9 +19,14 @@
     <main>
         {% if !is_filtered %}
             <div id="column_one">
+                {% if !multi_root.is_empty() %}
+                    <h1 id="multi_title">{{ sub.title }} <small>by <a href="/user/{{ multi_owner }}">u/{{ multi_owner }}</a></small></h1>
+                {% endif %}
                 <form id="sort">
                     <div id="sort_options">
-                        {% if sub.name.is_empty() %}
+                        {% if !multi_root.is_empty() %}
+                            {{ utils::sort(multi_root.as_str(), ["hot", "new", "top", "rising", "controversial"], sort.0) }}
+                        {% else if sub.name.is_empty() %}
                             {{ utils::sort("", ["hot", "new", "top", "rising", "controversial"], sort.0) }}
                         {% else %}
                             {{ utils::sort(["/r/", sub.name.as_str()].concat(), ["hot", "new", "top", "rising", "controversial"], sort.0) }}

@@ -158,6 +158,8 @@ impl Kind {
 			["duplicates", ..] => Self::Duplicates,
 			["comments", _, ..] | [_, _, "comments", _, ..] => Self::Comments,
 			["user" | "u", _, "gilded" | "trophies" | "moderated_subreddits"] => Self::Listing,
+			// A user's multireddit is a listing of posts, not a profile
+			["user" | "u", _, "m", _, ..] => Self::Listing,
 			["user" | "u", ..] => Self::User,
 			["search", ..] | ["subreddits" | "users", "search", ..] | ["r", _, "search", ..] => Self::Search,
 			["r", _, "wiki", ..] | ["wiki", ..] => Self::Wiki,
@@ -520,6 +522,8 @@ mod tests {
 			("/user/spez/gilded.json?sort=new", Kind::Listing),
 			("/user/spez/trophies.json?raw_json=1", Kind::Listing),
 			("/user/spez/moderated_subreddits.json", Kind::Listing),
+			("/user/kjoneslol/m/sfwpornnetwork/hot.json?raw_json=1", Kind::Listing),
+			("/u/kjoneslol/m/sfwpornnetwork.json", Kind::Listing),
 			("/r/rust.json", Kind::Listing),
 			("/r/rust+linux/new.json", Kind::Listing),
 			("/.json?raw_json=1", Kind::Listing),

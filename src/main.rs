@@ -13,7 +13,7 @@ use redlib::body::Body;
 use redlib::client::{canonical_path, proxy, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, get_source_url, redirect, ThemeAssets};
-use redlib::{config, duplicates, headers, instance_info, oidc, post, search, settings, subreddit, user};
+use redlib::{config, duplicates, headers, instance_info, mcp, oidc, post, search, settings, subreddit, user};
 
 use redlib::client::OAUTH_CLIENT;
 
@@ -257,6 +257,11 @@ async fn main() {
 	app.at("/oidc/login").get(|r| oidc::login(r).boxed());
 	app.at("/oidc/callback").get(|r| oidc::callback(r).boxed());
 	app.at("/oidc/logout").get(|r| oidc::logout(r).boxed());
+
+	// MCP server. Streamable HTTP is a single POST endpoint; GET would open an
+	// SSE stream and DELETE would end a session, neither of which this server
+	// offers, so both answer 405 as the spec allows.
+	app.at("/mcp").post(|r| mcp::handle(r).boxed()).get(|r| mcp::handle_unsupported(r).boxed());
 
 	// Read static files
 	app.at("/style.css").get(|_| style().boxed());

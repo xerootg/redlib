@@ -24,8 +24,10 @@ impl Backend for Json {
 }
 
 /// Only listings tell: threads and user pages are blocked for every fingerprint.
+/// A user's gilded items, trophies and moderated subreddits share the listing
+/// order but are user pages, so a block there says nothing about the client.
 fn blames_fingerprint(path: &str) -> bool {
-	Kind::of(path) == Kind::Listing
+	Kind::of(path) == Kind::Listing && !path.starts_with("/user/") && !path.starts_with("/u/")
 }
 
 async fn fetch(path: &str, quarantine: bool) -> Result<Value, Failure> {
@@ -115,5 +117,6 @@ mod tests {
 		assert!(blames_fingerprint("/r/popular/hot.json?geo_filter=GLOBAL&raw_json=1"));
 		assert!(!blames_fingerprint("/r/rust/comments/abc123.json?raw_json=1"));
 		assert!(!blames_fingerprint("/user/spez/about.json?raw_json=1"));
+		assert!(!blames_fingerprint("/user/spez/trophies.json?raw_json=1"));
 	}
 }

@@ -271,6 +271,16 @@ pub struct Config {
 	#[serde(rename = "REDLIB_MCP_TOKEN")]
 	#[serde(skip_serializing)]
 	pub(crate) mcp_token: Option<String>,
+
+	// --- MCP server -------------------------------------------------------
+	/// Master switch for the Model Context Protocol endpoint at `/mcp`.
+	#[serde(rename = "REDLIB_MCP_ENABLED")]
+	pub(crate) mcp_enabled: Option<String>,
+
+	/// Comma-separated origins allowed to call `/mcp` from a browser context.
+	/// The instance's own origin is always allowed.
+	#[serde(rename = "REDLIB_MCP_ALLOWED_ORIGINS")]
+	pub(crate) mcp_allowed_origins: Option<String>,
 }
 
 impl Config {
@@ -377,6 +387,8 @@ impl Config {
 			auth_bypass_cidrs: parse("REDLIB_AUTH_BYPASS_CIDRS"),
 			trusted_proxies: parse("REDLIB_TRUSTED_PROXIES"),
 			mcp_token: parse("REDLIB_MCP_TOKEN"),
+			mcp_enabled: parse("REDLIB_MCP_ENABLED"),
+			mcp_allowed_origins: parse("REDLIB_MCP_ALLOWED_ORIGINS"),
 		}
 	}
 }
@@ -447,6 +459,8 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_AUTH_BYPASS_CIDRS" => config.auth_bypass_cidrs.clone(),
 		"REDLIB_TRUSTED_PROXIES" => config.trusted_proxies.clone(),
 		"REDLIB_MCP_TOKEN" => config.mcp_token.clone(),
+		"REDLIB_MCP_ENABLED" => config.mcp_enabled.clone(),
+		"REDLIB_MCP_ALLOWED_ORIGINS" => config.mcp_allowed_origins.clone(),
 		_ => None,
 	}
 }
@@ -499,6 +513,16 @@ mod tests {
 				assert_eq!(get_setting_from_config(key, &config).as_deref(), Some(expected), "{key} = {value}");
 			}
 		}
+	}
+
+	#[test]
+	fn test_mcp_token_is_not_serialized() {
+		// `/info.json` serializes the whole config; the token is a credential.
+		let config = parsed("REDLIB_MCP_TOKEN = \"s3cret\"\nREDLIB_MCP_ENABLED = true\n");
+		assert_eq!(get_setting_from_config("REDLIB_MCP_TOKEN", &config).as_deref(), Some("s3cret"));
+		let json = serde_json::to_string(&config).unwrap();
+		assert!(!json.contains("s3cret"), "{json}");
+		assert!(json.contains("REDLIB_MCP_ENABLED"), "{json}");
 	}
 
 	#[test]

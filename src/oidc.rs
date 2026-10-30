@@ -484,8 +484,42 @@ fn redirect_target(query: Option<&str>) -> String {
 				.find(|(k, _)| k == "redirect")
 				.map(|(_, v)| v)
 		})
-		.filter(|p| p.starts_with('/') && !p.starts_with("//"))
+		.and_then(|p| local_path(&p))
 		.unwrap_or_else(|| "/".to_string())
+}
+
+/// Whether `p` starts like a path on this instance: one `/`, then anything
+/// but a second `/` or a `\`.
+fn is_single_slash_path(p: &str) -> bool {
+	let mut chars = p.chars();
+	chars.next() == Some('/') && !matches!(chars.next(), Some('/' | '\\'))
+}
+
+/// `p` rebuilt as a path and query on this instance, or `None` if a browser
+/// could read it as a URL on another host.
+///
+/// Browsers treat `\` as `/` and silently drop tabs and newlines, so any of
+/// those can turn `/\evil.example` or `/<TAB>/evil.example` into
+/// `//evil.example`. They are refused outright rather than cleaned up.
+fn local_path(p: &str) -> Option<String> {
+	if !is_single_slash_path(p) || p.chars().any(|c| c == '\\' || c.is_control() || c.is_whitespace()) {
+		return None;
+	}
+
+	// Rebuild from a parsed URL so only a path and a query come out. Parsing
+	// also resolves dot segments, which can produce a fresh `//`, so the
+	// result is checked again.
+	let base = url::Url::parse("http://redlib.invalid/").ok()?;
+	let url = base.join(p).ok()?;
+	if url.origin() != base.origin() {
+		return None;
+	}
+	let mut out = url.path().to_string();
+	if let Some(query) = url.query() {
+		out.push('?');
+		out.push_str(query);
+	}
+	is_single_slash_path(&out).then_some(out)
 }
 
 /// Starts the authorization-code flow.

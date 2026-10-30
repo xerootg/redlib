@@ -31,6 +31,8 @@ struct UserTemplate {
 	/// Whether all posts were hidden because they are NSFW (and user has disabled show NSFW)
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
+	/// Whether the empty first page suggests the user has hidden their post and comment history.
+	history_hidden: bool,
 }
 
 // FUNCTIONS
@@ -76,11 +78,13 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
+			history_hidden: false,
 		}))
 	} else {
 		// Request user posts/comments from Reddit
 		match Post::fetch(&path, false).await {
 			Ok((mut posts, after)) => {
+				let listing_empty = posts.is_empty();
 				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
@@ -97,12 +101,19 @@ pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 					all_posts_filtered,
 					all_posts_hidden_nsfw,
 					no_posts,
+					history_hidden: history_hidden(listing_empty, &path),
 				}))
 			}
 			// If there is an error show error page
 			Err(msg) => error(req, &msg).await,
 		}
 	}
+}
+
+/// Reddit gives no flag for users who hide their history; the listing is simply empty.
+/// An empty first page (no `after`/`before` cursor) is the only anonymous signal.
+fn history_hidden(_listing_empty: bool, _path: &str) -> bool {
+	false
 }
 
 // USER
@@ -168,6 +179,56 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn render(history_hidden: bool, no_posts: bool) -> String {
+		UserTemplate {
+			user: User {
+				name: "someone".into(),
+				..Default::default()
+			},
+			posts: Vec::new(),
+			sort: (String::new(), String::new()),
+			ends: (String::new(), String::new()),
+			listing: "overview".into(),
+			prefs: Preferences::default(),
+			url: "/user/someone".into(),
+			redirect_url: "user/someone".into(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts,
+			history_hidden,
+		}
+		.render()
+		.unwrap()
+	}
+
+	#[test]
+	fn test_history_hidden_on_empty_first_page() {
+		assert!(history_hidden(true, "/user/someone/overview.json?&raw_json=1"));
+		assert!(history_hidden(true, "/user/someone/submitted.json?sort=new&raw_json=1"));
+	}
+
+	#[test]
+	fn test_history_not_hidden_with_posts_or_later_pages() {
+		assert!(!history_hidden(false, "/user/someone/overview.json?&raw_json=1"));
+		assert!(!history_hidden(true, "/user/someone/overview.json?after=t3_abc&raw_json=1"));
+		assert!(!history_hidden(true, "/user/someone/overview.json?before=t3_abc&raw_json=1"));
+	}
+
+	#[test]
+	fn test_hidden_notice_rendered() {
+		let html = render(true, true);
+		assert!(html.contains("hidden their post and comment history"));
+		assert!(!html.contains("No posts were found."));
+	}
+
+	#[test]
+	fn test_no_notice_for_ordinary_empty_page() {
+		let html = render(false, true);
+		assert!(html.contains("No posts were found."));
+		assert!(!html.contains("hidden their post and comment history"));
+	}
 
 	#[test]
 	fn test_fetching_user() {

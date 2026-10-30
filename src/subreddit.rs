@@ -201,8 +201,8 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 /// Reddit only returns quarantined posts to logged-in accounts: after opting in, anonymous
 /// requests get an empty listing. That is the case when the first page of an opted-in
 /// community (not the front page) comes back empty.
-fn quarantine_empty(_listing_empty: bool, _quarantined: bool, _root: bool, _path: &str) -> bool {
-	false
+fn quarantine_empty(listing_empty: bool, quarantined: bool, root: bool, path: &str) -> bool {
+	listing_empty && quarantined && !root && param(path, "after").is_none()
 }
 
 pub fn quarantine(req: &Request<Body>, sub: String, restriction: &str) -> Response<Body> {

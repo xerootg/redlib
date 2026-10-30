@@ -951,6 +951,44 @@ mod tests {
 	}
 
 	#[test]
+	fn reads_every_forwarded_for_header_in_order() {
+		// A second header line is how a proxy that appends rather than merges
+		// adds its hop; reading only the first line takes the client's word.
+		let trusted = [net("10.42.0.0/16")];
+		let h = headers(&[("x-forwarded-for", "192.168.1.5"), ("x-forwarded-for", "203.0.113.9")]);
+		assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &h), Some(ip("203.0.113.9")));
+	}
+
+	#[test]
+	fn stops_at_the_first_entry_it_cannot_read() {
+		// Skipping an unreadable hop would hand the decision to whatever the
+		// client wrote further left.
+		let trusted = [net("10.42.0.0/16")];
+		for chain in [
+			"192.168.1.5, garbage, 10.42.0.3",
+			"192.168.1.5, 203.0.113.9:4711",
+			"192.168.1.5, [2001:db8::1]:443",
+			"192.168.1.5, , 10.42.0.3",
+			"192.168.1.5, unknown",
+			"192.168.1.5,",
+		] {
+			assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &xff(chain)), None, "{chain:?}");
+		}
+
+		let mut h = xff("192.168.1.5");
+		h.append("x-forwarded-for", HeaderValue::from_bytes(b"\xff").unwrap());
+		assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &h), None, "non-UTF-8 value");
+	}
+
+	#[test]
+	fn accepts_bare_and_bracketed_ipv6_hops() {
+		let trusted = [net("10.42.0.0/16")];
+		assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &xff("2001:db8::1")), Some(ip("2001:db8::1")));
+		assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &xff("[2001:db8::1]")), Some(ip("2001:db8::1")));
+		assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &xff("[::ffff:192.168.1.5]")), Some(ip("192.168.1.5")));
+	}
+
+	#[test]
 	fn client_is_unknown_when_the_chain_is_all_trusted() {
 		let trusted = [net("10.42.0.0/16")];
 		assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &xff("10.42.0.3")), None);

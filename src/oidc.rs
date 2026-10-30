@@ -1168,6 +1168,20 @@ mod tests {
 		assert_eq!(cookie_value(&h, "redlib"), None);
 	}
 
+	#[test]
+	fn provider_error_text_is_not_shown_to_the_user() {
+		// Anyone can send a victim to the callback with an error of their
+		// choosing, so its text must not appear on our page as if it were ours.
+		let req = Request::builder()
+			.uri("/oidc/callback?error=access_denied&error_description=Call+0800-SCAM+to+restore+access")
+			.body(Body::empty())
+			.unwrap();
+		let res = futures_lite::future::block_on(callback(req)).unwrap();
+		assert_eq!(res.status(), StatusCode::FORBIDDEN);
+		let body = body_text(res);
+		assert!(!body.contains("SCAM") && !body.contains("access_denied"), "{body}");
+	}
+
 	// --- ID token validation ------------------------------------------------
 
 	/// A throwaway RSA key generated for these tests only. It signs nothing

@@ -900,6 +900,34 @@ mod tests {
 	}
 
 	#[test]
+	fn login_redirect_rejects_paths_a_browser_would_read_as_another_host() {
+		// Browsers treat `\` like `/` and strip tabs and newlines from URLs, so
+		// each of these can turn into `//evil.example` by the time it is used.
+		for (raw, decoded) in [
+			("%2F%5Cevil.example", "/\\evil.example"),
+			("%2F%09%2Fevil.example", "/\t/evil.example"),
+			("%2F%2Fevil", "//evil"),
+			("%2F%0D%0Ax", "/\r\nx"),
+			("%2F%0B%2Fx", "/\x0b/x"),
+			("%2Fr%2Frust%5C..%5Cevil", "/r/rust\\..\\evil"),
+			("%2F%7F", "/\x7f"),
+			// Dot segments collapse to `//evil.example` once normalised.
+			("%2F.%2F%2Fevil.example", "/.//evil.example"),
+			("%2Fr%2Frust%20x", "/r/rust x"),
+			("https%3A%2F%2Fevil", "https://evil"),
+			("", ""),
+		] {
+			assert_eq!(redirect_target(Some(&format!("redirect={raw}"))), "/", "{decoded:?}");
+		}
+	}
+
+	#[test]
+	fn login_redirect_keeps_a_local_path_and_query() {
+		assert_eq!(redirect_target(Some("redirect=%2Fr%2Frust%3Fsort%3Dnew")), "/r/rust?sort=new");
+		assert_eq!(redirect_target(Some("redirect=%2F")), "/");
+	}
+
+	#[test]
 	fn login_path_is_percent_encoded() {
 		assert_eq!(urlencoding_path("/r/rust/comments/abc"), "%2Fr%2Frust%2Fcomments%2Fabc");
 	}

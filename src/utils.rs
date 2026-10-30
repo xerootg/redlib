@@ -273,8 +273,8 @@ impl Media {
 		let alt_url = video.map_or(String::new(), |video| format_url(video["hls_url"].as_str().unwrap_or_default()));
 		let url = format_url(url_val.as_str().unwrap_or_default());
 		// Only the muxed MP4s from packaged media have sound without HLS
-		let needs_hls_for_audio =
-			post_type == "video" && !alt_url.is_empty() && !url.starts_with("/packaged") && video.is_some_and(|video| video["has_audio"].as_bool() != Some(false));
+		let audio_is_separate = post_type == "video" && !url.starts_with("/packaged") && video.is_some_and(|video| video["has_audio"].as_bool() != Some(false));
+		let needs_hls_for_audio = audio_is_separate && !alt_url.is_empty();
 
 		let download_name = if post_type == "image" || post_type == "gif" || post_type == "video" {
 			let permalink_base = url_path_basename(data["permalink"].as_str().unwrap_or_default());
@@ -297,7 +297,8 @@ impl Media {
 				poster: format_url(source["url"].as_str().unwrap_or_default()),
 				download_name,
 				needs_hls_for_audio,
-				download_silent: false,
+				// The download link is that same video-only file, with or without HLS to enable
+				download_silent: audio_is_separate,
 			},
 			gallery,
 		)

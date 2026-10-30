@@ -2,8 +2,9 @@
 
 use crate::body::Body;
 use crate::utils::{
-	build_rss_items, catch_random, clean_url, enable_rss, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls,
-	rss_page_link, rss_page_path, rss_response, setting, setting_or_default, should_be_nsfw_gated, template, val, Post, Preferences, Subreddit, RSS_LISTING_SORTS,
+	build_rss_items, catch_random, clean_url, enable_rss, error, filter_posts, format_num, format_url, get_filters, info, is_account_only_subreddit, nsfw_landing, param,
+	redirect, rewrite_urls, rss_page_link, rss_page_path, rss_response, setting, setting_or_default, should_be_nsfw_gated, template, val, Post, Preferences, Subreddit,
+	ACCOUNT_ONLY_MSG, RSS_LISTING_SORTS,
 };
 use crate::{backends::json, server::RequestExt, server::ResponseExt};
 use askama::Template;
@@ -86,6 +87,10 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			)
 			.await;
 		}
+	}
+
+	if is_account_only_subreddit(&sub_name) {
+		return error(req, ACCOUNT_ONLY_MSG).await;
 	}
 
 	let quarantined = can_access_quarantine(&req, &sub_name) || root;

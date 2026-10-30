@@ -6,6 +6,7 @@ pub mod duplicates;
 pub mod instance_info;
 pub mod oauth;
 pub mod oauth_resources;
+pub mod oidc;
 pub mod post;
 pub mod reddit_health;
 pub mod redgifs;

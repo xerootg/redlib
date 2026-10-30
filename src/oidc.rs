@@ -28,7 +28,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hyper::{HeaderMap, Request, Response, StatusCode};
 use ipnet::IpNet;
-use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -774,18 +774,26 @@ async fn exchange_and_validate(code: &str, tx: &LoginTx) -> Result<IdClaims, Str
 		set = jwks(true).await?;
 	}
 	let jwk = set.find(&kid).ok_or_else(|| format!("no signing key matches key id {kid}"))?;
+
+	validate_id_token(&tokens.id_token, jwk, &disco.issuer, &AUTH.client_id, &tx.nonce)
+}
+
+/// Checks an ID token's signature against `jwk` and its claims against what
+/// this relying party expects.
+fn validate_id_token(id_token: &str, jwk: &Jwk, issuer: &str, client_id: &str, nonce: &str) -> Result<IdClaims, String> {
+	let header = decode_header(id_token).map_err(|e| format!("malformed ID token: {e}"))?;
 	let key = DecodingKey::from_jwk(jwk).map_err(|e| format!("unusable signing key: {e}"))?;
 
 	let algorithm = header.alg;
 	let mut validation = Validation::new(algorithm);
-	validation.set_audience(&[&AUTH.client_id]);
-	validation.set_issuer(&[&disco.issuer]);
+	validation.set_audience(&[client_id]);
+	validation.set_issuer(&[issuer]);
 
-	let data = decode::<IdClaims>(&tokens.id_token, &key, &validation).map_err(|e| format!("ID token validation failed: {e}"))?;
+	let data = decode::<IdClaims>(id_token, &key, &validation).map_err(|e| format!("ID token validation failed: {e}"))?;
 
 	// Binds this ID token to the login request that started the flow,
 	// preventing token replay.
-	if data.claims.nonce.as_deref() != Some(tx.nonce.as_str()) {
+	if data.claims.nonce.as_deref() != Some(nonce) {
 		return Err("ID token nonce does not match the login request".to_string());
 	}
 
@@ -1108,6 +1116,127 @@ mod tests {
 		assert_eq!(cookie_value(&h, "redlib_session").as_deref(), Some("tok"));
 		assert_eq!(cookie_value(&h, "redlib_oidc_tx").as_deref(), Some("tx"));
 		assert_eq!(cookie_value(&h, "redlib"), None);
+	}
+
+	// --- ID token validation ------------------------------------------------
+
+	/// A throwaway RSA key generated for these tests only. It signs nothing
+	/// outside them.
+	const TEST_RSA_KEY: &str = r"-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCj078mBSOUBQdc
+YItNTy0SlvLN+eFKHxLJsLBLPI8K87Dzoe/iFI+BxJwizHVXzC2nCa1ugdGCh+DD
+F8xjYvaUWB1HWj+oKpCP38Gwsw1ra0M1igEw6YXVcqJWnkY4/f+9zMU322UI7oSE
+ZldjUHf2iuew52XPB+CKNF7rW0MI03WEraRvSZRCI25j0hM6rwVJ/8KuTN0yn2ap
+8uvubu1clPdpKj+o0vXMIt9fpzIy0159IhfhOAbAIG3EotBmgyrO+toVF8+ceYW7
+/9lK0L6dOnB1BRR8cf3NfTKQV83RMLAfkQobDDznRb8Tl+YE+BrOdqxaC9lhOY+J
+qL1k2/m3AgMBAAECggEASMaSnlggEuwc9ftpRmGKuzxVBg0f+GZPWUtlNTbksE/K
+5p+kSYEqstHdLlQ3OFZaXV6eLX37zQmBXgkfYXMf6IwwDXdY2eJ2r4MNruoLZxGS
+HKF+n/TM4CH5XZMXzM+AoRbq8UJD4rDaK1qvLU4czGeuPta8UjjElYBoPhMfdzaK
+ZVbBlf/7+2KjFOwg5jKvd5mWdz0CLKjopTgP6N1Lf1BUWB5UEyJ7madtqv1l/ieI
+MsnxXZ2ReFnF82BilVJj5KGhnDTCr239IGRgsvYWBVsUf/7/s8gZHv79678+JvoS
+9oAdzbBV544Yipxt8c6AMpcuOWW6L/+xtR5vfVuxIQKBgQDUmnwHhXGimBHKA9or
+KB5ydXLqqlTzOD9hGrdWJtzRhNiqnQwUobrsJe5Lb/Ix8npvsrlhSLzyBmcjiNrP
+VdWHsqGkc8pSDbMrpOqZ85Z/SbdSHFVQI9JtuBP78khYUL+/L0iBbHE4pgYYLj6e
+0ciFVyXZZmRUHKl/zYD48R285wKBgQDFRHk3tpdN8C5x5XL8/Sya72nNRYb6SuUS
+H8DqxscM2EGBFlhcT2oAqUhlK3dDYi3yqmrthclpP2OR7JXtMd+QUbgmHH5vX1Zz
+tedPcDYUWXAgUMJpVlR6PX1uD8YxpEfgezMVloT3b2egIut61Q7oZ2V/rsbWVfu9
+ABCeNjbysQKBgFzvSthe1NWmc+BC3tOOrgCKprk9y/Sl2c6wxwO56T0NPUkXbXh3
+WiZwTkJbpRuAS1UYY0DLcwy5D8zQvhV0B+tRgqdIlmBX7MJfTM4PVPI/Xwtdp01o
+20tq9BFmT4mLgsYn/SHWLYf9yxw22tjCC01+UuU9hQ3fmZhsVLx9aepxAoGBALWu
+fdHhGfMPHUeK4l+8sQM1MwV6XnlQ1y7dDeltD9B1r8a7FMBX57IaNvHumVX3K4hO
+ilKeIEUNu5+e/OpLP7MEgIyhO5VJgi7pvtL77uLJCKrKlnM7rmwzC719S7VWr1hB
+P2hHi8jz0sW6w5QKfENxTxrMlpa69DI6yBNerTbRAoGARVkLBM8CGUZjCgliH5Pj
+WyPWnm8ZfUBbac30QyGiUL24qebj7he+dZF4ypIUiFtDYf6Yjf6uf0S3GJn+77T6
+dJGqFkpWGrtruNnGsiU+N3pTukrhvuUdiFXAIQ931FTNPdiKwUI5wgqbJmlR2IGm
+J6LdBPXCFDZfsB7AdnW3CIo=
+-----END PRIVATE KEY-----";
+	/// The modulus of [`TEST_RSA_KEY`], base64url-encoded as in a JWK.
+	const TEST_RSA_N: &str = "o9O_JgUjlAUHXGCLTU8tEpbyzfnhSh8SybCwSzyPCvOw86Hv4hSPgcScIsx1V8wtpwmtboHRgofgwxfMY2L2lFgdR1o_qCqQj9_BsLMNa2tDNYoBMOmF1XKiVp5GOP3_vczFN9tlCO6EhGZXY1B39ornsOdlzwfgijRe61tDCNN1hK2kb0mUQiNuY9ITOq8FSf_CrkzdMp9mqfLr7m7tXJT3aSo_qNL1zCLfX6cyMtNefSIX4TgGwCBtxKLQZoMqzvraFRfPnHmFu__ZStC-nTpwdQUUfHH9zX0ykFfN0TCwH5EKGww850W_E5fmBPgaznasWgvZYTmPiai9ZNv5tw";
+	const TEST_ISSUER: &str = "https://idp.example/application/o/redlib/";
+
+	fn test_jwk(alg: Option<&str>) -> Jwk {
+		let mut jwk = serde_json::json!({"kty": "RSA", "kid": "k1", "use": "sig", "n": TEST_RSA_N, "e": "AQAB"});
+		if let Some(alg) = alg {
+			jwk["alg"] = alg.into();
+		}
+		serde_json::from_value(jwk).unwrap()
+	}
+
+	fn id_claims() -> serde_json::Value {
+		serde_json::json!({"iss": TEST_ISSUER, "aud": "id", "sub": "u1", "nonce": "n1", "iat": now(), "exp": now() + 300})
+	}
+
+	fn id_token(alg: Algorithm, claims: &serde_json::Value) -> String {
+		let mut header = Header::new(alg);
+		header.kid = Some("k1".into());
+		encode(&header, claims, &EncodingKey::from_rsa_pem(TEST_RSA_KEY.as_bytes()).unwrap()).unwrap()
+	}
+
+	fn check_id_token(token: &str, jwk: &Jwk) -> Result<IdClaims, String> {
+		validate_id_token(token, jwk, TEST_ISSUER, "id", "n1")
+	}
+
+	#[test]
+	fn accepts_a_well_formed_id_token() {
+		let claims = check_id_token(&id_token(Algorithm::RS256, &id_claims()), &test_jwk(None)).unwrap();
+		assert_eq!(claims.sub, "u1");
+		check_id_token(&id_token(Algorithm::RS256, &id_claims()), &test_jwk(Some("RS256"))).unwrap();
+	}
+
+	#[test]
+	fn id_token_algorithm_is_pinned_not_taken_from_the_token() {
+		// The token's own header must not choose how it is checked.
+		for alg in [Algorithm::RS384, Algorithm::RS512, Algorithm::PS256] {
+			assert!(check_id_token(&id_token(alg, &id_claims()), &test_jwk(None)).is_err(), "{alg:?} against an RS256 key");
+		}
+		let hs = encode(&Header::new(Algorithm::HS256), &id_claims(), &EncodingKey::from_secret(TEST_RSA_N.as_bytes())).unwrap();
+		assert!(check_id_token(&hs, &test_jwk(None)).is_err(), "HS256");
+
+		// A key that declares its algorithm gets exactly that one.
+		check_id_token(&id_token(Algorithm::RS384, &id_claims()), &test_jwk(Some("RS384"))).unwrap();
+		assert!(check_id_token(&id_token(Algorithm::RS256, &id_claims()), &test_jwk(Some("RS384"))).is_err());
+	}
+
+	#[test]
+	fn id_token_must_carry_iss_aud_exp_and_iat() {
+		for claim in ["iss", "aud", "exp", "iat"] {
+			let mut claims = id_claims();
+			claims.as_object_mut().unwrap().remove(claim);
+			assert!(check_id_token(&id_token(Algorithm::RS256, &claims), &test_jwk(None)).is_err(), "without {claim}");
+		}
+	}
+
+	#[test]
+	fn id_token_with_several_audiences_must_name_us_as_azp() {
+		let mut claims = id_claims();
+		claims["aud"] = serde_json::json!(["id", "other"]);
+		assert!(check_id_token(&id_token(Algorithm::RS256, &claims), &test_jwk(None)).is_err(), "no azp");
+
+		claims["azp"] = "other".into();
+		assert!(check_id_token(&id_token(Algorithm::RS256, &claims), &test_jwk(None)).is_err(), "someone else's azp");
+
+		claims["azp"] = "id".into();
+		check_id_token(&id_token(Algorithm::RS256, &claims), &test_jwk(None)).unwrap();
+	}
+
+	#[test]
+	fn id_token_must_not_be_issued_in_the_future() {
+		let mut claims = id_claims();
+		claims["iat"] = (now() + 600).into();
+		assert!(check_id_token(&id_token(Algorithm::RS256, &claims), &test_jwk(None)).is_err(), "10 minutes ahead");
+
+		// Small clock skew is fine.
+		claims["iat"] = (now() + 120).into();
+		check_id_token(&id_token(Algorithm::RS256, &claims), &test_jwk(None)).unwrap();
+	}
+
+	#[test]
+	fn id_token_must_match_issuer_audience_and_nonce() {
+		for (claim, value) in [("iss", "https://evil.example/"), ("aud", "other"), ("nonce", "n2")] {
+			let mut claims = id_claims();
+			claims[claim] = value.into();
+			assert!(check_id_token(&id_token(Algorithm::RS256, &claims), &test_jwk(None)).is_err(), "wrong {claim}");
+		}
 	}
 
 	// --- Configuration ------------------------------------------------------

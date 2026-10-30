@@ -1145,7 +1145,26 @@ pub async fn get_duplicates(post_id: &str, limit: u64, after: Option<&str>) -> R
 		.map(|c| c.iter().map(project_post).collect())
 		.unwrap_or_default();
 
+	// Reddit's anonymous /duplicates answers with an empty list even when the
+	// same link was submitted elsewhere. For a link post, fall back to the
+	// url: search that lookup uses, so "nobody else posted this" is not
+	// reported on Reddit's say-so alone.
+	if dupes.is_empty() && after.is_none() {
+		if let Some(url) = original.as_ref().filter(|p| p["is_self"] == false).and_then(|p| str_of(p, "url")) {
+			let res = get(lookup_search_path(&url), true).await?;
+			let found = other_submissions(project_children(&res, project_post), &id, limit);
+			return Ok(json!({ "original": original, "count": found.len(), "duplicates": found }));
+		}
+	}
+
 	Ok(json!({ "original": original, "count": dupes.len(), "duplicates": dupes }))
+}
+
+/// Search results for a post's link, without the post itself.
+fn other_submissions(mut found: Vec<Value>, original_id: &str, limit: u64) -> Vec<Value> {
+	found.retain(|p| p["id"] != original_id);
+	found.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+	found
 }
 
 /// Escape hatch for endpoints this module does not model.
@@ -1372,6 +1391,13 @@ mod tests {
 		assert_eq!(fetch.len(), MAX_LOOKUP_IDS);
 		assert_eq!(errors.len(), 5);
 		assert!(errors[0]["error"].as_str().unwrap().contains("at most"), "{}", errors[0]);
+	}
+
+	#[test]
+	fn duplicate_fallback_leaves_out_the_original() {
+		let found = vec![json!({"id": "a"}), json!({"id": "orig"}), json!({"id": "b"}), json!({"id": "c"})];
+		let out = other_submissions(found, "orig", 2);
+		assert_eq!(out, vec![json!({"id": "a"}), json!({"id": "b"})]);
 	}
 
 	#[test]

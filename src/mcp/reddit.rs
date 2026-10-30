@@ -477,19 +477,43 @@ fn subreddit_listing_path(sub: &str, sort: &str, query: &str) -> String {
 	format!("/r/{}/{sort}.json?{query}", sub.replace('+', "%2B"))
 }
 
-/// Like [`listing_result`], but holds a listing to the `limit` asked for.
+/// The fullname Reddit pages by for a projected post or comment.
+fn item_fullname(item: &Value) -> Option<String> {
+	if let Some(fullname) = str_of(item, "fullname") {
+		return Some(fullname);
+	}
+	let id = str_of(item, "id")?;
+	(item["type"] == "comment").then(|| format!("t1_{id}"))
+}
+
+/// Like [`listing_result`], but holds a listing to the `limit` asked for,
+/// and pages it locally when the backend ignores paging.
 ///
-/// Some backends ignore `limit` -- r/all comes back 25 posts long whatever
-/// was requested. Dropping the extra posts keeps the result as small as the
-/// caller asked, and `after` moves to the last post kept so the next page
-/// continues from there rather than skipping the dropped ones.
-fn limited_listing_result(res: &Value, mut items: Vec<Value>, limit: u64) -> Value {
+/// Some endpoints ignore `limit` and `after` altogether: r/all and a user's
+/// gilded items come back as the same 25 entries whatever was asked. Extra
+/// entries are dropped so the result is as small as requested, and `after`
+/// moves to the last entry kept. When the requested `after` turns up inside
+/// the page, the backend ignored it, so the page is continued from there,
+/// and once it runs out `after` is null -- Reddit's own cursor would only
+/// return the same page again, and a model following it would never stop.
+fn limited_listing_result(res: &Value, mut items: Vec<Value>, limit: u64, requested_after: Option<&str>) -> Value {
 	let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-	if items.len() <= limit {
+	let mut ignored_after = false;
+	if let Some(requested) = requested_after.filter(|a| !a.is_empty()) {
+		if let Some(pos) = items.iter().position(|i| item_fullname(i).as_deref() == Some(requested)) {
+			items.drain(..=pos);
+			ignored_after = true;
+		}
+	}
+	if items.len() <= limit && !ignored_after {
 		return listing_result(res, items);
 	}
-	items.truncate(limit);
-	let after = items.last().and_then(|p| p.get("fullname")).cloned().unwrap_or(Value::Null);
+	let after = if items.len() > limit {
+		items.truncate(limit);
+		items.last().and_then(item_fullname).map_or(Value::Null, Value::from)
+	} else {
+		Value::Null
+	};
 	json!({
 		"count": items.len(),
 		"after": after,
@@ -522,7 +546,7 @@ pub async fn browse_subreddit(sub: &str, sort: &str, time: Option<&str>, limit: 
 		.map(|c| c.iter().map(project_post).collect())
 		.unwrap_or_default();
 
-	Ok(limited_listing_result(&res, items, limit))
+	Ok(limited_listing_result(&res, items, limit, after))
 }
 
 pub async fn browse_frontpage(feed: &str, sort: &str, time: Option<&str>, limit: u64, after: Option<&str>) -> Result<Value, String> {
@@ -1040,7 +1064,8 @@ pub async fn get_user_listing(name: &str, listing: &str, sort: &str, time: &str,
 
 	let res = get(format!("/user/{name}/{listing}.json?{qs}"), false).await?;
 	let children = res.get("data").and_then(|d| d.get("children")).and_then(Value::as_array).cloned().unwrap_or_default();
-	Ok(listing_result(&res, project_mixed(&children)))
+	// The JSON API's gilded listing ignores limit.
+	Ok(limited_listing_result(&res, project_mixed(&children), limit, after))
 }
 
 pub async fn get_subreddit_about(sub: &str) -> Result<Value, String> {
@@ -1429,12 +1454,39 @@ mod tests {
 	fn listings_are_held_to_the_requested_limit() {
 		let res = json!({"data": {"after": "t3_e", "children": []}});
 		let items: Vec<Value> = ["a", "b", "c", "d", "e"].iter().map(|id| json!({"id": id, "fullname": format!("t3_{id}")})).collect();
-		let out = limited_listing_result(&res, items.clone(), 3);
+		let out = limited_listing_result(&res, items.clone(), 3, None);
 		assert_eq!(out["count"], 3);
 		assert_eq!(out["after"], "t3_c", "the next page must start after the last post kept");
-		let all = limited_listing_result(&res, items, 5);
+		let all = limited_listing_result(&res, items, 5, None);
 		assert_eq!(all["count"], 5);
 		assert_eq!(all["after"], "t3_e");
+	}
+
+	#[test]
+	fn listings_that_ignore_after_are_paged_locally_and_end() {
+		// Reddit answered with the same page although `after` was t3_b.
+		let res = json!({"data": {"after": "t3_e", "children": []}});
+		let items: Vec<Value> = ["a", "b", "c", "d", "e"].iter().map(|id| json!({"id": id, "fullname": format!("t3_{id}")})).collect();
+		let next = limited_listing_result(&res, items.clone(), 2, Some("t3_b"));
+		assert_eq!(next["items"], json!([items[2], items[3]]));
+		assert_eq!(next["after"], "t3_d");
+		let last = limited_listing_result(&res, items.clone(), 2, Some("t3_d"));
+		assert_eq!(last["items"], json!([items[4]]));
+		assert_eq!(last["after"], Value::Null, "Reddit's cursor would only repeat the page");
+		// A backend that honoured `after` is left alone.
+		let honoured = limited_listing_result(&res, items[..2].to_vec(), 2, Some("t3_z"));
+		assert_eq!(honoured["after"], "t3_e");
+	}
+
+	#[test]
+	fn held_mixed_listings_page_after_the_last_comment_kept() {
+		let res = json!({"data": {"after": "t1_z", "children": []}});
+		let items = vec![
+			json!({"id": "p", "fullname": "t3_p"}),
+			json!({"type": "comment", "id": "c"}),
+			json!({"type": "comment", "id": "d"}),
+		];
+		assert_eq!(limited_listing_result(&res, items, 2, None)["after"], "t1_c");
 	}
 
 	#[test]

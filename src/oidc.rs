@@ -41,8 +41,11 @@ use crate::config;
 /// otherwise the login redirect would loop forever.
 pub const OIDC_PREFIX: &str = "/oidc/";
 
-const SESSION_COOKIE: &str = "redlib_session";
-const TX_COOKIE: &str = "redlib_oidc_tx";
+// `__Host-` makes browsers accept these only with Secure, Path=/ and no
+// Domain, so another host under the same parent domain cannot set or shadow
+// them. The prefix changed the names, which logged everyone out once.
+const SESSION_COOKIE: &str = "__Host-redlib_session";
+const TX_COOKIE: &str = "__Host-redlib_oidc_tx";
 const DEFAULT_SCOPES: &str = "openid profile email";
 const DEFAULT_SESSION_TTL: u64 = 86_400;
 /// How long a user has to complete the login round-trip.
@@ -440,19 +443,11 @@ pub fn session_from(headers: &HeaderMap) -> Option<Session> {
 	}
 }
 
-/// `Secure` is omitted for loopback so that a local `cargo run` over plain
-/// HTTP still works; everything else is assumed to be behind TLS.
-fn cookie_attrs(secure: bool, max_age: u64) -> String {
-	let base = format!("Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}");
-	if secure {
-		format!("{base}; Secure")
-	} else {
-		base
-	}
-}
-
-fn is_secure_context() -> bool {
-	AUTH.redirect_uri.starts_with("https://")
+/// Always `Secure`, which the `__Host-` prefix requires. Browsers treat
+/// `http://localhost` as secure, so a local `cargo run` still works; any
+/// other instance has to be served over HTTPS.
+fn cookie_attrs(max_age: u64) -> String {
+	format!("Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}; Secure")
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +636,7 @@ pub async fn login(req: Request<Body>) -> Result<Response<Body>, String> {
 	let sep = if disco.authorization_endpoint.contains('?') { '&' } else { '?' };
 	let location = format!("{}{sep}{query}", disco.authorization_endpoint);
 
-	Ok(redirect_to(&location, &[format!("{TX_COOKIE}={tx_token}; {}", cookie_attrs(is_secure_context(), TX_TTL))]))
+	Ok(redirect_to(&location, &[format!("{TX_COOKIE}={tx_token}; {}", cookie_attrs(TX_TTL))]))
 }
 
 #[derive(Deserialize)]
@@ -734,9 +729,9 @@ pub async fn callback(req: Request<Body>) -> Result<Response<Body>, String> {
 	Ok(redirect_to(
 		&tx.redirect_to,
 		&[
-			format!("{SESSION_COOKIE}={token}; {}", cookie_attrs(is_secure_context(), AUTH.session_ttl)),
+			format!("{SESSION_COOKIE}={token}; {}", cookie_attrs(AUTH.session_ttl)),
 			// Retire the transaction cookie now that it has been consumed.
-			format!("{TX_COOKIE}=; {}", cookie_attrs(is_secure_context(), 0)),
+			format!("{TX_COOKIE}=; {}", cookie_attrs(0)),
 		],
 	))
 }
@@ -855,7 +850,7 @@ fn one_or_many<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<
 /// Clears the local session, then hands off to the provider's end-session
 /// endpoint when it advertises one.
 pub async fn logout(_req: Request<Body>) -> Result<Response<Body>, String> {
-	let clear = format!("{SESSION_COOKIE}=; {}", cookie_attrs(is_secure_context(), 0));
+	let clear = format!("{SESSION_COOKIE}=; {}", cookie_attrs(0));
 
 	let location = match discovery().await {
 		Ok(disco) => disco.end_session_endpoint.unwrap_or_else(|| "/".to_string()),
@@ -1164,14 +1159,12 @@ mod tests {
 		for name in [SESSION_COOKIE, TX_COOKIE] {
 			assert!(name.starts_with("__Host-"), "{name}");
 		}
-		for secure in [true, false] {
-			let attrs = cookie_attrs(secure, 60);
-			let attrs: Vec<&str> = attrs.split("; ").collect();
-			for wanted in ["Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=60", "Secure"] {
-				assert!(attrs.contains(&wanted), "{wanted} missing from {attrs:?}");
-			}
-			assert!(!attrs.iter().any(|a| a.to_ascii_lowercase().starts_with("domain")), "{attrs:?}");
+		let attrs = cookie_attrs(60);
+		let attrs: Vec<&str> = attrs.split("; ").collect();
+		for wanted in ["Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=60", "Secure"] {
+			assert!(attrs.contains(&wanted), "{wanted} missing from {attrs:?}");
 		}
+		assert!(!attrs.iter().any(|a| a.to_ascii_lowercase().starts_with("domain")), "{attrs:?}");
 	}
 
 	#[test]

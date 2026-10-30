@@ -337,6 +337,27 @@ async fn main() {
 	app
 		.at("/u/:name")
 		.get(|r| async move { Ok(redirect(&format!("/user/{}", r.param("name").unwrap_or_default()))) }.boxed());
+	app.at("/u/:name/m/:multi").get(|r| {
+		async move {
+			Ok(redirect(&format!(
+				"/user/{}/m/{}",
+				r.param("name").unwrap_or_default(),
+				r.param("multi").unwrap_or_default()
+			)))
+		}
+		.boxed()
+	});
+	app.at("/u/:name/m/:multi/:sort").get(|r| {
+		async move {
+			Ok(redirect(&format!(
+				"/user/{}/m/{}/{}",
+				r.param("name").unwrap_or_default(),
+				r.param("multi").unwrap_or_default(),
+				r.param("sort").unwrap_or_default()
+			)))
+		}
+		.boxed()
+	});
 	app.at("/u/:name/comments/:id/:title").get(|r| post::item(r).boxed());
 	app.at("/u/:name/comments/:id/:title/:comment_id").get(|r| post::item(r).boxed());
 
@@ -347,6 +368,8 @@ async fn main() {
 	app.at("/user/:name/:listing.rss").get(|r| user::rss(r).boxed());
 	app.at("/user/:name").get(|r| user::profile(r).boxed());
 	app.at("/user/:name/:listing").get(|r| user::profile(r).boxed());
+	app.at("/user/:name/m/:multi").get(|r| subreddit::multi(r).boxed());
+	app.at("/user/:name/m/:multi/:sort").get(|r| subreddit::multi(r).boxed());
 	app.at("/user/:name/comments/:id").get(|r| post::item(r).boxed());
 	app.at("/user/:name/comments/:id/:title").get(|r| post::item(r).boxed());
 	app.at("/user/:name/comments/:id/:title/:comment_id").get(|r| post::item(r).boxed());

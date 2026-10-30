@@ -202,8 +202,61 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 }
 
 /// Builds the Reddit API path for a user's multireddit listing.
-fn multi_api_path(_name: &str, _multi: &str, _sort: &str, _query: &str) -> Result<String, String> {
-	Err("Invalid multireddit".to_string())
+fn multi_api_path(name: &str, multi: &str, sort: &str, query: &str) -> Result<String, String> {
+	let valid_name = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+	if !valid_name(name) || !valid_name(multi) {
+		return Err("Invalid multireddit".to_string());
+	}
+	if !["hot", "new", "top", "rising", "controversial"].contains(&sort) {
+		return Err(format!("Invalid sort: {sort}"));
+	}
+	Ok(format!("/user/{name}/m/{multi}/{sort}.json?{query}&raw_json=1"))
+}
+
+// /user/:name/m/:multi[/:sort]
+pub async fn multi(req: Request<Body>) -> Result<Response<Body>, String> {
+	let name = req.param("name").unwrap_or_default();
+	let multi = req.param("multi").unwrap_or_default();
+	let post_sort = setting_or_default(&req, "post_sort", "hot".to_string());
+	let sort = req.param("sort").unwrap_or(post_sort);
+
+	let path = match multi_api_path(&name, &multi, &sort, req.uri().query().unwrap_or_default()) {
+		Ok(path) => path,
+		Err(msg) => return error(req, &msg).await,
+	};
+	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
+	let redirect_url = url[1..].replace('?', "%3F").replace('&', "%26").replace('+', "%2B");
+	let filters = get_filters(&req);
+
+	match Post::fetch(&path, false).await {
+		Ok((mut posts, after)) => {
+			let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
+			let no_posts = posts.is_empty();
+			let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
+			if sort == "new" {
+				posts.sort_by_key(|post| std::cmp::Reverse(post.created_ts));
+			}
+			Ok(template(&SubredditTemplate {
+				sub: Subreddit {
+					title: format!("m/{multi}"),
+					..Subreddit::default()
+				},
+				posts,
+				sort: (sort, param(&path, "t").unwrap_or_default()),
+				ends: (param(&path, "after").unwrap_or_default(), after),
+				prefs: Preferences::new(&req),
+				url,
+				redirect_url,
+				is_filtered: false,
+				all_posts_filtered,
+				all_posts_hidden_nsfw,
+				no_posts,
+				multi_root: format!("/user/{name}/m/{multi}"),
+				multi_owner: name,
+			}))
+		}
+		Err(msg) => error(req, &msg).await,
+	}
 }
 
 pub fn quarantine(req: &Request<Body>, sub: String, restriction: &str) -> Response<Body> {

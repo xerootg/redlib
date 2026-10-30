@@ -154,6 +154,8 @@ impl Kind {
 			["by_id", ..] => Self::Post,
 			["duplicates", ..] => Self::Duplicates,
 			["comments", _, ..] | [_, _, "comments", _, ..] => Self::Comments,
+			// A user's multireddit is a listing of posts, not a profile
+			["user" | "u", _, "m", _, ..] => Self::Listing,
 			["user" | "u", ..] => Self::User,
 			["search", ..] | ["subreddits" | "users", "search", ..] | ["r", _, "search", ..] => Self::Search,
 			["r", _, "wiki", ..] | ["wiki", ..] => Self::Wiki,

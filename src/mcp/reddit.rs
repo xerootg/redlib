@@ -389,7 +389,9 @@ pub fn project_user(thing: &Value) -> Value {
 
 	put(&mut m, "name", str_of(d, "name").map(Value::from));
 	put(&mut m, "id", str_of(d, "id").map(Value::from));
-	put(&mut m, "created_utc", d.get("created_utc").and_then(Value::as_f64).map(|f| Value::from(f as i64)));
+	// GraphQL-built profiles only carry `created`, which is also UTC.
+	let created = d.get("created_utc").or_else(|| d.get("created")).and_then(Value::as_f64);
+	put(&mut m, "created_utc", created.map(|f| Value::from(f as i64)));
 	put(&mut m, "link_karma", num_of(d, "link_karma").map(Value::from));
 	put(&mut m, "comment_karma", num_of(d, "comment_karma").map(Value::from));
 	put(&mut m, "total_karma", num_of(d, "total_karma").map(Value::from));
@@ -1370,6 +1372,14 @@ mod tests {
 		assert_eq!(fetch.len(), MAX_LOOKUP_IDS);
 		assert_eq!(errors.len(), 5);
 		assert!(errors[0]["error"].as_str().unwrap().contains("at most"), "{}", errors[0]);
+	}
+
+	#[test]
+	fn user_age_falls_back_to_created() {
+		let user = json!({"kind": "t2", "data": {"name": "spez", "created": 1118030400.0, "total_karma": 5}});
+		let p = project_user(&user);
+		assert_eq!(p["created_utc"], 1118030400_i64);
+		assert_eq!(p["total_karma"], 5);
 	}
 
 	#[test]

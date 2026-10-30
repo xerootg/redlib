@@ -207,7 +207,8 @@ pub struct Config {
 	pub(crate) endpoints_duplicates: Option<String>,
 
 	// --- OIDC authentication ---------------------------------------------
-	// These have no LIBREDDIT_ aliases: they never existed under the old name.
+	// These have no LIBREDDIT_ names: they never existed under the old name,
+	// and `has_legacy_name` keeps the legacy environment fallback off them.
 	/// Master switch. Auth is only enforced when this is `on`.
 	#[serde(rename = "REDLIB_OIDC_ENABLED")]
 	pub(crate) oidc_enabled: Option<String>,
@@ -309,8 +310,8 @@ impl Config {
 		let parse = |key: &str| -> Option<String> {
 			// Return the first non-`None` value
 			// If all are `None`, return `None`
-			let legacy_key = key.replace("REDLIB_", "LIBREDDIT_");
-			var(key).ok().or_else(|| var(legacy_key).ok()).or_else(|| get_setting_from_config(key, &config))
+			let legacy = || has_legacy_name(key).then(|| var(key.replace("REDLIB_", "LIBREDDIT_")).ok()).flatten();
+			var(key).ok().or_else(legacy).or_else(|| get_setting_from_config(key, &config))
 		};
 		Self {
 			sfw_only: parse("REDLIB_SFW_ONLY"),
@@ -449,6 +450,13 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_MCP_TOKEN" => config.mcp_token.clone(),
 		_ => None,
 	}
+}
+
+/// Whether `key` may also be read from its `LIBREDDIT_` name. The auth
+/// settings never had one, so a stray variable under such a name must not
+/// switch authentication off, widen the bypass list or set a token.
+fn has_legacy_name(key: &str) -> bool {
+	!(key.starts_with("REDLIB_OIDC_") || matches!(key, "REDLIB_AUTH_BYPASS_CIDRS" | "REDLIB_TRUSTED_PROXIES" | "REDLIB_MCP_TOKEN"))
 }
 
 /// Retrieves setting from environment variable or config file.

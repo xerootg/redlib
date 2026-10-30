@@ -251,7 +251,9 @@ fn project_poll(poll: &Value) -> Value {
 }
 
 /// Marks a `get_more_comments` cursor that a non-GraphQL backend issued.
-const FOREIGN_CURSOR_PREFIX: &str = "q:";
+/// GraphQL cursors look like `commenttree:<hash>,...`, so a cursor starting
+/// with this cannot be one of theirs.
+const FOREIGN_CURSOR_PREFIX: &str = "redlib-more?";
 
 /// The cursor handed to the model for a `more` node.
 ///
@@ -259,8 +261,7 @@ const FOREIGN_CURSOR_PREFIX: &str = "q:";
 /// tells them apart by the `more_query` sent alongside. GraphQL cursors, the
 /// common case, are passed through unchanged, so they match what the backend
 /// emits. The scraper's cursors only work together with their `more_query`,
-/// so both travel inside one opaque string; base64 GraphQL cursors never
-/// contain the `:` of the prefix.
+/// so both travel inside one opaque string behind [`FOREIGN_CURSOR_PREFIX`].
 fn encode_cursor(cursor: &str, more_query: Option<&str>) -> String {
 	match more_query.filter(|q| !q.is_empty() && *q != MORE_QUERY) {
 		None => cursor.to_string(),
@@ -1253,6 +1254,20 @@ mod tests {
 		assert_eq!(crate::utils::param(&query, "more_cursor").as_deref(), Some("Y3Vyc29y=="));
 		assert_eq!(crate::utils::param(&query, "more_query").as_deref(), Some(MORE_QUERY));
 		assert_eq!(crate::utils::param(&query, "sort").as_deref(), Some("top"));
+	}
+
+	#[test]
+	fn live_shaped_graphql_cursors_are_not_mistaken_for_foreign_ones() {
+		// Real GraphQL cursors contain ':' and arbitrary punctuation.
+		let cursor = "commenttree:60fe9b44,::0:ex:,WaKUF47N':%BSS<JOa*5ac\\H57{At";
+		let listing = json!({"data": {"children": [
+			{"kind": "more", "data": {"id": "", "count": 9, "parent_id": "t3_abc", "cursor": cursor, "more_query": "gql"}}
+		]}});
+		assert_eq!(project_comments(&listing, 0, 5)[0]["cursor"], cursor);
+		let path = more_comments_path("abc", cursor, "confidence");
+		let query = format!("?{}", path.split_once('?').unwrap().1);
+		assert_eq!(crate::utils::param(&query, "more_cursor").as_deref(), Some(cursor));
+		assert_eq!(crate::utils::param(&query, "more_query").as_deref(), Some(MORE_QUERY));
 	}
 
 	#[test]

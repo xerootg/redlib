@@ -83,7 +83,7 @@ Assign a default value for each instance-specific setting by passing environment
 | `OIDC_ALLOWED_GROUPS`     | List            | (empty)                                | Comma-separated groups; when set, a login must carry one of them. |
 | `AUTH_BYPASS_CIDRS`       | List            | (empty)                                | Comma-separated CIDRs or addresses that skip the login. |
 | `TRUSTED_PROXIES`         | List            | (empty)                                | Comma-separated CIDRs of reverse proxies whose `X-Forwarded-For` is believed. |
-| `MCP_TOKEN`               | String          | (empty)                                | Bearer token that passes the login on any path, for clients that can't hold a cookie. **Secret.** |
+| `MCP_TOKEN`               | String          | (empty)                                | Bearer token that passes the login on `/mcp` only, for MCP clients, which can't hold a cookie. **Secret.** |
 
 ### Reddit session
 
@@ -176,7 +176,7 @@ Redlib won't start if OIDC is on and any of the issuer, client ID, client secret
 - The session and login cookies are `__Host-redlib_session` and `__Host-redlib_oidc_tx`. The `__Host-` prefix means browsers only keep them over HTTPS (or `http://localhost`), so serve the instance over HTTPS. The names used to be `redlib_session` and `redlib_oidc_tx`; upgrading from a version with those names logs everyone out once.
 - Sessions are signed cookies; Redlib stores nothing. They can't be revoked one by one: changing `REDLIB_OIDC_SESSION_SECRET` ends all of them.
 - Clients in `REDLIB_AUTH_BYPASS_CIDRS` skip the login, e.g. `192.168.0.0/16,100.64.0.0/10`. Behind a reverse proxy, list the proxy in `REDLIB_TRUSTED_PROXIES`: `X-Forwarded-For` is read only when the connection comes from one of those, right to left, skipping the proxies. Every `X-Forwarded-For` line counts, in order, and the walk stops at the first entry that isn't a plain IPv4 or IPv6 address (IPv6 may be in brackets; a port is not allowed). If a proxy sends no `X-Forwarded-For`, one that lists only proxies, or one with an entry that can't be read, the client counts as unknown: it gets no bypass, even if the proxy's own address is in a bypass range, but can still log in. From anywhere else the header is ignored and the connecting address is the client, so a client can't claim a bypass address. IPv4 clients on Redlib's dual-stack `[::]` socket match IPv4 ranges.
-- `REDLIB_MCP_TOKEN` lets clients that can't hold a cookie in with `Authorization: Bearer <token>`, on any path.
+- `REDLIB_MCP_TOKEN` lets MCP clients, which can't hold a cookie, in with `Authorization: Bearer <token>` (the scheme in any case). It works on `/mcp` only; everywhere else the token is ignored and a login is needed.
 
 The secrets, the bypass ranges and the proxy list never show on `/info`.
 

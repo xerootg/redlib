@@ -41,6 +41,9 @@ use crate::config;
 /// otherwise the login redirect would loop forever.
 pub const OIDC_PREFIX: &str = "/oidc/";
 
+/// The only path `REDLIB_MCP_TOKEN` opens.
+const MCP_PATH: &str = "/mcp";
+
 // `__Host-` makes browsers accept these only with Secure, Path=/ and no
 // Domain, so another host under the same parent domain cannot set or shadow
 // them. The prefix changed the names, which logged everyone out once.
@@ -405,7 +408,8 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 /// Whether the request carries the configured API bearer token.
 ///
 /// Session cookies are unusable by headless clients such as an MCP client, so
-/// a long random token stands in for them. Returns false whenever no token is
+/// a long random token stands in for them. The gate only consults this for
+/// [`MCP_PATH`]. Returns false whenever no token is
 /// configured, so an unset value can never authorise anything.
 ///
 /// The comparison hashes both sides first. A plain `==` on the raw strings
@@ -421,7 +425,11 @@ fn bearer_token_valid(headers: &HeaderMap) -> bool {
 	let Some(presented) = headers
 		.get("authorization")
 		.and_then(|v| v.to_str().ok())
-		.and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+		.and_then(|v| {
+			// Auth schemes are case-insensitive (RFC 9110 11.1).
+			let (scheme, token) = v.split_once(' ')?;
+			scheme.eq_ignore_ascii_case("bearer").then_some(token)
+		})
 		.map(str::trim)
 		.filter(|t| !t.is_empty())
 	else {
@@ -871,7 +879,8 @@ pub async fn logout(_req: Request<Body>) -> Result<Response<Body>, String> {
 ///
 /// Only `/oidc/` is exempt. Health checks, static files and `/mcp` are gated
 /// like everything else; probes are expected to come from a bypass CIDR, and
-/// headless clients such as MCP present `REDLIB_MCP_TOKEN` as a bearer token.
+/// MCP clients present `REDLIB_MCP_TOKEN` as a bearer token, which opens
+/// `/mcp` and nothing else.
 pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Body>> {
 	if !AUTH.enabled {
 		return None;
@@ -888,9 +897,11 @@ pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Bo
 		return None;
 	}
 
-	// Checked before the cookie so that headless clients (MCP, curl, CI) have
-	// a credential they can actually present.
-	if bearer_token_valid(headers) {
+	// Checked before the cookie so that MCP clients have a credential they can
+	// actually present. Only for `/mcp`: a token handed to an MCP client must
+	// not open the rest of the instance. `path` has already been normalised
+	// by the server (no doubled or trailing slashes).
+	if path == MCP_PATH && bearer_token_valid(headers) {
 		return None;
 	}
 

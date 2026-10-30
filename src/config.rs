@@ -264,8 +264,8 @@ pub struct Config {
 	#[serde(skip_serializing)]
 	pub(crate) trusted_proxies: Option<String>,
 
-	/// Bearer token accepted at any endpoint by the OIDC gate, for clients
-	/// that cannot hold a session cookie (the MCP endpoint at `/mcp`, curl).
+	/// Bearer token the OIDC gate accepts on `/mcp` only, for MCP clients,
+	/// which cannot hold a session cookie.
 	/// Unset means no token is accepted at all. A credential, so it is never
 	/// serialized.
 	#[serde(rename = "REDLIB_MCP_TOKEN")]

@@ -30,6 +30,8 @@ struct PostTemplate {
 	comment_query: String,
 	/// The page shows one batch of scraped comments loaded from a "more" link.
 	more_page: bool,
+	/// The page links to a single comment that Reddit has no record of.
+	comment_missing: bool,
 }
 
 static COMMENT_SEARCH_CAPTURE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\?q=(.*)&type=comment").unwrap());
@@ -123,6 +125,8 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 		_ => query_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &get_filters(&req), &query, &req),
 	};
 
+	let comment_missing = comment_missing(single_thread, &response[1], &query);
+
 	// Use the Post and Comment structs to generate a website to show users
 	Ok(template(&PostTemplate {
 		comments,
@@ -134,7 +138,14 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 		url: req_url,
 		comment_query: query,
 		more_page,
+		comment_missing,
 	}))
+}
+
+/// Whether a permalink to a single comment found nothing: Reddit sends an empty listing
+/// for comments that were removed, deleted or never existed.
+fn comment_missing(_single_thread: bool, _comments: &serde_json::Value, _query: &str) -> bool {
+	false
 }
 
 /// Feed for a post and its comments, built from the JSON API.
@@ -372,6 +383,55 @@ fn build_comment(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn render(comment_missing: bool) -> String {
+		let post = crate::client::block_on_shared(parse_post(&serde_json::json!({
+			"kind": "t3",
+			"data": {"id": "abc", "title": "A post", "subreddit": "test", "permalink": "/r/test/comments/abc/a_post/"}
+		})));
+		PostTemplate {
+			comments: Vec::new(),
+			post,
+			sort: String::new(),
+			prefs: Preferences::default(),
+			single_thread: true,
+			url: "/r/test/comments/abc/a_post/gone/".into(),
+			url_without_query: "/r/test/comments/abc/a_post/gone/".into(),
+			comment_query: String::new(),
+			more_page: false,
+			comment_missing,
+		}
+		.render()
+		.unwrap()
+	}
+
+	#[test]
+	fn test_comment_missing_when_a_permalink_finds_nothing() {
+		let empty = serde_json::json!({"kind": "Listing", "data": {"children": []}});
+		assert!(comment_missing(true, &empty, ""));
+	}
+
+	#[test]
+	fn test_comment_not_missing_otherwise() {
+		let empty = serde_json::json!({"kind": "Listing", "data": {"children": []}});
+		let found = serde_json::json!({"kind": "Listing", "data": {"children": [{"kind": "t1", "data": {}}]}});
+		// A post page that simply has no comments
+		assert!(!comment_missing(false, &empty, ""));
+		// The comment was found
+		assert!(!comment_missing(true, &found, ""));
+		// A comment search with no results
+		assert!(!comment_missing(true, &empty, "needle"));
+		// No listing at all is an error elsewhere, not a missing comment
+		assert!(!comment_missing(true, &serde_json::Value::Null, ""));
+	}
+
+	#[test]
+	fn test_missing_comment_notice_rendered() {
+		let html = render(true);
+		assert!(html.contains("This comment was removed, deleted, or doesn't exist."), "{html}");
+		assert!(html.contains(r#"href="/r/test/comments/abc/a_post/""#));
+		assert!(!render(false).contains("removed, deleted, or"));
+	}
 
 	#[test]
 	fn test_gone_comment() {

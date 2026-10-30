@@ -1200,6 +1200,25 @@ mod tests {
 		assert!(!body.contains("SCAM") && !body.contains("access_denied"), "{body}");
 	}
 
+	#[test]
+	#[sealed_test]
+	fn a_provider_that_never_answers_does_not_hang_the_request() {
+		// Accepts connections and then says nothing, like a wedged provider.
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let addr = listener.local_addr().unwrap();
+		std::thread::spawn(move || {
+			let held: Vec<_> = listener.incoming().collect();
+			drop(held);
+		});
+		// The config is read on first use, which is after this in a fresh process.
+		std::env::set_var("REDLIB_OIDC_ISSUER", format!("http://{addr}"));
+
+		let runtime = tokio::runtime::Runtime::new().unwrap();
+		let outcome = runtime.block_on(async { tokio::time::timeout(std::time::Duration::from_secs(30), discovery()).await });
+		let result = outcome.expect("discovery must give up on its own instead of waiting forever");
+		assert!(result.is_err());
+	}
+
 	// --- ID token validation ------------------------------------------------
 
 	/// A throwaway RSA key generated for these tests only. It signs nothing

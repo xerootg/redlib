@@ -1554,7 +1554,11 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_never_blocks_its_own_endpoints() {
-		for path in ["/oidc/login", "/oidc/callback", "/oidc/logout"] {
+		// The login endpoints, or login could never complete, and the bare
+		// liveness check, which kubelet probes from the node's pod-network
+		// bridge address: a trusted-proxy address that sends no
+		// X-Forwarded-For, so it gets no bypass.
+		for path in ["/oidc/login", "/oidc/callback", "/oidc/logout", "/healthz"] {
 			assert!(gate(ip(OUTSIDE), path, &headers(&[BROWSER])).is_none(), "{path}");
 		}
 	}
@@ -1569,10 +1573,24 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_covers_every_other_path() {
-		// Only `/oidc/` is exempt, as in the original. Health checks, static
-		// files and `/mcp` all need a session, a bypass address or (once
-		// configured) the bearer token.
-		for path in ["/", "/healthz", "/healthz/reddit", "/healthz/reddit.json", "/style.css", "/info.json", "/mcp", "/oidc"] {
+		// Only the three login endpoints and the bare liveness check are
+		// exempt. Everything else, including anything else under /oidc/ and
+		// the Reddit health report, needs a session, a bypass address or the
+		// bearer token.
+		for path in [
+			"/",
+			"/healthz/reddit",
+			"/healthz/reddit.json",
+			"/style.css",
+			"/info.json",
+			"/mcp",
+			"/oidc",
+			"/oidc/",
+			"/oidc/x",
+			"/oidc/login/x",
+			"/oidc/loginx",
+			"/healthzx",
+		] {
 			let res = gate(ip(OUTSIDE), path, &HeaderMap::new()).unwrap_or_else(|| panic!("{path} must be gated"));
 			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
 		}

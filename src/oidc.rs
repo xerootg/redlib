@@ -1206,6 +1206,36 @@ mod tests {
 	}
 
 	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		// 31 bytes: one short.
+		("REDLIB_OIDC_SESSION_SECRET", "0123456789abcdef0123456789abcde"),
+	])]
+	fn a_short_session_secret_refuses_to_start() {
+		// Hashing a short secret does not make it any harder to guess, and
+		// whoever guesses it can mint sessions.
+		let refusal = startup_refusal().expect("must refuse to start");
+		assert!(refusal.contains("REDLIB_OIDC_SESSION_SECRET") && refusal.contains("32"), "{refusal}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "0123456789abcdef0123456789abcdef"),
+	])]
+	fn a_32_byte_session_secret_is_enough() {
+		assert_eq!(startup_refusal(), None);
+	}
+
+	#[test]
 	#[sealed_test(env = [("REDLIB_OIDC_ENABLED", "")])]
 	fn an_empty_enabled_value_refuses_to_start() {
 		let refusal = startup_refusal().expect("must refuse to start");
@@ -1243,7 +1273,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_redirects_browsers_to_login() {
 		let res = gate(ip(OUTSIDE), "/r/rust/comments/abc", &headers(&[BROWSER])).expect("must be gated");
@@ -1258,7 +1288,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_answers_programmatic_clients_with_401_json() {
 		let res = gate(ip(OUTSIDE), "/r/rust", &headers(&[("accept", "application/json")])).expect("must be gated");
@@ -1275,7 +1305,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_never_blocks_its_own_endpoints() {
 		for path in ["/oidc/login", "/oidc/callback", "/oidc/logout"] {
@@ -1290,7 +1320,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_covers_every_other_path() {
 		// Only `/oidc/` is exempt, as in the original. Health checks, static
@@ -1309,7 +1339,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 		("REDLIB_AUTH_BYPASS_CIDRS", "192.168.0.0/16,127.0.0.0/8"),
 		("REDLIB_TRUSTED_PROXIES", "10.42.0.0/16"),
 	])]
@@ -1331,7 +1361,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 		("REDLIB_AUTH_BYPASS_CIDRS", "192.168.0.0/16"),
 	])]
 	fn gate_ignores_forged_forwarded_for_without_trusted_proxies() {
@@ -1396,7 +1426,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_accepts_a_valid_session_cookie() {
 		let token = sign(&session(now() + 3600)).unwrap();
@@ -1411,7 +1441,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_rejects_expired_tampered_and_foreign_sessions() {
 		// Expired beyond jsonwebtoken's default 60 s leeway.
@@ -1448,7 +1478,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn login_transaction_cookie_is_not_a_session() {
 		// Both are signed with the same key; the claim shapes must keep them apart.
@@ -1487,7 +1517,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 		("REDLIB_MCP_TOKEN", "correct-horse-battery-staple"),
 	])]
 	fn gate_accepts_the_bearer_token_on_any_path() {
@@ -1504,7 +1534,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 		("REDLIB_MCP_TOKEN", "correct-horse-battery-staple"),
 	])]
 	fn gate_rejects_wrong_or_malformed_bearer_tokens() {
@@ -1527,7 +1557,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 		("REDLIB_MCP_TOKEN", "   "),
 	])]
 	fn an_unset_or_blank_token_authorises_nothing() {

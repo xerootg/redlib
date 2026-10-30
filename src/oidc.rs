@@ -1036,6 +1036,59 @@ mod tests {
 		assert!(!AuthConfig::load_unchecked().enabled);
 	}
 
+	/// The message `AuthConfig::load` refuses to start with, if it refuses.
+	fn startup_refusal() -> Option<String> {
+		let err = std::panic::catch_unwind(AuthConfig::load).err()?;
+		Some(
+			err
+				.downcast_ref::<String>()
+				.cloned()
+				.or_else(|| err.downcast_ref::<&str>().map(ToString::to_string))
+				.unwrap_or_default(),
+		)
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_OIDC_ENABLED", " TRUE ")])]
+	fn enabled_ignores_case_and_surrounding_space() {
+		assert!(AuthConfig::load_unchecked().enabled);
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_OIDC_ENABLED", "Yes")])]
+	fn yes_enables_auth() {
+		assert!(AuthConfig::load_unchecked().enabled);
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_OIDC_ENABLED", "NO")])]
+	fn no_disables_auth() {
+		assert!(!AuthConfig::load_unchecked().enabled);
+		assert_eq!(startup_refusal(), None);
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "ture"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "0123456789abcdef0123456789abcdef"),
+	])]
+	fn a_misspelt_enabled_value_refuses_to_start() {
+		// Reading a typo as "off" would silently publish the instance.
+		let refusal = startup_refusal().expect("must refuse to start");
+		assert!(refusal.contains("REDLIB_OIDC_ENABLED") && refusal.contains("ture"), "{refusal}");
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_OIDC_ENABLED", "")])]
+	fn an_empty_enabled_value_refuses_to_start() {
+		let refusal = startup_refusal().expect("must refuse to start");
+		assert!(refusal.contains("REDLIB_OIDC_ENABLED"), "{refusal}");
+	}
+
 	#[test]
 	#[sealed_test(env = [
 		("REDLIB_OIDC_CLIENT_SECRET", "client-secret-value"),

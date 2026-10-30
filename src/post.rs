@@ -144,8 +144,8 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 
 /// Whether a permalink to a single comment found nothing: Reddit sends an empty listing
 /// for comments that were removed, deleted or never existed.
-fn comment_missing(_single_thread: bool, _comments: &serde_json::Value, _query: &str) -> bool {
-	false
+fn comment_missing(single_thread: bool, comments: &serde_json::Value, query: &str) -> bool {
+	single_thread && query.is_empty() && comments["data"]["children"].as_array().is_some_and(Vec::is_empty)
 }
 
 /// Feed for a post and its comments, built from the JSON API.

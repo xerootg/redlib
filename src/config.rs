@@ -205,6 +205,64 @@ pub struct Config {
 
 	#[serde(rename = "REDLIB_ENDPOINTS_DUPLICATES")]
 	pub(crate) endpoints_duplicates: Option<String>,
+
+	// --- OIDC authentication ---------------------------------------------
+	// These have no LIBREDDIT_ aliases: they never existed under the old name.
+	/// Master switch. Auth is only enforced when this is `on`.
+	#[serde(rename = "REDLIB_OIDC_ENABLED")]
+	pub(crate) oidc_enabled: Option<String>,
+
+	/// Issuer URL, e.g. `https://authentik.example.com/application/o/redlib/`.
+	/// Discovery appends `.well-known/openid-configuration` to this.
+	#[serde(rename = "REDLIB_OIDC_ISSUER")]
+	pub(crate) oidc_issuer: Option<String>,
+
+	#[serde(rename = "REDLIB_OIDC_CLIENT_ID")]
+	pub(crate) oidc_client_id: Option<String>,
+
+	/// A credential, so it must never be serialized: `/info.json` serializes
+	/// the whole config.
+	#[serde(rename = "REDLIB_OIDC_CLIENT_SECRET")]
+	#[serde(skip_serializing)]
+	pub(crate) oidc_client_secret: Option<String>,
+
+	/// Absolute callback URL. Must exactly match a redirect URI registered
+	/// with the provider, e.g. `https://redlib.example.com/oidc/callback`.
+	#[serde(rename = "REDLIB_OIDC_REDIRECT_URI")]
+	pub(crate) oidc_redirect_uri: Option<String>,
+
+	/// Space-separated. Defaults to `openid profile email`.
+	#[serde(rename = "REDLIB_OIDC_SCOPES")]
+	pub(crate) oidc_scopes: Option<String>,
+
+	/// HMAC key for session cookies. Rotating it invalidates all sessions.
+	/// Anyone holding it can mint a session, so it is never serialized.
+	#[serde(rename = "REDLIB_OIDC_SESSION_SECRET")]
+	#[serde(skip_serializing)]
+	pub(crate) oidc_session_secret: Option<String>,
+
+	/// Session lifetime in seconds. Defaults to 86400 (24h).
+	#[serde(rename = "REDLIB_OIDC_SESSION_TTL")]
+	pub(crate) oidc_session_ttl: Option<String>,
+
+	/// Optional comma-separated group allowlist. When set, a valid login is
+	/// additionally required to carry one of these groups.
+	#[serde(rename = "REDLIB_OIDC_ALLOWED_GROUPS")]
+	pub(crate) oidc_allowed_groups: Option<String>,
+
+	/// Comma-separated CIDRs whose clients skip authentication entirely.
+	/// Not serialized: it maps out which addresses need no login.
+	#[serde(rename = "REDLIB_AUTH_BYPASS_CIDRS")]
+	#[serde(skip_serializing)]
+	pub(crate) auth_bypass_cidrs: Option<String>,
+
+	/// Comma-separated CIDRs of reverse proxies whose `X-Forwarded-For` we
+	/// trust. Anything not listed here has its XFF ignored, so a client
+	/// cannot forge a bypass address. Leave unset when not behind a proxy.
+	/// Not serialized, for the same reason as the bypass list.
+	#[serde(rename = "REDLIB_TRUSTED_PROXIES")]
+	#[serde(skip_serializing)]
+	pub(crate) trusted_proxies: Option<String>,
 }
 
 impl Config {
@@ -299,6 +357,17 @@ impl Config {
 			endpoints_search: parse("REDLIB_ENDPOINTS_SEARCH"),
 			endpoints_wiki: parse("REDLIB_ENDPOINTS_WIKI"),
 			endpoints_duplicates: parse("REDLIB_ENDPOINTS_DUPLICATES"),
+			oidc_enabled: parse("REDLIB_OIDC_ENABLED"),
+			oidc_issuer: parse("REDLIB_OIDC_ISSUER"),
+			oidc_client_id: parse("REDLIB_OIDC_CLIENT_ID"),
+			oidc_client_secret: parse("REDLIB_OIDC_CLIENT_SECRET"),
+			oidc_redirect_uri: parse("REDLIB_OIDC_REDIRECT_URI"),
+			oidc_scopes: parse("REDLIB_OIDC_SCOPES"),
+			oidc_session_secret: parse("REDLIB_OIDC_SESSION_SECRET"),
+			oidc_session_ttl: parse("REDLIB_OIDC_SESSION_TTL"),
+			oidc_allowed_groups: parse("REDLIB_OIDC_ALLOWED_GROUPS"),
+			auth_bypass_cidrs: parse("REDLIB_AUTH_BYPASS_CIDRS"),
+			trusted_proxies: parse("REDLIB_TRUSTED_PROXIES"),
 		}
 	}
 }
@@ -357,6 +426,17 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_ENDPOINTS_SEARCH" => config.endpoints_search.clone(),
 		"REDLIB_ENDPOINTS_WIKI" => config.endpoints_wiki.clone(),
 		"REDLIB_ENDPOINTS_DUPLICATES" => config.endpoints_duplicates.clone(),
+		"REDLIB_OIDC_ENABLED" => config.oidc_enabled.clone(),
+		"REDLIB_OIDC_ISSUER" => config.oidc_issuer.clone(),
+		"REDLIB_OIDC_CLIENT_ID" => config.oidc_client_id.clone(),
+		"REDLIB_OIDC_CLIENT_SECRET" => config.oidc_client_secret.clone(),
+		"REDLIB_OIDC_REDIRECT_URI" => config.oidc_redirect_uri.clone(),
+		"REDLIB_OIDC_SCOPES" => config.oidc_scopes.clone(),
+		"REDLIB_OIDC_SESSION_SECRET" => config.oidc_session_secret.clone(),
+		"REDLIB_OIDC_SESSION_TTL" => config.oidc_session_ttl.clone(),
+		"REDLIB_OIDC_ALLOWED_GROUPS" => config.oidc_allowed_groups.clone(),
+		"REDLIB_AUTH_BYPASS_CIDRS" => config.auth_bypass_cidrs.clone(),
+		"REDLIB_TRUSTED_PROXIES" => config.trusted_proxies.clone(),
 		_ => None,
 	}
 }

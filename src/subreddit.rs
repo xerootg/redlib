@@ -32,6 +32,8 @@ struct SubredditTemplate {
 	/// Whether all posts were hidden because they are NSFW (and user has disabled show NSFW)
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
+	/// Whether the empty listing is because Reddit only serves this quarantined community to logged-in accounts.
+	quarantine_empty: bool,
 }
 
 #[derive(Template)]
@@ -159,6 +161,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
+			quarantine_empty: false,
 		}))
 	} else {
 		match Post::fetch(&path, quarantined).await {
@@ -167,6 +170,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 				if clean_urls == "on".to_owned() {
 					posts.iter_mut().for_each(|post| post.media.url = clean_url(post.media.url.clone()));
 				}
+				let listing_empty = posts.is_empty();
 				let (_, all_posts_filtered) = filter_posts(&mut posts, &filters);
 				let no_posts = posts.is_empty();
 				let all_posts_hidden_nsfw = !no_posts && (posts.iter().all(|p| p.flags.nsfw) && setting(&req, "show_nsfw") != "on");
@@ -186,6 +190,7 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					all_posts_filtered,
 					all_posts_hidden_nsfw,
 					no_posts,
+					quarantine_empty: quarantine_empty(listing_empty, quarantined, root, &path),
 				}))
 			}
 			Err(msg) => match msg.as_str() {
@@ -196,6 +201,13 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			},
 		}
 	}
+}
+
+/// Reddit only returns quarantined posts to logged-in accounts: after opting in, anonymous
+/// requests get an empty listing. That is the case when the first page of an opted-in
+/// community (not the front page) comes back empty.
+fn quarantine_empty(listing_empty: bool, quarantined: bool, root: bool, path: &str) -> bool {
+	listing_empty && quarantined && !root && param(path, "after").is_none()
 }
 
 pub fn quarantine(req: &Request<Body>, sub: String, restriction: &str) -> Response<Body> {
@@ -668,6 +680,55 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn empty_listing(quarantine_empty: bool) -> String {
+		SubredditTemplate {
+			sub: Subreddit::default(),
+			posts: Vec::new(),
+			sort: ("hot".to_string(), String::new()),
+			ends: (String::new(), String::new()),
+			prefs: Preferences::default(),
+			url: "/r/TheRedPill".to_string(),
+			redirect_url: "r/TheRedPill".to_string(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: true,
+			quarantine_empty,
+		}
+		.render()
+		.unwrap()
+	}
+
+	#[test]
+	fn empty_quarantined_listing_explains_login_requirement() {
+		let html = empty_listing(true);
+		assert!(html.contains("only shows quarantined communities to logged-in accounts"));
+		assert!(!html.contains("No posts were found."));
+	}
+
+	#[test]
+	fn empty_regular_listing_keeps_generic_message() {
+		let html = empty_listing(false);
+		assert!(html.contains("No posts were found."));
+		assert!(!html.contains("logged-in accounts"));
+	}
+
+	#[test]
+	fn test_quarantine_empty_on_first_page_of_opted_in_community() {
+		assert!(quarantine_empty(true, true, false, "/r/TheRedPill/hot.json?&raw_json=1"));
+	}
+
+	#[test]
+	fn test_quarantine_not_empty_otherwise() {
+		let path = "/r/TheRedPill/hot.json?&raw_json=1";
+		// Posts came back, or the visitor has not opted in, or this is the front page
+		assert!(!quarantine_empty(false, true, false, path));
+		assert!(!quarantine_empty(true, false, false, path));
+		assert!(!quarantine_empty(true, true, true, path));
+		// A later page running out is not a login problem
+		assert!(!quarantine_empty(true, true, false, "/r/TheRedPill/hot.json?after=t3_abc&raw_json=1"));
+	}
 
 	#[test]
 	fn test_wiki_html() {

@@ -12,7 +12,7 @@ use log::{info, warn};
 use redlib::body::Body;
 use redlib::client::{canonical_path, proxy, CLIENT};
 use redlib::server::{self, RequestExt};
-use redlib::utils::{error, get_source_url, redirect, ThemeAssets};
+use redlib::utils::{error, gallery_redirect_path, get_source_url, redirect, ThemeAssets};
 use redlib::{config, duplicates, headers, instance_info, mcp, oidc, post, search, settings, subreddit, user};
 
 use redlib::client::OAUTH_CLIENT;
@@ -483,6 +483,16 @@ async fn main() {
 
 				// Error message for unknown pages
 				_ => error(req, "Nothing here").await,
+			}
+		})
+	});
+
+	// Reddit's own gallery URLs (https://www.reddit.com/gallery/<id>) redirect to the post
+	app.at("/gallery/:id").get(|req: Request<Body>| {
+		Box::pin(async move {
+			match req.param("id").as_deref().and_then(gallery_redirect_path) {
+				Some(path) => Ok(redirect(&path)),
+				None => error(req, "Nothing here").await,
 			}
 		})
 	});

@@ -72,6 +72,18 @@ Assign a default value for each instance-specific setting by passing environment
 | `HSTS`                    | Integer         | `604800`                               | `max-age` of the HSTS header in seconds. `-H` takes precedence. |
 | `IPV4_ONLY`               | `["on", "off"]` | `off`                                  | Listens on IPv4 only, like `-4` or `IPV4_ONLY`. |
 | `IPV6_ONLY`               | `["on", "off"]` | `off`                                  | Listens on IPv6 only, like `-6` or `IPV6_ONLY`. |
+| `OIDC_ENABLED`            | `["on", "off"]` | `off`                                  | Requires a login through an OpenID Connect provider. See [OIDC login](#oidc-login). |
+| `OIDC_ISSUER`             | String          | (empty)                                | Issuer URL of the provider. Required with `OIDC_ENABLED`. |
+| `OIDC_CLIENT_ID`          | String          | (empty)                                | Client ID registered with the provider. Required with `OIDC_ENABLED`. |
+| `OIDC_CLIENT_SECRET`      | String          | (empty)                                | Client secret. Required with `OIDC_ENABLED`. **Secret.** |
+| `OIDC_REDIRECT_URI`       | String          | (empty)                                | This instance's `/oidc/callback` URL, exactly as registered with the provider. Required with `OIDC_ENABLED`. |
+| `OIDC_SCOPES`             | String          | `openid profile email`                 | Space-separated scopes to request. |
+| `OIDC_SESSION_SECRET`     | String          | (random per start)                     | Key that signs session cookies. Set it, or every restart logs everyone out. **Secret.** |
+| `OIDC_SESSION_TTL`        | Integer         | `86400`                                | Session lifetime in seconds. |
+| `OIDC_ALLOWED_GROUPS`     | List            | (empty)                                | Comma-separated groups; when set, a login must carry one of them. |
+| `AUTH_BYPASS_CIDRS`       | List            | (empty)                                | Comma-separated CIDRs or addresses that skip the login. |
+| `TRUSTED_PROXIES`         | List            | (empty)                                | Comma-separated CIDRs of reverse proxies whose `X-Forwarded-For` is believed. |
+| `MCP_TOKEN`               | String          | (empty)                                | Bearer token that passes the login on any path, for clients that can't hold a cookie. **Secret.** |
 
 ### Reddit session
 
@@ -139,6 +151,30 @@ While running, Redlib reorders the listed backends by how often each worked in t
 ³ The old GraphQL feed sends about 8 posts per request, so a page takes up to `REDLIB_GQL_FEED_REQUESTS` requests.
 
 </details>
+
+### OIDC login
+
+With `REDLIB_OIDC_ENABLED=on`, every page needs a login through an OpenID Connect provider such as authentik, Keycloak or Authelia. Register a confidential client with the redirect URI `https://<your instance>/oidc/callback`, then set:
+
+```bash
+REDLIB_OIDC_ENABLED=on
+REDLIB_OIDC_ISSUER=https://auth.example.com/application/o/redlib/
+REDLIB_OIDC_CLIENT_ID=...
+REDLIB_OIDC_CLIENT_SECRET=...
+REDLIB_OIDC_REDIRECT_URI=https://redlib.example.com/oidc/callback
+REDLIB_OIDC_SESSION_SECRET=<long random string>
+```
+
+Redlib won't start if OIDC is on and any of the issuer, client ID, client secret or redirect URI is missing.
+
+- Browsers without a session are sent to `/oidc/login`, and back to the page they asked for afterwards. Other clients (no `text/html` in `Accept`) get `401` with `{"error":"unauthorized","error_description":"Authentication required."}`.
+- `/oidc/login`, `/oidc/callback` and `/oidc/logout` are the only paths without a login. Health checks (`/healthz`, `/healthz/reddit`) and `/mcp` need one too, so point probes at the instance from an address in `REDLIB_AUTH_BYPASS_CIDRS`.
+- `/oidc/logout` ends the session and then the provider's session, if the provider offers that.
+- Sessions are signed cookies; Redlib stores nothing. They can't be revoked one by one: changing `REDLIB_OIDC_SESSION_SECRET` ends all of them.
+- Clients in `REDLIB_AUTH_BYPASS_CIDRS` skip the login, e.g. `192.168.0.0/16,100.64.0.0/10`. Behind a reverse proxy, list the proxy in `REDLIB_TRUSTED_PROXIES`: `X-Forwarded-For` is read only when the connection comes from one of those, right to left, skipping the proxies. From anywhere else it is ignored, so a client can't claim a bypass address. IPv4 clients on Redlib's dual-stack `[::]` socket match IPv4 ranges.
+- `REDLIB_MCP_TOKEN` lets clients that can't hold a cookie in with `Authorization: Bearer <token>`, on any path.
+
+The secrets, the bypass ranges and the proxy list never show on `/info`.
 
 ## Default user settings
 

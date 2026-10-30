@@ -15,7 +15,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Gate every image on lint and the offline tests. Live tests that call
+  # Reddit are skipped: GitHub's runners get captcha'd, and an image should
+  # not be blocked by Reddit's mood. /healthz/reddit watches that in prod.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: "cargo test --locked -- --skip live_tests::"
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read

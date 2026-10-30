@@ -22,13 +22,13 @@
 
 use std::net::IpAddr;
 use std::sync::LazyLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hyper::{HeaderMap, Request, Response, StatusCode};
 use ipnet::IpNet;
-use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -41,12 +41,23 @@ use crate::config;
 /// otherwise the login redirect would loop forever.
 pub const OIDC_PREFIX: &str = "/oidc/";
 
-const SESSION_COOKIE: &str = "redlib_session";
-const TX_COOKIE: &str = "redlib_oidc_tx";
+/// The only path `REDLIB_MCP_TOKEN` opens.
+const MCP_PATH: &str = "/mcp";
+
+// `__Host-` makes browsers accept these only with Secure, Path=/ and no
+// Domain, so another host under the same parent domain cannot set or shadow
+// them. The prefix changed the names, which logged everyone out once.
+const SESSION_COOKIE: &str = "__Host-redlib_session";
+const TX_COOKIE: &str = "__Host-redlib_oidc_tx";
 const DEFAULT_SCOPES: &str = "openid profile email";
 const DEFAULT_SESSION_TTL: u64 = 86_400;
 /// How long a user has to complete the login round-trip.
 const TX_TTL: u64 = 600;
+/// How far ahead of our clock an ID token's `iat` may be.
+const MAX_IAT_SKEW: u64 = 300;
+/// Shortest accepted `REDLIB_OIDC_SESSION_SECRET`, in bytes: the size of the
+/// HMAC-SHA256 key it becomes.
+const MIN_SESSION_SECRET_LEN: usize = 32;
 
 fn now() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default()
@@ -86,6 +97,21 @@ pub struct AuthConfig {
 	pub bypass_cidrs: Vec<IpNet>,
 	pub trusted_proxies: Vec<IpNet>,
 	session_key: Vec<u8>,
+	/// Settings that are present but unusable. `load` refuses to start when
+	/// there are any.
+	problems: Vec<String>,
+}
+
+/// Reads `REDLIB_OIDC_ENABLED`. Unset is off; a value that is neither a
+/// recognised yes nor a recognised no is an error, not a guess, because
+/// guessing "off" would publish the instance without a login.
+fn parse_enabled(raw: Option<&str>) -> Result<bool, String> {
+	let Some(raw) = raw else { return Ok(false) };
+	match raw.trim().to_ascii_lowercase().as_str() {
+		"on" | "true" | "1" | "yes" => Ok(true),
+		"off" | "false" | "0" | "no" => Ok(false),
+		_ => Err(format!("REDLIB_OIDC_ENABLED is {raw:?}; use on/off, true/false, yes/no or 1/0")),
+	}
 }
 
 /// Parses a comma-separated CIDR list. Bare addresses (`10.0.0.1`) are
@@ -115,10 +141,25 @@ impl AuthConfig {
 	fn load() -> Self {
 		let cfg = Self::load_unchecked();
 
+		let mut problems = cfg.problems.clone();
 		if cfg.enabled {
 			let missing = cfg.missing_required();
-			assert!(missing.is_empty(), "REDLIB_OIDC_ENABLED is on but these are unset: {}", missing.join(", "));
+			if !missing.is_empty() {
+				problems.push(format!("REDLIB_OIDC_ENABLED is on but these are unset: {}", missing.join(", ")));
+			}
+		}
+		assert!(problems.is_empty(), "Refusing to start: {}", problems.join("; "));
 
+		let ignored = cfg.ignored_settings();
+		if !ignored.is_empty() {
+			warn!(
+				"OIDC IS OFF, so this instance needs no login, yet {} {} set. If it should be behind a login, set REDLIB_OIDC_ENABLED=on.",
+				ignored.join(", "),
+				if ignored.len() == 1 { "is" } else { "are" }
+			);
+		}
+
+		if cfg.enabled {
 			info!(
 				"OIDC enabled: issuer={} bypass_cidrs={:?} trusted_proxies={:?} allowed_groups={:?}",
 				cfg.issuer, cfg.bypass_cidrs, cfg.trusted_proxies, cfg.allowed_groups
@@ -133,16 +174,32 @@ impl AuthConfig {
 	}
 
 	fn load_unchecked() -> Self {
-		// `redlib.toml` booleans arrive as "on"/"off".
-		let enabled = setting("REDLIB_OIDC_ENABLED").is_some_and(|v| v == "on" || v == "true" || v == "1");
+		let mut problems = Vec::new();
+
+		// `redlib.toml` booleans arrive as "on"/"off". An unreadable value
+		// counts as on, so that whatever else is missing is reported too, and
+		// `load` refuses to start either way.
+		let enabled = parse_enabled(config::get_setting("REDLIB_OIDC_ENABLED").as_deref()).unwrap_or_else(|e| {
+			problems.push(e);
+			true
+		});
 
 		let bypass_cidrs = parse_cidrs(setting("REDLIB_AUTH_BYPASS_CIDRS"), "REDLIB_AUTH_BYPASS_CIDRS");
 		let trusted_proxies = parse_cidrs(setting("REDLIB_TRUSTED_PROXIES"), "REDLIB_TRUSTED_PROXIES");
 
 		// Derive a fixed-length key from the configured secret so that
-		// operators are not forced to supply exactly N bytes.
+		// operators are not forced to supply exactly N bytes. Hashing hides
+		// the length but adds no strength, so a minimum is enforced.
 		let session_key = match setting("REDLIB_OIDC_SESSION_SECRET") {
-			Some(secret) => Sha256::digest(secret.as_bytes()).to_vec(),
+			Some(secret) => {
+				if enabled && secret.trim().len() < MIN_SESSION_SECRET_LEN {
+					problems.push(format!(
+						"REDLIB_OIDC_SESSION_SECRET is {} bytes; it must be at least {MIN_SESSION_SECRET_LEN}, e.g. `openssl rand -hex 32`",
+						secret.trim().len()
+					));
+				}
+				Sha256::digest(secret.as_bytes()).to_vec()
+			}
 			None if enabled => {
 				// A random per-process key still works, but every restart (and
 				// every replica) invalidates sessions, so say so loudly.
@@ -166,7 +223,20 @@ impl AuthConfig {
 			bypass_cidrs,
 			trusted_proxies,
 			session_key,
+			problems,
 		}
+	}
+
+	/// OIDC settings that are set while OIDC is off. That usually means the
+	/// switch itself was forgotten, and the instance is public by mistake.
+	fn ignored_settings(&self) -> Vec<&'static str> {
+		if self.enabled {
+			return Vec::new();
+		}
+		["REDLIB_OIDC_ISSUER", "REDLIB_OIDC_CLIENT_ID", "REDLIB_OIDC_CLIENT_SECRET", "REDLIB_OIDC_SESSION_SECRET"]
+			.into_iter()
+			.filter(|key| setting(key).is_some())
+			.collect()
 	}
 
 	/// The settings a working relying party cannot do without.
@@ -215,29 +285,45 @@ pub fn enabled() -> bool {
 /// (nearest hop first) and the first address that is not itself a trusted
 /// proxy is returned. Walking from the right matters: the left-hand entries
 /// are the ones a client can prepend.
-pub fn resolve_client_ip(peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+///
+/// `None` means the client is unknown: the peer is a trusted proxy but the
+/// chain names no client. The proxy's own address is deliberately not used
+/// then. Proxies often sit inside a bypass range, and falling back to them
+/// would let every request they forward skip the login.
+pub fn resolve_client_ip(peer: IpAddr, headers: &HeaderMap) -> Option<IpAddr> {
 	resolve_with(&AUTH.trusted_proxies, peer, headers)
 }
 
-fn resolve_with(trusted: &[IpNet], peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+fn resolve_with(trusted: &[IpNet], peer: IpAddr, headers: &HeaderMap) -> Option<IpAddr> {
 	let peer = canonical(peer);
 
 	if !trusted.iter().any(|net| net.contains(&peer)) {
-		return peer;
+		return Some(peer);
 	}
 
-	let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) else {
-		return peer;
-	};
+	// Every header line counts, in order: a proxy may append a line of its
+	// own rather than extend the client's.
+	let lines = headers.get_all("x-forwarded-for").iter().map(|v| v.to_str().ok()).collect::<Option<Vec<_>>>()?;
 
-	xff
-		.split(',')
-		.map(str::trim)
-		.filter_map(|s| s.parse::<IpAddr>().ok())
-		.map(canonical)
-		.rev()
-		.find(|ip| !trusted.iter().any(|net| net.contains(ip)))
-		.unwrap_or(peer)
+	// Nearest hop first. The first entry that can't be read ends the walk with
+	// an unknown client: skipping it would let entries the client wrote
+	// further left decide.
+	for entry in lines.iter().flat_map(|line| line.split(',')).rev() {
+		let ip = canonical(parse_forwarded_ip(entry.trim())?);
+		if !trusted.iter().any(|net| net.contains(&ip)) {
+			return Some(ip);
+		}
+	}
+	None
+}
+
+/// One `X-Forwarded-For` entry: a bare IPv4 or IPv6 address, or an IPv6
+/// address in brackets. Ports and anything else are refused.
+fn parse_forwarded_ip(entry: &str) -> Option<IpAddr> {
+	match entry.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+		Some(v6) => v6.parse::<std::net::Ipv6Addr>().ok().map(IpAddr::V6),
+		None => entry.parse().ok(),
+	}
 }
 
 /// Normalises IPv4-mapped IPv6 addresses (`::ffff:10.0.0.1`) down to plain
@@ -322,7 +408,8 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 /// Whether the request carries the configured API bearer token.
 ///
 /// Session cookies are unusable by headless clients such as an MCP client, so
-/// a long random token stands in for them. Returns false whenever no token is
+/// a long random token stands in for them. The gate only consults this for
+/// [`MCP_PATH`]. Returns false whenever no token is
 /// configured, so an unset value can never authorise anything.
 ///
 /// The comparison hashes both sides first. A plain `==` on the raw strings
@@ -338,7 +425,11 @@ fn bearer_token_valid(headers: &HeaderMap) -> bool {
 	let Some(presented) = headers
 		.get("authorization")
 		.and_then(|v| v.to_str().ok())
-		.and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+		.and_then(|v| {
+			// Auth schemes are case-insensitive (RFC 9110 11.1).
+			let (scheme, token) = v.split_once(' ')?;
+			scheme.eq_ignore_ascii_case("bearer").then_some(token)
+		})
 		.map(str::trim)
 		.filter(|t| !t.is_empty())
 	else {
@@ -360,19 +451,11 @@ pub fn session_from(headers: &HeaderMap) -> Option<Session> {
 	}
 }
 
-/// `Secure` is omitted for loopback so that a local `cargo run` over plain
-/// HTTP still works; everything else is assumed to be behind TLS.
-fn cookie_attrs(secure: bool, max_age: u64) -> String {
-	let base = format!("Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}");
-	if secure {
-		format!("{base}; Secure")
-	} else {
-		base
-	}
-}
-
-fn is_secure_context() -> bool {
-	AUTH.redirect_uri.starts_with("https://")
+/// Always `Secure`, which the `__Host-` prefix requires. Browsers treat
+/// `http://localhost` as secure, so a local `cargo run` still works; any
+/// other instance has to be served over HTTPS.
+fn cookie_attrs(max_age: u64) -> String {
+	format!("Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}; Secure")
 }
 
 // ---------------------------------------------------------------------------
@@ -396,7 +479,11 @@ struct Discovery {
 static DISCOVERY: LazyLock<tokio::sync::RwLock<Option<Discovery>>> = LazyLock::new(|| tokio::sync::RwLock::new(None));
 static JWKS: LazyLock<tokio::sync::RwLock<Option<JwkSet>>> = LazyLock::new(|| tokio::sync::RwLock::new(None));
 
-static HTTP: LazyLock<wreq::Client> = LazyLock::new(|| wreq::Client::builder().build().expect("failed to build OIDC HTTP client"));
+/// Upper bound on each request to the provider, so one that is down or wedged
+/// fails the login instead of holding the handler open.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+static HTTP: LazyLock<wreq::Client> = LazyLock::new(|| wreq::Client::builder().timeout(HTTP_TIMEOUT).build().expect("failed to build OIDC HTTP client"));
 
 async fn discovery() -> Result<Discovery, String> {
 	if let Some(cached) = DISCOVERY.read().await.clone() {
@@ -484,8 +571,42 @@ fn redirect_target(query: Option<&str>) -> String {
 				.find(|(k, _)| k == "redirect")
 				.map(|(_, v)| v)
 		})
-		.filter(|p| p.starts_with('/') && !p.starts_with("//"))
+		.and_then(|p| local_path(&p))
 		.unwrap_or_else(|| "/".to_string())
+}
+
+/// Whether `p` starts like a path on this instance: one `/`, then anything
+/// but a second `/` or a `\`.
+fn is_single_slash_path(p: &str) -> bool {
+	let mut chars = p.chars();
+	chars.next() == Some('/') && !matches!(chars.next(), Some('/' | '\\'))
+}
+
+/// `p` rebuilt as a path and query on this instance, or `None` if a browser
+/// could read it as a URL on another host.
+///
+/// Browsers treat `\` as `/` and silently drop tabs and newlines, so any of
+/// those can turn `/\evil.example` or `/<TAB>/evil.example` into
+/// `//evil.example`. They are refused outright rather than cleaned up.
+fn local_path(p: &str) -> Option<String> {
+	if !is_single_slash_path(p) || p.chars().any(|c| c == '\\' || c.is_control() || c.is_whitespace()) {
+		return None;
+	}
+
+	// Rebuild from a parsed URL so only a path and a query come out. Parsing
+	// also resolves dot segments, which can produce a fresh `//`, so the
+	// result is checked again.
+	let base = url::Url::parse("http://redlib.invalid/").ok()?;
+	let url = base.join(p).ok()?;
+	if url.origin() != base.origin() {
+		return None;
+	}
+	let mut out = url.path().to_string();
+	if let Some(query) = url.query() {
+		out.push('?');
+		out.push_str(query);
+	}
+	is_single_slash_path(&out).then_some(out)
 }
 
 /// Starts the authorization-code flow.
@@ -527,7 +648,7 @@ pub async fn login(req: Request<Body>) -> Result<Response<Body>, String> {
 	let sep = if disco.authorization_endpoint.contains('?') { '&' } else { '?' };
 	let location = format!("{}{sep}{query}", disco.authorization_endpoint);
 
-	Ok(redirect_to(&location, &[format!("{TX_COOKIE}={tx_token}; {}", cookie_attrs(is_secure_context(), TX_TTL))]))
+	Ok(redirect_to(&location, &[format!("{TX_COOKIE}={tx_token}; {}", cookie_attrs(TX_TTL))]))
 }
 
 #[derive(Deserialize)]
@@ -549,6 +670,12 @@ struct IdClaims {
 	groups: Vec<String>,
 	#[serde(default)]
 	nonce: Option<String>,
+	#[serde(default, deserialize_with = "one_or_many")]
+	aud: Vec<String>,
+	#[serde(default)]
+	azp: Option<String>,
+	#[serde(default)]
+	iat: Option<u64>,
 }
 
 /// Handles the provider's redirect back to us.
@@ -556,11 +683,13 @@ pub async fn callback(req: Request<Body>) -> Result<Response<Body>, String> {
 	let params: Vec<(String, String)> = req.uri().query().and_then(|q| serde_urlencoded::from_str(q).ok()).unwrap_or_default();
 	let param = |key: &str| params.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
 
-	// The provider reports failures (e.g. the user hit "deny") in-band.
+	// The provider reports failures (e.g. the user hit "deny") in-band. Both
+	// values are attacker-controlled: they are logged with `{:?}` so they
+	// cannot inject log lines, and the page shows a fixed message so nobody
+	// can put words in this instance's mouth.
 	if let Some(err) = param("error") {
-		let description = param("error_description").unwrap_or_else(|| err.clone());
-		warn!("identity provider returned error {err}: {description}");
-		return Ok(error_page(StatusCode::FORBIDDEN, &description));
+		warn!("identity provider returned error {err:?}: {:?}", param("error_description"));
+		return Ok(error_page(StatusCode::FORBIDDEN, "The identity provider did not complete the sign-in."));
 	}
 
 	let (Some(code), Some(state)) = (param("code"), param("state")) else {
@@ -612,9 +741,9 @@ pub async fn callback(req: Request<Body>) -> Result<Response<Body>, String> {
 	Ok(redirect_to(
 		&tx.redirect_to,
 		&[
-			format!("{SESSION_COOKIE}={token}; {}", cookie_attrs(is_secure_context(), AUTH.session_ttl)),
+			format!("{SESSION_COOKIE}={token}; {}", cookie_attrs(AUTH.session_ttl)),
 			// Retire the transaction cookie now that it has been consumed.
-			format!("{TX_COOKIE}=; {}", cookie_attrs(is_secure_context(), 0)),
+			format!("{TX_COOKIE}=; {}", cookie_attrs(0)),
 		],
 	))
 }
@@ -662,28 +791,78 @@ async fn exchange_and_validate(code: &str, tx: &LoginTx) -> Result<IdClaims, Str
 		set = jwks(true).await?;
 	}
 	let jwk = set.find(&kid).ok_or_else(|| format!("no signing key matches key id {kid}"))?;
+
+	validate_id_token(&tokens.id_token, jwk, &disco.issuer, &AUTH.client_id, &tx.nonce)
+}
+
+/// Checks an ID token's signature against `jwk` and its claims against what
+/// this relying party expects.
+fn validate_id_token(id_token: &str, jwk: &Jwk, issuer: &str, client_id: &str, nonce: &str) -> Result<IdClaims, String> {
 	let key = DecodingKey::from_jwk(jwk).map_err(|e| format!("unusable signing key: {e}"))?;
 
-	let algorithm = header.alg;
-	let mut validation = Validation::new(algorithm);
-	validation.set_audience(&[&AUTH.client_id]);
-	validation.set_issuer(&[&disco.issuer]);
+	// The algorithm comes from our side, never from the token's header, so a
+	// token cannot pick a weaker check for itself.
+	let mut validation = Validation::new(id_token_algorithm(jwk)?);
+	validation.set_audience(&[client_id]);
+	validation.set_issuer(&[issuer]);
+	validation.set_required_spec_claims(&["iss", "aud", "exp"]);
 
-	let data = decode::<IdClaims>(&tokens.id_token, &key, &validation).map_err(|e| format!("ID token validation failed: {e}"))?;
+	let claims = decode::<IdClaims>(id_token, &key, &validation)
+		.map_err(|e| format!("ID token validation failed: {e}"))?
+		.claims;
+
+	// jsonwebtoken neither requires nor checks `iat`.
+	let iat = claims.iat.ok_or("ID token has no iat")?;
+	if iat > now() + MAX_IAT_SKEW {
+		return Err(format!("ID token iat {iat} is in the future"));
+	}
+
+	// OIDC Core 3.1.3.7: with several audiences, `azp` must name us; when
+	// present at all, it must be us.
+	if (claims.aud.len() > 1 || claims.azp.is_some()) && claims.azp.as_deref() != Some(client_id) {
+		return Err(format!("ID token azp {:?} is not this client", claims.azp));
+	}
 
 	// Binds this ID token to the login request that started the flow,
 	// preventing token replay.
-	if data.claims.nonce.as_deref() != Some(tx.nonce.as_str()) {
+	if claims.nonce.as_deref() != Some(nonce) {
 		return Err("ID token nonce does not match the login request".to_string());
 	}
 
-	Ok(data.claims)
+	Ok(claims)
+}
+
+/// The algorithm an ID token signed with `jwk` must use: the key's declared
+/// `alg` if it has one, RS256 (the OIDC default) otherwise. Symmetric and
+/// encryption algorithms are refused.
+fn id_token_algorithm(jwk: &Jwk) -> Result<Algorithm, String> {
+	let Some(declared) = jwk.common.key_algorithm else {
+		return Ok(Algorithm::RS256);
+	};
+	match declared.to_string().parse::<Algorithm>() {
+		Ok(Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512) | Err(_) => Err(format!("signing key declares {declared}, which is not an asymmetric signature algorithm")),
+		Ok(alg) => Ok(alg),
+	}
+}
+
+/// `aud` may be a single string or an array of them.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+	#[derive(Deserialize)]
+	#[serde(untagged)]
+	enum OneOrMany {
+		One(String),
+		Many(Vec<String>),
+	}
+	Ok(match OneOrMany::deserialize(deserializer)? {
+		OneOrMany::One(aud) => vec![aud],
+		OneOrMany::Many(auds) => auds,
+	})
 }
 
 /// Clears the local session, then hands off to the provider's end-session
 /// endpoint when it advertises one.
 pub async fn logout(_req: Request<Body>) -> Result<Response<Body>, String> {
-	let clear = format!("{SESSION_COOKIE}=; {}", cookie_attrs(is_secure_context(), 0));
+	let clear = format!("{SESSION_COOKIE}=; {}", cookie_attrs(0));
 
 	let location = match discovery().await {
 		Ok(disco) => disco.end_session_endpoint.unwrap_or_else(|| "/".to_string()),
@@ -704,7 +883,8 @@ pub async fn logout(_req: Request<Body>) -> Result<Response<Body>, String> {
 ///
 /// Only `/oidc/` is exempt. Health checks, static files and `/mcp` are gated
 /// like everything else; probes are expected to come from a bypass CIDR, and
-/// headless clients such as MCP present `REDLIB_MCP_TOKEN` as a bearer token.
+/// MCP clients present `REDLIB_MCP_TOKEN` as a bearer token, which opens
+/// `/mcp` and nothing else.
 pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Body>> {
 	if !AUTH.enabled {
 		return None;
@@ -715,14 +895,17 @@ pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Bo
 		return None;
 	}
 
+	// An unknown client is never bypassed, but can still authenticate.
 	let client = resolve_client_ip(peer, headers);
-	if is_bypassed(client) {
+	if client.is_some_and(is_bypassed) {
 		return None;
 	}
 
-	// Checked before the cookie so that headless clients (MCP, curl, CI) have
-	// a credential they can actually present.
-	if bearer_token_valid(headers) {
+	// Checked before the cookie so that MCP clients have a credential they can
+	// actually present. Only for `/mcp`: a token handed to an MCP client must
+	// not open the rest of the instance. `path` has already been normalised
+	// by the server (no doubled or trailing slashes).
+	if path == MCP_PATH && bearer_token_valid(headers) {
 		return None;
 	}
 
@@ -730,7 +913,7 @@ pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Bo
 		return None;
 	}
 
-	debug!("unauthenticated request from {client} for {path}");
+	debug!("unauthenticated request from {client:?} for {path}");
 
 	// Programmatic clients get a plain 401 rather than an HTML redirect they
 	// cannot follow. This is what an MCP client or curl will see.
@@ -837,7 +1020,7 @@ mod tests {
 		// or XFF would be ignored and every client would look like the proxy.
 		let trusted = [net("10.42.0.0/16")];
 		let got = resolve_with(&trusted, ip("::ffff:10.42.0.7"), &xff("203.0.113.9"));
-		assert_eq!(got, ip("203.0.113.9"));
+		assert_eq!(got, Some(ip("203.0.113.9")));
 	}
 
 	#[test]
@@ -845,7 +1028,7 @@ mod tests {
 		// The spoofing case: a direct client claims to be on the LAN.
 		let trusted = [net("10.42.0.0/16")];
 		let got = resolve_with(&trusted, ip("203.0.113.9"), &xff("192.168.1.5"));
-		assert_eq!(got, ip("203.0.113.9"));
+		assert_eq!(got, Some(ip("203.0.113.9")));
 	}
 
 	#[test]
@@ -853,28 +1036,71 @@ mod tests {
 		let trusted = [net("10.42.0.0/16")];
 		// Client prepended a forged entry; the real address is on the right.
 		let got = resolve_with(&trusted, ip("10.42.0.7"), &xff("192.168.1.5, 203.0.113.9"));
-		assert_eq!(got, ip("203.0.113.9"));
+		assert_eq!(got, Some(ip("203.0.113.9")));
 	}
 
 	#[test]
 	fn skips_trusted_hops_in_the_chain() {
 		let trusted = [net("10.42.0.0/16")];
 		let got = resolve_with(&trusted, ip("10.42.0.7"), &xff("203.0.113.9, 10.42.0.3"));
-		assert_eq!(got, ip("203.0.113.9"));
+		assert_eq!(got, Some(ip("203.0.113.9")));
 	}
 
 	#[test]
-	fn falls_back_to_peer_when_chain_is_all_trusted() {
+	fn reads_every_forwarded_for_header_in_order() {
+		// A second header line is how a proxy that appends rather than merges
+		// adds its hop; reading only the first line takes the client's word.
 		let trusted = [net("10.42.0.0/16")];
-		let got = resolve_with(&trusted, ip("10.42.0.7"), &xff("10.42.0.3"));
-		assert_eq!(got, ip("10.42.0.7"));
+		let h = headers(&[("x-forwarded-for", "192.168.1.5"), ("x-forwarded-for", "203.0.113.9")]);
+		assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &h), Some(ip("203.0.113.9")));
 	}
 
 	#[test]
-	fn falls_back_to_peer_without_forwarded_header() {
+	fn stops_at_the_first_entry_it_cannot_read() {
+		// Skipping an unreadable hop would hand the decision to whatever the
+		// client wrote further left.
 		let trusted = [net("10.42.0.0/16")];
-		let got = resolve_with(&trusted, ip("10.42.0.7"), &HeaderMap::new());
-		assert_eq!(got, ip("10.42.0.7"));
+		for chain in [
+			"192.168.1.5, garbage, 10.42.0.3",
+			"192.168.1.5, 203.0.113.9:4711",
+			"192.168.1.5, [2001:db8::1]:443",
+			"192.168.1.5, , 10.42.0.3",
+			"192.168.1.5, unknown",
+			"192.168.1.5,",
+		] {
+			assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &xff(chain)), None, "{chain:?}");
+		}
+
+		let mut h = xff("192.168.1.5");
+		h.append("x-forwarded-for", HeaderValue::from_bytes(b"\xff").unwrap());
+		assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &h), None, "non-UTF-8 value");
+	}
+
+	#[test]
+	fn accepts_bare_and_bracketed_ipv6_hops() {
+		let trusted = [net("10.42.0.0/16")];
+		assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &xff("2001:db8::1")), Some(ip("2001:db8::1")));
+		assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &xff("[2001:db8::1]")), Some(ip("2001:db8::1")));
+		assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &xff("[::ffff:192.168.1.5]")), Some(ip("192.168.1.5")));
+	}
+
+	#[test]
+	fn client_is_unknown_when_the_chain_is_all_trusted() {
+		let trusted = [net("10.42.0.0/16")];
+		assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &xff("10.42.0.3")), None);
+	}
+
+	#[test]
+	fn client_is_unknown_without_forwarded_header_from_a_proxy() {
+		let trusted = [net("10.42.0.0/16")];
+		assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &HeaderMap::new()), None);
+	}
+
+	#[test]
+	fn peer_that_is_not_a_proxy_is_the_client_without_forwarded_header() {
+		let trusted = [net("10.42.0.0/16")];
+		assert_eq!(resolve_with(&trusted, ip("192.168.1.5"), &HeaderMap::new()), Some(ip("192.168.1.5")));
+		assert_eq!(resolve_with(&[], ip("10.42.0.7"), &HeaderMap::new()), Some(ip("10.42.0.7")));
 	}
 
 	#[test]
@@ -900,6 +1126,34 @@ mod tests {
 	}
 
 	#[test]
+	fn login_redirect_rejects_paths_a_browser_would_read_as_another_host() {
+		// Browsers treat `\` like `/` and strip tabs and newlines from URLs, so
+		// each of these can turn into `//evil.example` by the time it is used.
+		for (raw, decoded) in [
+			("%2F%5Cevil.example", "/\\evil.example"),
+			("%2F%09%2Fevil.example", "/\t/evil.example"),
+			("%2F%2Fevil", "//evil"),
+			("%2F%0D%0Ax", "/\r\nx"),
+			("%2F%0B%2Fx", "/\x0b/x"),
+			("%2Fr%2Frust%5C..%5Cevil", "/r/rust\\..\\evil"),
+			("%2F%7F", "/\x7f"),
+			// Dot segments collapse to `//evil.example` once normalised.
+			("%2F.%2F%2Fevil.example", "/.//evil.example"),
+			("%2Fr%2Frust%20x", "/r/rust x"),
+			("https%3A%2F%2Fevil", "https://evil"),
+			("", ""),
+		] {
+			assert_eq!(redirect_target(Some(&format!("redirect={raw}"))), "/", "{decoded:?}");
+		}
+	}
+
+	#[test]
+	fn login_redirect_keeps_a_local_path_and_query() {
+		assert_eq!(redirect_target(Some("redirect=%2Fr%2Frust%3Fsort%3Dnew")), "/r/rust?sort=new");
+		assert_eq!(redirect_target(Some("redirect=%2F")), "/");
+	}
+
+	#[test]
 	fn login_path_is_percent_encoded() {
 		assert_eq!(urlencoding_path("/r/rust/comments/abc"), "%2Fr%2Frust%2Fcomments%2Fabc");
 	}
@@ -913,9 +1167,19 @@ mod tests {
 	}
 
 	#[test]
-	fn cookies_are_secure_unless_running_over_plain_http() {
-		assert_eq!(cookie_attrs(true, 60), "Path=/; HttpOnly; SameSite=Lax; Max-Age=60; Secure");
-		assert_eq!(cookie_attrs(false, 0), "Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+	fn cookies_are_host_only_and_always_secure() {
+		// With the `__Host-` prefix a browser only accepts the cookie when it is
+		// Secure, has Path=/ and no Domain, so a sibling subdomain can neither
+		// set nor shadow it.
+		for name in [SESSION_COOKIE, TX_COOKIE] {
+			assert!(name.starts_with("__Host-"), "{name}");
+		}
+		let attrs = cookie_attrs(60);
+		let attrs: Vec<&str> = attrs.split("; ").collect();
+		for wanted in ["Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=60", "Secure"] {
+			assert!(attrs.contains(&wanted), "{wanted} missing from {attrs:?}");
+		}
+		assert!(!attrs.iter().any(|a| a.to_ascii_lowercase().starts_with("domain")), "{attrs:?}");
 	}
 
 	#[test]
@@ -924,6 +1188,160 @@ mod tests {
 		assert_eq!(cookie_value(&h, "redlib_session").as_deref(), Some("tok"));
 		assert_eq!(cookie_value(&h, "redlib_oidc_tx").as_deref(), Some("tx"));
 		assert_eq!(cookie_value(&h, "redlib"), None);
+	}
+
+	#[test]
+	fn provider_error_text_is_not_shown_to_the_user() {
+		// Anyone can send a victim to the callback with an error of their
+		// choosing, so its text must not appear on our page as if it were ours.
+		let req = Request::builder()
+			.uri("/oidc/callback?error=access_denied&error_description=Call+0800-SCAM+to+restore+access")
+			.body(Body::empty())
+			.unwrap();
+		let res = futures_lite::future::block_on(callback(req)).unwrap();
+		assert_eq!(res.status(), StatusCode::FORBIDDEN);
+		let body = body_text(res);
+		assert!(!body.contains("SCAM") && !body.contains("access_denied"), "{body}");
+	}
+
+	#[test]
+	#[sealed_test]
+	fn a_provider_that_never_answers_does_not_hang_the_request() {
+		// Accepts connections and then says nothing, like a wedged provider.
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let addr = listener.local_addr().unwrap();
+		std::thread::spawn(move || {
+			let held: Vec<_> = listener.incoming().collect();
+			drop(held);
+		});
+		// The config is read on first use, which is after this in a fresh process.
+		std::env::set_var("REDLIB_OIDC_ISSUER", format!("http://{addr}"));
+
+		let runtime = tokio::runtime::Runtime::new().unwrap();
+		let outcome = runtime.block_on(async { tokio::time::timeout(std::time::Duration::from_secs(30), discovery()).await });
+		let result = outcome.expect("discovery must give up on its own instead of waiting forever");
+		assert!(result.is_err());
+	}
+
+	// --- ID token validation ------------------------------------------------
+
+	/// A throwaway RSA key generated for these tests only. It signs nothing
+	/// outside them.
+	const TEST_RSA_KEY: &str = r"-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCj078mBSOUBQdc
+YItNTy0SlvLN+eFKHxLJsLBLPI8K87Dzoe/iFI+BxJwizHVXzC2nCa1ugdGCh+DD
+F8xjYvaUWB1HWj+oKpCP38Gwsw1ra0M1igEw6YXVcqJWnkY4/f+9zMU322UI7oSE
+ZldjUHf2iuew52XPB+CKNF7rW0MI03WEraRvSZRCI25j0hM6rwVJ/8KuTN0yn2ap
+8uvubu1clPdpKj+o0vXMIt9fpzIy0159IhfhOAbAIG3EotBmgyrO+toVF8+ceYW7
+/9lK0L6dOnB1BRR8cf3NfTKQV83RMLAfkQobDDznRb8Tl+YE+BrOdqxaC9lhOY+J
+qL1k2/m3AgMBAAECggEASMaSnlggEuwc9ftpRmGKuzxVBg0f+GZPWUtlNTbksE/K
+5p+kSYEqstHdLlQ3OFZaXV6eLX37zQmBXgkfYXMf6IwwDXdY2eJ2r4MNruoLZxGS
+HKF+n/TM4CH5XZMXzM+AoRbq8UJD4rDaK1qvLU4czGeuPta8UjjElYBoPhMfdzaK
+ZVbBlf/7+2KjFOwg5jKvd5mWdz0CLKjopTgP6N1Lf1BUWB5UEyJ7madtqv1l/ieI
+MsnxXZ2ReFnF82BilVJj5KGhnDTCr239IGRgsvYWBVsUf/7/s8gZHv79678+JvoS
+9oAdzbBV544Yipxt8c6AMpcuOWW6L/+xtR5vfVuxIQKBgQDUmnwHhXGimBHKA9or
+KB5ydXLqqlTzOD9hGrdWJtzRhNiqnQwUobrsJe5Lb/Ix8npvsrlhSLzyBmcjiNrP
+VdWHsqGkc8pSDbMrpOqZ85Z/SbdSHFVQI9JtuBP78khYUL+/L0iBbHE4pgYYLj6e
+0ciFVyXZZmRUHKl/zYD48R285wKBgQDFRHk3tpdN8C5x5XL8/Sya72nNRYb6SuUS
+H8DqxscM2EGBFlhcT2oAqUhlK3dDYi3yqmrthclpP2OR7JXtMd+QUbgmHH5vX1Zz
+tedPcDYUWXAgUMJpVlR6PX1uD8YxpEfgezMVloT3b2egIut61Q7oZ2V/rsbWVfu9
+ABCeNjbysQKBgFzvSthe1NWmc+BC3tOOrgCKprk9y/Sl2c6wxwO56T0NPUkXbXh3
+WiZwTkJbpRuAS1UYY0DLcwy5D8zQvhV0B+tRgqdIlmBX7MJfTM4PVPI/Xwtdp01o
+20tq9BFmT4mLgsYn/SHWLYf9yxw22tjCC01+UuU9hQ3fmZhsVLx9aepxAoGBALWu
+fdHhGfMPHUeK4l+8sQM1MwV6XnlQ1y7dDeltD9B1r8a7FMBX57IaNvHumVX3K4hO
+ilKeIEUNu5+e/OpLP7MEgIyhO5VJgi7pvtL77uLJCKrKlnM7rmwzC719S7VWr1hB
+P2hHi8jz0sW6w5QKfENxTxrMlpa69DI6yBNerTbRAoGARVkLBM8CGUZjCgliH5Pj
+WyPWnm8ZfUBbac30QyGiUL24qebj7he+dZF4ypIUiFtDYf6Yjf6uf0S3GJn+77T6
+dJGqFkpWGrtruNnGsiU+N3pTukrhvuUdiFXAIQ931FTNPdiKwUI5wgqbJmlR2IGm
+J6LdBPXCFDZfsB7AdnW3CIo=
+-----END PRIVATE KEY-----";
+	/// The modulus of [`TEST_RSA_KEY`], base64url-encoded as in a JWK.
+	const TEST_RSA_N: &str = "o9O_JgUjlAUHXGCLTU8tEpbyzfnhSh8SybCwSzyPCvOw86Hv4hSPgcScIsx1V8wtpwmtboHRgofgwxfMY2L2lFgdR1o_qCqQj9_BsLMNa2tDNYoBMOmF1XKiVp5GOP3_vczFN9tlCO6EhGZXY1B39ornsOdlzwfgijRe61tDCNN1hK2kb0mUQiNuY9ITOq8FSf_CrkzdMp9mqfLr7m7tXJT3aSo_qNL1zCLfX6cyMtNefSIX4TgGwCBtxKLQZoMqzvraFRfPnHmFu__ZStC-nTpwdQUUfHH9zX0ykFfN0TCwH5EKGww850W_E5fmBPgaznasWgvZYTmPiai9ZNv5tw";
+	const TEST_ISSUER: &str = "https://idp.example/application/o/redlib/";
+
+	fn test_jwk(alg: Option<&str>) -> Jwk {
+		let mut jwk = serde_json::json!({"kty": "RSA", "kid": "k1", "use": "sig", "n": TEST_RSA_N, "e": "AQAB"});
+		if let Some(alg) = alg {
+			jwk["alg"] = alg.into();
+		}
+		serde_json::from_value(jwk).unwrap()
+	}
+
+	fn id_claims() -> serde_json::Value {
+		serde_json::json!({"iss": TEST_ISSUER, "aud": "id", "sub": "u1", "nonce": "n1", "iat": now(), "exp": now() + 300})
+	}
+
+	fn id_token(alg: Algorithm, claims: &serde_json::Value) -> String {
+		let mut header = Header::new(alg);
+		header.kid = Some("k1".into());
+		encode(&header, claims, &EncodingKey::from_rsa_pem(TEST_RSA_KEY.as_bytes()).unwrap()).unwrap()
+	}
+
+	fn check_id_token(token: &str, jwk: &Jwk) -> Result<IdClaims, String> {
+		validate_id_token(token, jwk, TEST_ISSUER, "id", "n1")
+	}
+
+	#[test]
+	fn accepts_a_well_formed_id_token() {
+		let claims = check_id_token(&id_token(Algorithm::RS256, &id_claims()), &test_jwk(None)).unwrap();
+		assert_eq!(claims.sub, "u1");
+		check_id_token(&id_token(Algorithm::RS256, &id_claims()), &test_jwk(Some("RS256"))).unwrap();
+	}
+
+	#[test]
+	fn id_token_algorithm_is_pinned_not_taken_from_the_token() {
+		// The token's own header must not choose how it is checked.
+		for alg in [Algorithm::RS384, Algorithm::RS512, Algorithm::PS256] {
+			assert!(check_id_token(&id_token(alg, &id_claims()), &test_jwk(None)).is_err(), "{alg:?} against an RS256 key");
+		}
+		let hs = encode(&Header::new(Algorithm::HS256), &id_claims(), &EncodingKey::from_secret(TEST_RSA_N.as_bytes())).unwrap();
+		assert!(check_id_token(&hs, &test_jwk(None)).is_err(), "HS256");
+
+		// A key that declares its algorithm gets exactly that one.
+		check_id_token(&id_token(Algorithm::RS384, &id_claims()), &test_jwk(Some("RS384"))).unwrap();
+		assert!(check_id_token(&id_token(Algorithm::RS256, &id_claims()), &test_jwk(Some("RS384"))).is_err());
+	}
+
+	#[test]
+	fn id_token_must_carry_iss_aud_exp_and_iat() {
+		for claim in ["iss", "aud", "exp", "iat"] {
+			let mut claims = id_claims();
+			claims.as_object_mut().unwrap().remove(claim);
+			assert!(check_id_token(&id_token(Algorithm::RS256, &claims), &test_jwk(None)).is_err(), "without {claim}");
+		}
+	}
+
+	#[test]
+	fn id_token_with_several_audiences_must_name_us_as_azp() {
+		let mut claims = id_claims();
+		claims["aud"] = serde_json::json!(["id", "other"]);
+		assert!(check_id_token(&id_token(Algorithm::RS256, &claims), &test_jwk(None)).is_err(), "no azp");
+
+		claims["azp"] = "other".into();
+		assert!(check_id_token(&id_token(Algorithm::RS256, &claims), &test_jwk(None)).is_err(), "someone else's azp");
+
+		claims["azp"] = "id".into();
+		check_id_token(&id_token(Algorithm::RS256, &claims), &test_jwk(None)).unwrap();
+	}
+
+	#[test]
+	fn id_token_must_not_be_issued_in_the_future() {
+		let mut claims = id_claims();
+		claims["iat"] = (now() + 600).into();
+		assert!(check_id_token(&id_token(Algorithm::RS256, &claims), &test_jwk(None)).is_err(), "10 minutes ahead");
+
+		// Small clock skew is fine.
+		claims["iat"] = (now() + 120).into();
+		check_id_token(&id_token(Algorithm::RS256, &claims), &test_jwk(None)).unwrap();
+	}
+
+	#[test]
+	fn id_token_must_match_issuer_audience_and_nonce() {
+		for (claim, value) in [("iss", "https://evil.example/"), ("aud", "other"), ("nonce", "n2")] {
+			let mut claims = id_claims();
+			claims[claim] = value.into();
+			assert!(check_id_token(&id_token(Algorithm::RS256, &claims), &test_jwk(None)).is_err(), "wrong {claim}");
+		}
 	}
 
 	// --- Configuration ------------------------------------------------------
@@ -974,6 +1392,102 @@ mod tests {
 		assert!(!AuthConfig::load_unchecked().enabled);
 	}
 
+	/// The message `AuthConfig::load` refuses to start with, if it refuses.
+	fn startup_refusal() -> Option<String> {
+		let err = std::panic::catch_unwind(AuthConfig::load).err()?;
+		Some(
+			err
+				.downcast_ref::<String>()
+				.cloned()
+				.or_else(|| err.downcast_ref::<&str>().map(ToString::to_string))
+				.unwrap_or_default(),
+		)
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "off"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_SESSION_SECRET", "0123456789abcdef0123456789abcdef"),
+	])]
+	fn settings_left_behind_while_disabled_are_reported() {
+		let cfg = AuthConfig::load_unchecked();
+		assert_eq!(cfg.ignored_settings(), vec!["REDLIB_OIDC_ISSUER", "REDLIB_OIDC_SESSION_SECRET"]);
+		// A warning, not a refusal: turning auth off on purpose must still work.
+		assert_eq!(startup_refusal(), None);
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_OIDC_ENABLED", " TRUE ")])]
+	fn enabled_ignores_case_and_surrounding_space() {
+		assert!(AuthConfig::load_unchecked().enabled);
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_OIDC_ENABLED", "Yes")])]
+	fn yes_enables_auth() {
+		assert!(AuthConfig::load_unchecked().enabled);
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_OIDC_ENABLED", "NO")])]
+	fn no_disables_auth() {
+		assert!(!AuthConfig::load_unchecked().enabled);
+		assert_eq!(startup_refusal(), None);
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "ture"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "0123456789abcdef0123456789abcdef"),
+	])]
+	fn a_misspelt_enabled_value_refuses_to_start() {
+		// Reading a typo as "off" would silently publish the instance.
+		let refusal = startup_refusal().expect("must refuse to start");
+		assert!(refusal.contains("REDLIB_OIDC_ENABLED") && refusal.contains("ture"), "{refusal}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		// 31 bytes: one short.
+		("REDLIB_OIDC_SESSION_SECRET", "0123456789abcdef0123456789abcde"),
+	])]
+	fn a_short_session_secret_refuses_to_start() {
+		// Hashing a short secret does not make it any harder to guess, and
+		// whoever guesses it can mint sessions.
+		let refusal = startup_refusal().expect("must refuse to start");
+		assert!(refusal.contains("REDLIB_OIDC_SESSION_SECRET") && refusal.contains("32"), "{refusal}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "0123456789abcdef0123456789abcdef"),
+	])]
+	fn a_32_byte_session_secret_is_enough() {
+		assert_eq!(startup_refusal(), None);
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_OIDC_ENABLED", "")])]
+	fn an_empty_enabled_value_refuses_to_start() {
+		let refusal = startup_refusal().expect("must refuse to start");
+		assert!(refusal.contains("REDLIB_OIDC_ENABLED"), "{refusal}");
+	}
+
 	#[test]
 	#[sealed_test(env = [
 		("REDLIB_OIDC_CLIENT_SECRET", "client-secret-value"),
@@ -1005,7 +1519,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_redirects_browsers_to_login() {
 		let res = gate(ip(OUTSIDE), "/r/rust/comments/abc", &headers(&[BROWSER])).expect("must be gated");
@@ -1020,7 +1534,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_answers_programmatic_clients_with_401_json() {
 		let res = gate(ip(OUTSIDE), "/r/rust", &headers(&[("accept", "application/json")])).expect("must be gated");
@@ -1037,7 +1551,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_never_blocks_its_own_endpoints() {
 		for path in ["/oidc/login", "/oidc/callback", "/oidc/logout"] {
@@ -1052,7 +1566,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_covers_every_other_path() {
 		// Only `/oidc/` is exempt, as in the original. Health checks, static
@@ -1071,7 +1585,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 		("REDLIB_AUTH_BYPASS_CIDRS", "192.168.0.0/16,127.0.0.0/8"),
 		("REDLIB_TRUSTED_PROXIES", "10.42.0.0/16"),
 	])]
@@ -1093,12 +1607,47 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 		("REDLIB_AUTH_BYPASS_CIDRS", "192.168.0.0/16"),
 	])]
 	fn gate_ignores_forged_forwarded_for_without_trusted_proxies() {
 		let res = gate(ip(OUTSIDE), "/", &xff("192.168.1.20"));
 		assert_eq!(res.expect("forged XFF must not bypass").status(), StatusCode::UNAUTHORIZED);
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "0123456789abcdef0123456789abcdef"),
+		// The proxy's range is also a bypass range, as in the deployment.
+		("REDLIB_AUTH_BYPASS_CIDRS", "10.42.0.0/16,192.168.0.0/16"),
+		("REDLIB_TRUSTED_PROXIES", "10.42.0.0/16"),
+	])]
+	fn a_proxy_that_names_no_client_is_not_a_bypass() {
+		// Without a usable client address the proxy's own address must not
+		// stand in for it, or every request it forwards would skip the login.
+		let proxy = ip("10.42.0.7");
+		for (label, h) in [
+			("no X-Forwarded-For", HeaderMap::new()),
+			("only trusted hops", xff("10.42.0.3")),
+			("only trusted hops, several", xff("10.42.0.3, 10.42.0.4")),
+			("nothing parseable", xff("unknown")),
+		] {
+			let res = gate(proxy, "/", &h).unwrap_or_else(|| panic!("{label}: must not bypass"));
+			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{label}");
+		}
+
+		// A forwarded bypass address still gets through the proxy.
+		assert!(gate(proxy, "/", &xff("192.168.1.20")).is_none());
+		// A peer that is not a proxy is the client, e.g. a kubelet probe from a node.
+		assert!(gate(ip("192.168.1.20"), "/", &HeaderMap::new()).is_none());
+		// An unknown client can still log in.
+		let token = sign(&session(now() + 3600)).unwrap();
+		assert!(gate(proxy, "/", &session_cookie(&token)).is_none());
 	}
 
 	fn session(exp: u64) -> Session {
@@ -1123,7 +1672,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_accepts_a_valid_session_cookie() {
 		let token = sign(&session(now() + 3600)).unwrap();
@@ -1138,7 +1687,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_rejects_expired_tampered_and_foreign_sessions() {
 		// Expired beyond jsonwebtoken's default 60 s leeway.
@@ -1175,7 +1724,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn login_transaction_cookie_is_not_a_session() {
 		// Both are signed with the same key; the claim shapes must keep them apart.
@@ -1214,14 +1763,22 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 		("REDLIB_MCP_TOKEN", "correct-horse-battery-staple"),
 	])]
-	fn gate_accepts_the_bearer_token_on_any_path() {
-		for path in ["/mcp", "/r/rust", "/"] {
-			assert!(gate(ip(OUTSIDE), path, &bearer("Bearer correct-horse-battery-staple")).is_none(), "{path}");
+	fn gate_accepts_the_bearer_token_only_on_mcp() {
+		// The scheme is case-insensitive (RFC 9110 11.1).
+		for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+			let value = format!("{scheme} correct-horse-battery-staple");
+			assert!(gate(ip(OUTSIDE), "/mcp", &bearer(&value)).is_none(), "{scheme}");
 		}
-		assert!(gate(ip(OUTSIDE), "/mcp", &bearer("bearer correct-horse-battery-staple")).is_none());
+
+		// The token is for the MCP endpoint. A leaked one must not open the
+		// rest of the instance.
+		for path in ["/", "/r/rust", "/info.json", "/mcp/other", "/mcpx"] {
+			let res = gate(ip(OUTSIDE), path, &bearer("Bearer correct-horse-battery-staple")).unwrap_or_else(|| panic!("{path} must be gated"));
+			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
+		}
 	}
 
 	#[test]
@@ -1231,7 +1788,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 		("REDLIB_MCP_TOKEN", "correct-horse-battery-staple"),
 	])]
 	fn gate_rejects_wrong_or_malformed_bearer_tokens() {
@@ -1254,7 +1811,7 @@ mod tests {
 		("REDLIB_OIDC_CLIENT_ID", "id"),
 		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
 		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
-		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 		("REDLIB_MCP_TOKEN", "   "),
 	])]
 	fn an_unset_or_blank_token_authorises_nothing() {

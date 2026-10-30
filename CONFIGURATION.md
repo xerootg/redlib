@@ -78,12 +78,12 @@ Assign a default value for each instance-specific setting by passing environment
 | `OIDC_CLIENT_SECRET`      | String          | (empty)                                | Client secret. Required with `OIDC_ENABLED`. **Secret.** |
 | `OIDC_REDIRECT_URI`       | String          | (empty)                                | This instance's `/oidc/callback` URL, exactly as registered with the provider. Required with `OIDC_ENABLED`. |
 | `OIDC_SCOPES`             | String          | `openid profile email`                 | Space-separated scopes to request. |
-| `OIDC_SESSION_SECRET`     | String          | (random per start)                     | Key that signs session cookies. Set it, or every restart logs everyone out. **Secret.** |
+| `OIDC_SESSION_SECRET`     | String          | (random per start)                     | Key that signs session cookies, at least 32 bytes. Set it, or every restart logs everyone out. **Secret.** |
 | `OIDC_SESSION_TTL`        | Integer         | `86400`                                | Session lifetime in seconds. |
 | `OIDC_ALLOWED_GROUPS`     | List            | (empty)                                | Comma-separated groups; when set, a login must carry one of them. |
 | `AUTH_BYPASS_CIDRS`       | List            | (empty)                                | Comma-separated CIDRs or addresses that skip the login. |
 | `TRUSTED_PROXIES`         | List            | (empty)                                | Comma-separated CIDRs of reverse proxies whose `X-Forwarded-For` is believed. |
-| `MCP_TOKEN`               | String          | (empty)                                | Bearer token that passes the login on any path, for clients that can't hold a cookie. **Secret.** |
+| `MCP_TOKEN`               | String          | (empty)                                | Bearer token that passes the login on `/mcp` only, for MCP clients, which can't hold a cookie. **Secret.** |
 
 ### Reddit session
 
@@ -162,19 +162,24 @@ REDLIB_OIDC_ISSUER=https://auth.example.com/application/o/redlib/
 REDLIB_OIDC_CLIENT_ID=...
 REDLIB_OIDC_CLIENT_SECRET=...
 REDLIB_OIDC_REDIRECT_URI=https://redlib.example.com/oidc/callback
-REDLIB_OIDC_SESSION_SECRET=<long random string>
+REDLIB_OIDC_SESSION_SECRET=<at least 32 random bytes, e.g. from openssl rand -hex 32>
 ```
 
-Redlib won't start if OIDC is on and any of the issuer, client ID, client secret or redirect URI is missing.
+Redlib won't start if OIDC is on and any of the issuer, client ID, client secret or redirect URI is missing, or if the session secret is shorter than 32 bytes.
+
+`REDLIB_OIDC_ENABLED` accepts `on`, `true`, `yes` or `1` to turn the login on and `off`, `false`, `no` or `0` to turn it off, in any case. Unset means off. Any other value, including an empty one, stops Redlib at startup instead of being read as off. If OIDC is off but the issuer, client ID, client secret or session secret is set, Redlib logs a warning, since that usually means the switch was forgotten.
 
 - Browsers without a session are sent to `/oidc/login`, and back to the page they asked for afterwards. Other clients (no `text/html` in `Accept`) get `401` with `{"error":"unauthorized","error_description":"Authentication required."}`.
 - `/oidc/login`, `/oidc/callback` and `/oidc/logout` are the only paths without a login. Health checks (`/healthz`, `/healthz/reddit`) and `/mcp` need one too, so point probes at the instance from an address in `REDLIB_AUTH_BYPASS_CIDRS`.
+- ID tokens must be signed with RS256, or with the asymmetric algorithm the provider's signing key declares in its JWKS `alg`, and must carry `iss`, `aud`, `exp` and `iat`. With more than one audience, `azp` must be the client ID.
+- Each request to the provider (discovery, signing keys, token exchange) gives up after 10 seconds, so a provider that is down fails the login with an error page instead of leaving it hanging.
 - `/oidc/logout` ends the session and then the provider's session, if the provider offers that.
+- The session and login cookies are `__Host-redlib_session` and `__Host-redlib_oidc_tx`. The `__Host-` prefix means browsers only keep them over HTTPS (or `http://localhost`), so serve the instance over HTTPS. The names used to be `redlib_session` and `redlib_oidc_tx`; upgrading from a version with those names logs everyone out once.
 - Sessions are signed cookies; Redlib stores nothing. They can't be revoked one by one: changing `REDLIB_OIDC_SESSION_SECRET` ends all of them.
-- Clients in `REDLIB_AUTH_BYPASS_CIDRS` skip the login, e.g. `192.168.0.0/16,100.64.0.0/10`. Behind a reverse proxy, list the proxy in `REDLIB_TRUSTED_PROXIES`: `X-Forwarded-For` is read only when the connection comes from one of those, right to left, skipping the proxies. From anywhere else it is ignored, so a client can't claim a bypass address. IPv4 clients on Redlib's dual-stack `[::]` socket match IPv4 ranges.
-- `REDLIB_MCP_TOKEN` lets clients that can't hold a cookie in with `Authorization: Bearer <token>`, on any path.
+- Clients in `REDLIB_AUTH_BYPASS_CIDRS` skip the login, e.g. `192.168.0.0/16,100.64.0.0/10`. Behind a reverse proxy, list the proxy in `REDLIB_TRUSTED_PROXIES`: `X-Forwarded-For` is read only when the connection comes from one of those, right to left, skipping the proxies. Every `X-Forwarded-For` line counts, in order, and the walk stops at the first entry that isn't a plain IPv4 or IPv6 address (IPv6 may be in brackets; a port is not allowed). If a proxy sends no `X-Forwarded-For`, one that lists only proxies, or one with an entry that can't be read, the client counts as unknown: it gets no bypass, even if the proxy's own address is in a bypass range, but can still log in. From anywhere else the header is ignored and the connecting address is the client, so a client can't claim a bypass address. IPv4 clients on Redlib's dual-stack `[::]` socket match IPv4 ranges.
+- `REDLIB_MCP_TOKEN` lets MCP clients, which can't hold a cookie, in with `Authorization: Bearer <token>` (the scheme in any case). It works on `/mcp` only; everywhere else the token is ignored and a login is needed.
 
-The secrets, the bypass ranges and the proxy list never show on `/info`.
+The secrets, the bypass ranges and the proxy list never show on `/info`. Unlike older settings, none of these can be set under a `LIBREDDIT_` name.
 
 ## Default user settings
 

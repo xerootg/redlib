@@ -632,6 +632,36 @@ mod tests {
 	}
 
 	#[test]
+	#[sealed_test(env = [
+		("LIBREDDIT_OIDC_ENABLED", "off"),
+		("LIBREDDIT_OIDC_ISSUER", "https://idp.example/"),
+		("LIBREDDIT_OIDC_CLIENT_ID", "id"),
+		("LIBREDDIT_OIDC_CLIENT_SECRET", "secret"),
+		("LIBREDDIT_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("LIBREDDIT_OIDC_SCOPES", "openid"),
+		("LIBREDDIT_OIDC_SESSION_SECRET", "0123456789abcdef0123456789abcdef"),
+		("LIBREDDIT_OIDC_SESSION_TTL", "60"),
+		("LIBREDDIT_OIDC_ALLOWED_GROUPS", "admins"),
+		("LIBREDDIT_AUTH_BYPASS_CIDRS", "0.0.0.0/0"),
+		("LIBREDDIT_TRUSTED_PROXIES", "0.0.0.0/0"),
+		("LIBREDDIT_MCP_TOKEN", "token"),
+	])]
+	fn test_auth_settings_have_no_legacy_names() {
+		// These never existed under LIBREDDIT_. A stray variable with such a
+		// name must not quietly switch auth off, widen the bypass or set a token.
+		let auth_keys: Vec<String> = serde_names("rename")
+			.into_iter()
+			.filter(|k| k.starts_with("REDLIB_OIDC_") || ["REDLIB_AUTH_BYPASS_CIDRS", "REDLIB_TRUSTED_PROXIES", "REDLIB_MCP_TOKEN"].contains(&k.as_str()))
+			.collect();
+		assert_eq!(auth_keys.len(), 12, "update the env list above: {auth_keys:?}");
+		let config = Config::load();
+		for key in &auth_keys {
+			assert!(var(key.replace("REDLIB_", "LIBREDDIT_")).is_ok(), "{key} has no legacy variable set above");
+			assert_eq!(get_setting_from_config(key, &config), None, "{key}");
+		}
+	}
+
+	#[test]
 	#[sealed_test(env = [("REDLIB_DEFAULT_COMMENT_SORT", "top")])]
 	fn test_env_config_precedence() {
 		let config_to_write = r#"REDLIB_DEFAULT_COMMENT_SORT = "best""#;

@@ -319,6 +319,35 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 		})
 }
 
+/// Whether the request carries the configured API bearer token.
+///
+/// Session cookies are unusable by headless clients such as an MCP client, so
+/// a long random token stands in for them. Returns false whenever no token is
+/// configured, so an unset value can never authorise anything.
+///
+/// The comparison hashes both sides first. A plain `==` on the raw strings
+/// short-circuits at the first differing byte, which leaks the length of the
+/// matching prefix and lets an attacker recover the token byte by byte.
+/// Comparing digests makes the timing independent of how much of the token was
+/// correct.
+fn bearer_token_valid(headers: &HeaderMap) -> bool {
+	let Some(expected) = setting("REDLIB_MCP_TOKEN") else {
+		return false;
+	};
+
+	let Some(presented) = headers
+		.get("authorization")
+		.and_then(|v| v.to_str().ok())
+		.and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+		.map(str::trim)
+		.filter(|t| !t.is_empty())
+	else {
+		return false;
+	};
+
+	Sha256::digest(presented.as_bytes()) == Sha256::digest(expected.as_bytes())
+}
+
 /// Reads and validates the session cookie, if present and well-formed.
 pub fn session_from(headers: &HeaderMap) -> Option<Session> {
 	let raw = cookie_value(headers, SESSION_COOKIE)?;
@@ -674,7 +703,8 @@ pub async fn logout(_req: Request<Body>) -> Result<Response<Body>, String> {
 /// short-circuit it (a redirect to login for browsers, a 401 otherwise).
 ///
 /// Only `/oidc/` is exempt. Health checks, static files and `/mcp` are gated
-/// like everything else; probes are expected to come from a bypass CIDR.
+/// like everything else; probes are expected to come from a bypass CIDR, and
+/// headless clients such as MCP present `REDLIB_MCP_TOKEN` as a bearer token.
 pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Body>> {
 	if !AUTH.enabled {
 		return None;
@@ -687,6 +717,12 @@ pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Bo
 
 	let client = resolve_client_ip(peer, headers);
 	if is_bypassed(client) {
+		return None;
+	}
+
+	// Checked before the cookie so that headless clients (MCP, curl, CI) have
+	// a credential they can actually present.
+	if bearer_token_valid(headers) {
 		return None;
 	}
 
@@ -944,11 +980,12 @@ mod tests {
 		("REDLIB_OIDC_SESSION_SECRET", "session-secret-value"),
 		("REDLIB_AUTH_BYPASS_CIDRS", "192.168.77.0/24"),
 		("REDLIB_TRUSTED_PROXIES", "10.99.0.0/16"),
+		("REDLIB_MCP_TOKEN", "mcp-token-value"),
 	])]
 	fn secrets_and_network_layout_never_reach_info_json() {
 		// `/info.json` serializes the whole config.
 		let json = serde_json::to_string(&crate::config::Config::load()).unwrap();
-		for leaked in ["client-secret-value", "session-secret-value", "192.168.77.0", "10.99.0.0"] {
+		for leaked in ["client-secret-value", "session-secret-value", "192.168.77.0", "10.99.0.0", "mcp-token-value"] {
 			assert!(!json.contains(leaked), "{leaked} is in /info.json");
 		}
 	}
@@ -1164,5 +1201,65 @@ mod tests {
 	fn sessions_still_work_with_an_ephemeral_key() {
 		let token = sign(&session(now() + 3600)).unwrap();
 		assert!(gate(ip(OUTSIDE), "/", &session_cookie(&token)).is_none());
+	}
+
+	fn bearer(value: &str) -> HeaderMap {
+		headers(&[("authorization", value), ("accept", "application/json")])
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_MCP_TOKEN", "correct-horse-battery-staple"),
+	])]
+	fn gate_accepts_the_bearer_token_on_any_path() {
+		for path in ["/mcp", "/r/rust", "/"] {
+			assert!(gate(ip(OUTSIDE), path, &bearer("Bearer correct-horse-battery-staple")).is_none(), "{path}");
+		}
+		assert!(gate(ip(OUTSIDE), "/mcp", &bearer("bearer correct-horse-battery-staple")).is_none());
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_MCP_TOKEN", "correct-horse-battery-staple"),
+	])]
+	fn gate_rejects_wrong_or_malformed_bearer_tokens() {
+		for value in [
+			"Bearer correct-horse-battery",
+			"Bearer correct-horse-battery-staplex",
+			"Bearer ",
+			"Basic correct-horse-battery-staple",
+			"correct-horse-battery-staple",
+		] {
+			let res = gate(ip(OUTSIDE), "/mcp", &bearer(value)).unwrap_or_else(|| panic!("{value:?} must not pass"));
+			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{value:?}");
+		}
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret"),
+		("REDLIB_MCP_TOKEN", "   "),
+	])]
+	fn an_unset_or_blank_token_authorises_nothing() {
+		for value in ["Bearer ", "Bearer    ", "Bearer x"] {
+			assert!(gate(ip(OUTSIDE), "/mcp", &bearer(value)).is_some(), "{value:?}");
+		}
 	}
 }

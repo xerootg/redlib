@@ -263,6 +263,14 @@ pub struct Config {
 	#[serde(rename = "REDLIB_TRUSTED_PROXIES")]
 	#[serde(skip_serializing)]
 	pub(crate) trusted_proxies: Option<String>,
+
+	/// Bearer token accepted at any endpoint by the OIDC gate, for clients
+	/// that cannot hold a session cookie (the MCP endpoint at `/mcp`, curl).
+	/// Unset means no token is accepted at all. A credential, so it is never
+	/// serialized.
+	#[serde(rename = "REDLIB_MCP_TOKEN")]
+	#[serde(skip_serializing)]
+	pub(crate) mcp_token: Option<String>,
 }
 
 impl Config {
@@ -368,6 +376,7 @@ impl Config {
 			oidc_allowed_groups: parse("REDLIB_OIDC_ALLOWED_GROUPS"),
 			auth_bypass_cidrs: parse("REDLIB_AUTH_BYPASS_CIDRS"),
 			trusted_proxies: parse("REDLIB_TRUSTED_PROXIES"),
+			mcp_token: parse("REDLIB_MCP_TOKEN"),
 		}
 	}
 }
@@ -437,6 +446,7 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_OIDC_ALLOWED_GROUPS" => config.oidc_allowed_groups.clone(),
 		"REDLIB_AUTH_BYPASS_CIDRS" => config.auth_bypass_cidrs.clone(),
 		"REDLIB_TRUSTED_PROXIES" => config.trusted_proxies.clone(),
+		"REDLIB_MCP_TOKEN" => config.mcp_token.clone(),
 		_ => None,
 	}
 }

@@ -86,6 +86,21 @@ pub struct AuthConfig {
 	pub bypass_cidrs: Vec<IpNet>,
 	pub trusted_proxies: Vec<IpNet>,
 	session_key: Vec<u8>,
+	/// Settings that are present but unusable. `load` refuses to start when
+	/// there are any.
+	problems: Vec<String>,
+}
+
+/// Reads `REDLIB_OIDC_ENABLED`. Unset is off; a value that is neither a
+/// recognised yes nor a recognised no is an error, not a guess, because
+/// guessing "off" would publish the instance without a login.
+fn parse_enabled(raw: Option<&str>) -> Result<bool, String> {
+	let Some(raw) = raw else { return Ok(false) };
+	match raw.trim().to_ascii_lowercase().as_str() {
+		"on" | "true" | "1" | "yes" => Ok(true),
+		"off" | "false" | "0" | "no" => Ok(false),
+		_ => Err(format!("REDLIB_OIDC_ENABLED is {raw:?}; use on/off, true/false, yes/no or 1/0")),
+	}
 }
 
 /// Parses a comma-separated CIDR list. Bare addresses (`10.0.0.1`) are
@@ -115,10 +130,25 @@ impl AuthConfig {
 	fn load() -> Self {
 		let cfg = Self::load_unchecked();
 
+		let mut problems = cfg.problems.clone();
 		if cfg.enabled {
 			let missing = cfg.missing_required();
-			assert!(missing.is_empty(), "REDLIB_OIDC_ENABLED is on but these are unset: {}", missing.join(", "));
+			if !missing.is_empty() {
+				problems.push(format!("REDLIB_OIDC_ENABLED is on but these are unset: {}", missing.join(", ")));
+			}
+		}
+		assert!(problems.is_empty(), "Refusing to start: {}", problems.join("; "));
 
+		let ignored = cfg.ignored_settings();
+		if !ignored.is_empty() {
+			warn!(
+				"OIDC IS OFF, so this instance needs no login, yet {} {} set. If it should be behind a login, set REDLIB_OIDC_ENABLED=on.",
+				ignored.join(", "),
+				if ignored.len() == 1 { "is" } else { "are" }
+			);
+		}
+
+		if cfg.enabled {
 			info!(
 				"OIDC enabled: issuer={} bypass_cidrs={:?} trusted_proxies={:?} allowed_groups={:?}",
 				cfg.issuer, cfg.bypass_cidrs, cfg.trusted_proxies, cfg.allowed_groups
@@ -133,8 +163,15 @@ impl AuthConfig {
 	}
 
 	fn load_unchecked() -> Self {
-		// `redlib.toml` booleans arrive as "on"/"off".
-		let enabled = setting("REDLIB_OIDC_ENABLED").is_some_and(|v| v == "on" || v == "true" || v == "1");
+		let mut problems = Vec::new();
+
+		// `redlib.toml` booleans arrive as "on"/"off". An unreadable value
+		// counts as on, so that whatever else is missing is reported too, and
+		// `load` refuses to start either way.
+		let enabled = parse_enabled(config::get_setting("REDLIB_OIDC_ENABLED").as_deref()).unwrap_or_else(|e| {
+			problems.push(e);
+			true
+		});
 
 		let bypass_cidrs = parse_cidrs(setting("REDLIB_AUTH_BYPASS_CIDRS"), "REDLIB_AUTH_BYPASS_CIDRS");
 		let trusted_proxies = parse_cidrs(setting("REDLIB_TRUSTED_PROXIES"), "REDLIB_TRUSTED_PROXIES");
@@ -166,7 +203,20 @@ impl AuthConfig {
 			bypass_cidrs,
 			trusted_proxies,
 			session_key,
+			problems,
 		}
+	}
+
+	/// OIDC settings that are set while OIDC is off. That usually means the
+	/// switch itself was forgotten, and the instance is public by mistake.
+	fn ignored_settings(&self) -> Vec<&'static str> {
+		if self.enabled {
+			return Vec::new();
+		}
+		["REDLIB_OIDC_ISSUER", "REDLIB_OIDC_CLIENT_ID", "REDLIB_OIDC_CLIENT_SECRET", "REDLIB_OIDC_SESSION_SECRET"]
+			.into_iter()
+			.filter(|key| setting(key).is_some())
+			.collect()
 	}
 
 	/// The settings a working relying party cannot do without.
@@ -1046,6 +1096,19 @@ mod tests {
 				.or_else(|| err.downcast_ref::<&str>().map(ToString::to_string))
 				.unwrap_or_default(),
 		)
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "off"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_SESSION_SECRET", "0123456789abcdef0123456789abcdef"),
+	])]
+	fn settings_left_behind_while_disabled_are_reported() {
+		let cfg = AuthConfig::load_unchecked();
+		assert_eq!(cfg.ignored_settings(), vec!["REDLIB_OIDC_ISSUER", "REDLIB_OIDC_SESSION_SECRET"]);
+		// A warning, not a refusal: turning auth off on purpose must still work.
+		assert_eq!(startup_refusal(), None);
 	}
 
 	#[test]

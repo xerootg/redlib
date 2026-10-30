@@ -167,6 +167,8 @@ REDLIB_OIDC_SESSION_SECRET=<long random string>
 
 Redlib won't start if OIDC is on and any of the issuer, client ID, client secret or redirect URI is missing.
 
+`REDLIB_OIDC_ENABLED` accepts `on`, `true`, `yes` or `1` to turn the login on and `off`, `false`, `no` or `0` to turn it off, in any case. Unset means off. Any other value, including an empty one, stops Redlib at startup instead of being read as off. If OIDC is off but the issuer, client ID, client secret or session secret is set, Redlib logs a warning, since that usually means the switch was forgotten.
+
 - Browsers without a session are sent to `/oidc/login`, and back to the page they asked for afterwards. Other clients (no `text/html` in `Accept`) get `401` with `{"error":"unauthorized","error_description":"Authentication required."}`.
 - `/oidc/login`, `/oidc/callback` and `/oidc/logout` are the only paths without a login. Health checks (`/healthz`, `/healthz/reddit`) and `/mcp` need one too, so point probes at the instance from an address in `REDLIB_AUTH_BYPASS_CIDRS`.
 - `/oidc/logout` ends the session and then the provider's session, if the provider offers that.

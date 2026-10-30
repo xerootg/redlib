@@ -265,20 +265,23 @@ pub fn enabled() -> bool {
 /// (nearest hop first) and the first address that is not itself a trusted
 /// proxy is returned. Walking from the right matters: the left-hand entries
 /// are the ones a client can prepend.
-pub fn resolve_client_ip(peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+///
+/// `None` means the client is unknown: the peer is a trusted proxy but the
+/// chain names no client. The proxy's own address is deliberately not used
+/// then. Proxies often sit inside a bypass range, and falling back to them
+/// would let every request they forward skip the login.
+pub fn resolve_client_ip(peer: IpAddr, headers: &HeaderMap) -> Option<IpAddr> {
 	resolve_with(&AUTH.trusted_proxies, peer, headers)
 }
 
-fn resolve_with(trusted: &[IpNet], peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+fn resolve_with(trusted: &[IpNet], peer: IpAddr, headers: &HeaderMap) -> Option<IpAddr> {
 	let peer = canonical(peer);
 
 	if !trusted.iter().any(|net| net.contains(&peer)) {
-		return peer;
+		return Some(peer);
 	}
 
-	let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) else {
-		return peer;
-	};
+	let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())?;
 
 	xff
 		.split(',')
@@ -287,7 +290,6 @@ fn resolve_with(trusted: &[IpNet], peer: IpAddr, headers: &HeaderMap) -> IpAddr 
 		.map(canonical)
 		.rev()
 		.find(|ip| !trusted.iter().any(|net| net.contains(ip)))
-		.unwrap_or(peer)
 }
 
 /// Normalises IPv4-mapped IPv6 addresses (`::ffff:10.0.0.1`) down to plain
@@ -799,8 +801,9 @@ pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Bo
 		return None;
 	}
 
+	// An unknown client is never bypassed, but can still authenticate.
 	let client = resolve_client_ip(peer, headers);
-	if is_bypassed(client) {
+	if client.is_some_and(is_bypassed) {
 		return None;
 	}
 
@@ -814,7 +817,7 @@ pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Bo
 		return None;
 	}
 
-	debug!("unauthenticated request from {client} for {path}");
+	debug!("unauthenticated request from {client:?} for {path}");
 
 	// Programmatic clients get a plain 401 rather than an HTML redirect they
 	// cannot follow. This is what an MCP client or curl will see.
@@ -921,7 +924,7 @@ mod tests {
 		// or XFF would be ignored and every client would look like the proxy.
 		let trusted = [net("10.42.0.0/16")];
 		let got = resolve_with(&trusted, ip("::ffff:10.42.0.7"), &xff("203.0.113.9"));
-		assert_eq!(got, ip("203.0.113.9"));
+		assert_eq!(got, Some(ip("203.0.113.9")));
 	}
 
 	#[test]
@@ -929,7 +932,7 @@ mod tests {
 		// The spoofing case: a direct client claims to be on the LAN.
 		let trusted = [net("10.42.0.0/16")];
 		let got = resolve_with(&trusted, ip("203.0.113.9"), &xff("192.168.1.5"));
-		assert_eq!(got, ip("203.0.113.9"));
+		assert_eq!(got, Some(ip("203.0.113.9")));
 	}
 
 	#[test]
@@ -937,14 +940,33 @@ mod tests {
 		let trusted = [net("10.42.0.0/16")];
 		// Client prepended a forged entry; the real address is on the right.
 		let got = resolve_with(&trusted, ip("10.42.0.7"), &xff("192.168.1.5, 203.0.113.9"));
-		assert_eq!(got, ip("203.0.113.9"));
+		assert_eq!(got, Some(ip("203.0.113.9")));
 	}
 
 	#[test]
 	fn skips_trusted_hops_in_the_chain() {
 		let trusted = [net("10.42.0.0/16")];
 		let got = resolve_with(&trusted, ip("10.42.0.7"), &xff("203.0.113.9, 10.42.0.3"));
-		assert_eq!(got, ip("203.0.113.9"));
+		assert_eq!(got, Some(ip("203.0.113.9")));
+	}
+
+	#[test]
+	fn client_is_unknown_when_the_chain_is_all_trusted() {
+		let trusted = [net("10.42.0.0/16")];
+		assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &xff("10.42.0.3")), None);
+	}
+
+	#[test]
+	fn client_is_unknown_without_forwarded_header_from_a_proxy() {
+		let trusted = [net("10.42.0.0/16")];
+		assert_eq!(resolve_with(&trusted, ip("10.42.0.7"), &HeaderMap::new()), None);
+	}
+
+	#[test]
+	fn peer_that_is_not_a_proxy_is_the_client_without_forwarded_header() {
+		let trusted = [net("10.42.0.0/16")];
+		assert_eq!(resolve_with(&trusted, ip("192.168.1.5"), &HeaderMap::new()), Some(ip("192.168.1.5")));
+		assert_eq!(resolve_with(&[], ip("10.42.0.7"), &HeaderMap::new()), Some(ip("10.42.0.7")));
 	}
 
 	#[test]

@@ -1,0 +1,180 @@
+name: Fork container build
+
+# This fork's own image build. It is a trimmed copy of main-docker.yml, kept
+# in a separate file so merges from Nachtalb/redlib never conflict with it.
+# Pushes to `deploy` publish ghcr.io/<owner>/redlib:sha-<short> for the
+# architectures the cluster runs (amd64 and arm64).
+
+on:
+  push:
+    branches: [deploy]
+  workflow_dispatch:
+
+concurrency:
+  group: fork-container-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Gate every image on lint and the offline tests. Live tests that call
+  # Reddit are skipped: GitHub's runners get captcha'd, and an image should
+  # not be blocked by Reddit's mood. /healthz/reddit watches that in prod.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: "cargo test --locked -- --skip live_tests::"
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+        flavor: [plain]
+    steps:
+      - name: Prepare
+        run: |
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          platform=${{ matrix.platform }}
+          pair=${platform//\//-}
+          [ "${{ matrix.flavor }}" = obscura ] && pair=$pair-obscura
+          echo "PLATFORM_PAIR=$pair" >> "$GITHUB_ENV"
+          arch=${platform#linux/}
+          echo "CACHE_ARCH=${arch//\//}" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.description=Private front-end for Reddit
+            org.opencontainers.image.licenses=AGPL-3.0-only
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Cargo cache
+        id: cargo-cache
+        uses: actions/cache@v6
+        with:
+          path: cargo-cache
+          key: cargo-${{ env.PLATFORM_PAIR }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ env.PLATFORM_PAIR }}-
+
+      - name: Inject cargo cache into the build
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          # Copying the cache out takes minutes; only needed when deps changed
+          skip-extraction: ${{ steps.cargo-cache.outputs.cache-hit }}
+          cache-map: |
+            {
+              "cargo-cache/registry": { "target": "/root/.cargo/registry", "id": "cargo-registry" },
+              "cargo-cache/git": { "target": "/root/.cargo/git", "id": "cargo-git" },
+              "cargo-cache/target": { "target": "/redlib/target", "id": "redlib-target-${{ env.CACHE_ARCH }}" }
+            }
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.distroless
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            GIT_HASH=${{ github.sha }}
+            OBSCURA=${{ matrix.flavor == 'obscura' }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=registry,ref=${{ env.IMAGE }}-buildcache:${{ env.PLATFORM_PAIR }}
+          cache-to: type=registry,ref=${{ env.IMAGE }}-buildcache:${{ env.PLATFORM_PAIR }},mode=max,ignore-error=true
+
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.flavor }}-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      packages: write
+    strategy:
+      matrix:
+        flavor: [plain]
+    steps:
+      - name: Prepare
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.flavor }}-*
+          merge-multiple: true
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: suffix=${{ matrix.flavor == 'obscura' && '-obscura' || '' }},onlatest=true
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: docker buildx imagetools inspect ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}

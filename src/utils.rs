@@ -1690,6 +1690,20 @@ pub fn to_absolute_url(relative_path: &str) -> String {
 	format!("{}{}", config::get_setting("REDLIB_FULL_URL").unwrap_or_default(), relative_path)
 }
 
+/// Message shown for pages that only exist for a logged-in Reddit account.
+pub const ACCOUNT_ONLY_MSG: &str = "This page needs a Reddit account. Redlib browses Reddit anonymously, so it can't show it.";
+
+/// Whether a user listing (`/user/<name>/<listing>`) is private to the account owner.
+pub fn is_account_only_user_listing(_listing: &str) -> bool {
+	false
+}
+
+/// Whether a subreddit path component is a feed that only exists for a logged-in account
+/// (`friends`, `mod`), alone or as part of a multireddit.
+pub fn is_account_only_subreddit(_sub: &str) -> bool {
+	false
+}
+
 // =====================================================
 // RSS Feed Helpers
 // =====================================================
@@ -2336,5 +2350,25 @@ How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or t
 			r#"<a href="https://redlib.example/r/rust">r/rust</a><img src="https://redlib.example/preview/pre/x.png"><a href="//example.com">x</a><a href="https://a.b/c">y</a>"#
 		);
 		assert_eq!(prefix_relative_urls(html, ""), html);
+	}
+
+	#[test]
+	fn account_only_user_listings_are_detected() {
+		for listing in ["saved", "upvoted", "downvoted", "hidden", "SAVED"] {
+			assert!(super::is_account_only_user_listing(listing), "{listing} should be account-only");
+		}
+		for listing in ["overview", "comments", "submitted", "gilded", ""] {
+			assert!(!super::is_account_only_user_listing(listing), "{listing} should be public");
+		}
+	}
+
+	#[test]
+	fn account_only_subreddits_are_detected() {
+		for sub in ["friends", "mod", "Mod", "friends+rust", "rust+mod"] {
+			assert!(super::is_account_only_subreddit(sub), "{sub} should be account-only");
+		}
+		for sub in ["all", "popular", "rust", "modest", "friendsofrust", "rust+programming", ""] {
+			assert!(!super::is_account_only_subreddit(sub), "{sub} should be public");
+		}
 	}
 }

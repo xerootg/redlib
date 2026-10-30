@@ -453,6 +453,35 @@ async fn get(path: String, quarantine: bool) -> Result<Value, String> {
 	reddit_json(path, quarantine).await
 }
 
+/// The listing path for a subreddit, a `+`-combined feed, or r/all.
+///
+/// Reddit's JSON API only reads `a+b` as a combined feed when the `+` is
+/// percent-encoded; a literal `+` gets the default front page instead,
+/// which looks like a plausible answer. The web UI encodes it the same way.
+fn subreddit_listing_path(sub: &str, sort: &str, query: &str) -> String {
+	format!("/r/{}/{sort}.json?{query}", sub.replace('+', "%2B"))
+}
+
+/// Like [`listing_result`], but holds a listing to the `limit` asked for.
+///
+/// Some backends ignore `limit` -- r/all comes back 25 posts long whatever
+/// was requested. Dropping the extra posts keeps the result as small as the
+/// caller asked, and `after` moves to the last post kept so the next page
+/// continues from there rather than skipping the dropped ones.
+fn limited_listing_result(res: &Value, mut items: Vec<Value>, limit: u64) -> Value {
+	let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+	if items.len() <= limit {
+		return listing_result(res, items);
+	}
+	items.truncate(limit);
+	let after = items.last().and_then(|p| p.get("fullname")).cloned().unwrap_or(Value::Null);
+	json!({
+		"count": items.len(),
+		"after": after,
+		"items": items,
+	})
+}
+
 pub async fn browse_subreddit(sub: &str, sort: &str, time: Option<&str>, limit: u64, after: Option<&str>) -> Result<Value, String> {
 	validate("sort", sort, &LISTING_SORTS)?;
 	let time = time.unwrap_or("day");
@@ -470,7 +499,7 @@ pub async fn browse_subreddit(sub: &str, sort: &str, time: Option<&str>, limit: 
 		("raw_json", "1".to_string()),
 	]);
 
-	let res = get(format!("/r/{sub}/{sort}.json?{q}"), true).await?;
+	let res = get(subreddit_listing_path(&sub, sort, &q), true).await?;
 	let items: Vec<Value> = res
 		.get("data")
 		.and_then(|d| d.get("children"))
@@ -478,7 +507,7 @@ pub async fn browse_subreddit(sub: &str, sort: &str, time: Option<&str>, limit: 
 		.map(|c| c.iter().map(project_post).collect())
 		.unwrap_or_default();
 
-	Ok(listing_result(&res, items))
+	Ok(limited_listing_result(&res, items, limit))
 }
 
 pub async fn browse_frontpage(feed: &str, sort: &str, time: Option<&str>, limit: u64, after: Option<&str>) -> Result<Value, String> {
@@ -1328,6 +1357,26 @@ mod tests {
 		assert_eq!(fetch.len(), MAX_LOOKUP_IDS);
 		assert_eq!(errors.len(), 5);
 		assert!(errors[0]["error"].as_str().unwrap().contains("at most"), "{}", errors[0]);
+	}
+
+	#[test]
+	fn combined_feeds_encode_the_plus() {
+		assert_eq!(subreddit_listing_path("rust+golang", "hot", "limit=3"), "/r/rust%2Bgolang/hot.json?limit=3");
+		assert_eq!(subreddit_listing_path("rust", "new", "limit=3"), "/r/rust/new.json?limit=3");
+		// r/all must keep its own route so the backend layer can serve it.
+		assert_eq!(crate::backends::Kind::of(&subreddit_listing_path("all", "hot", "")), crate::backends::Kind::All);
+	}
+
+	#[test]
+	fn listings_are_held_to_the_requested_limit() {
+		let res = json!({"data": {"after": "t3_e", "children": []}});
+		let items: Vec<Value> = ["a", "b", "c", "d", "e"].iter().map(|id| json!({"id": id, "fullname": format!("t3_{id}")})).collect();
+		let out = limited_listing_result(&res, items.clone(), 3);
+		assert_eq!(out["count"], 3);
+		assert_eq!(out["after"], "t3_c", "the next page must start after the last post kept");
+		let all = limited_listing_result(&res, items, 5);
+		assert_eq!(all["count"], 5);
+		assert_eq!(all["after"], "t3_e");
 	}
 
 	#[test]

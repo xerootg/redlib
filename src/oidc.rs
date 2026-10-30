@@ -1157,9 +1157,21 @@ mod tests {
 	}
 
 	#[test]
-	fn cookies_are_secure_unless_running_over_plain_http() {
-		assert_eq!(cookie_attrs(true, 60), "Path=/; HttpOnly; SameSite=Lax; Max-Age=60; Secure");
-		assert_eq!(cookie_attrs(false, 0), "Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+	fn cookies_are_host_only_and_always_secure() {
+		// With the `__Host-` prefix a browser only accepts the cookie when it is
+		// Secure, has Path=/ and no Domain, so a sibling subdomain can neither
+		// set nor shadow it.
+		for name in [SESSION_COOKIE, TX_COOKIE] {
+			assert!(name.starts_with("__Host-"), "{name}");
+		}
+		for secure in [true, false] {
+			let attrs = cookie_attrs(secure, 60);
+			let attrs: Vec<&str> = attrs.split("; ").collect();
+			for wanted in ["Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=60", "Secure"] {
+				assert!(attrs.contains(&wanted), "{wanted} missing from {attrs:?}");
+			}
+			assert!(!attrs.iter().any(|a| a.to_ascii_lowercase().starts_with("domain")), "{attrs:?}");
+		}
 	}
 
 	#[test]

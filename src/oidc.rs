@@ -47,6 +47,8 @@ const DEFAULT_SCOPES: &str = "openid profile email";
 const DEFAULT_SESSION_TTL: u64 = 86_400;
 /// How long a user has to complete the login round-trip.
 const TX_TTL: u64 = 600;
+/// How far ahead of our clock an ID token's `iat` may be.
+const MAX_IAT_SKEW: u64 = 300;
 /// Shortest accepted `REDLIB_OIDC_SESSION_SECRET`, in bytes: the size of the
 /// HMAC-SHA256 key it becomes.
 const MIN_SESSION_SECRET_LEN: usize = 32;
@@ -661,6 +663,12 @@ struct IdClaims {
 	groups: Vec<String>,
 	#[serde(default)]
 	nonce: Option<String>,
+	#[serde(default, deserialize_with = "one_or_many")]
+	aud: Vec<String>,
+	#[serde(default)]
+	azp: Option<String>,
+	#[serde(default)]
+	iat: Option<u64>,
 }
 
 /// Handles the provider's redirect back to us.
@@ -781,23 +789,65 @@ async fn exchange_and_validate(code: &str, tx: &LoginTx) -> Result<IdClaims, Str
 /// Checks an ID token's signature against `jwk` and its claims against what
 /// this relying party expects.
 fn validate_id_token(id_token: &str, jwk: &Jwk, issuer: &str, client_id: &str, nonce: &str) -> Result<IdClaims, String> {
-	let header = decode_header(id_token).map_err(|e| format!("malformed ID token: {e}"))?;
 	let key = DecodingKey::from_jwk(jwk).map_err(|e| format!("unusable signing key: {e}"))?;
 
-	let algorithm = header.alg;
-	let mut validation = Validation::new(algorithm);
+	// The algorithm comes from our side, never from the token's header, so a
+	// token cannot pick a weaker check for itself.
+	let mut validation = Validation::new(id_token_algorithm(jwk)?);
 	validation.set_audience(&[client_id]);
 	validation.set_issuer(&[issuer]);
+	validation.set_required_spec_claims(&["iss", "aud", "exp"]);
 
-	let data = decode::<IdClaims>(id_token, &key, &validation).map_err(|e| format!("ID token validation failed: {e}"))?;
+	let claims = decode::<IdClaims>(id_token, &key, &validation)
+		.map_err(|e| format!("ID token validation failed: {e}"))?
+		.claims;
+
+	// jsonwebtoken neither requires nor checks `iat`.
+	let iat = claims.iat.ok_or("ID token has no iat")?;
+	if iat > now() + MAX_IAT_SKEW {
+		return Err(format!("ID token iat {iat} is in the future"));
+	}
+
+	// OIDC Core 3.1.3.7: with several audiences, `azp` must name us; when
+	// present at all, it must be us.
+	if (claims.aud.len() > 1 || claims.azp.is_some()) && claims.azp.as_deref() != Some(client_id) {
+		return Err(format!("ID token azp {:?} is not this client", claims.azp));
+	}
 
 	// Binds this ID token to the login request that started the flow,
 	// preventing token replay.
-	if data.claims.nonce.as_deref() != Some(nonce) {
+	if claims.nonce.as_deref() != Some(nonce) {
 		return Err("ID token nonce does not match the login request".to_string());
 	}
 
-	Ok(data.claims)
+	Ok(claims)
+}
+
+/// The algorithm an ID token signed with `jwk` must use: the key's declared
+/// `alg` if it has one, RS256 (the OIDC default) otherwise. Symmetric and
+/// encryption algorithms are refused.
+fn id_token_algorithm(jwk: &Jwk) -> Result<Algorithm, String> {
+	let Some(declared) = jwk.common.key_algorithm else {
+		return Ok(Algorithm::RS256);
+	};
+	match declared.to_string().parse::<Algorithm>() {
+		Ok(Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512) | Err(_) => Err(format!("signing key declares {declared}, which is not an asymmetric signature algorithm")),
+		Ok(alg) => Ok(alg),
+	}
+}
+
+/// `aud` may be a single string or an array of them.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+	#[derive(Deserialize)]
+	#[serde(untagged)]
+	enum OneOrMany {
+		One(String),
+		Many(Vec<String>),
+	}
+	Ok(match OneOrMany::deserialize(deserializer)? {
+		OneOrMany::One(aud) => vec![aud],
+		OneOrMany::Many(auds) => auds,
+	})
 }
 
 /// Clears the local session, then hands off to the provider's end-session

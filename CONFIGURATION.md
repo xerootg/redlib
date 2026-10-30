@@ -78,7 +78,7 @@ Assign a default value for each instance-specific setting by passing environment
 | `OIDC_CLIENT_SECRET`      | String          | (empty)                                | Client secret. Required with `OIDC_ENABLED`. **Secret.** |
 | `OIDC_REDIRECT_URI`       | String          | (empty)                                | This instance's `/oidc/callback` URL, exactly as registered with the provider. Required with `OIDC_ENABLED`. |
 | `OIDC_SCOPES`             | String          | `openid profile email`                 | Space-separated scopes to request. |
-| `OIDC_SESSION_SECRET`     | String          | (random per start)                     | Key that signs session cookies. Set it, or every restart logs everyone out. **Secret.** |
+| `OIDC_SESSION_SECRET`     | String          | (random per start)                     | Key that signs session cookies, at least 32 bytes. Set it, or every restart logs everyone out. **Secret.** |
 | `OIDC_SESSION_TTL`        | Integer         | `86400`                                | Session lifetime in seconds. |
 | `OIDC_ALLOWED_GROUPS`     | List            | (empty)                                | Comma-separated groups; when set, a login must carry one of them. |
 | `AUTH_BYPASS_CIDRS`       | List            | (empty)                                | Comma-separated CIDRs or addresses that skip the login. |
@@ -162,10 +162,10 @@ REDLIB_OIDC_ISSUER=https://auth.example.com/application/o/redlib/
 REDLIB_OIDC_CLIENT_ID=...
 REDLIB_OIDC_CLIENT_SECRET=...
 REDLIB_OIDC_REDIRECT_URI=https://redlib.example.com/oidc/callback
-REDLIB_OIDC_SESSION_SECRET=<long random string>
+REDLIB_OIDC_SESSION_SECRET=<at least 32 random bytes, e.g. from openssl rand -hex 32>
 ```
 
-Redlib won't start if OIDC is on and any of the issuer, client ID, client secret or redirect URI is missing.
+Redlib won't start if OIDC is on and any of the issuer, client ID, client secret or redirect URI is missing, or if the session secret is shorter than 32 bytes.
 
 `REDLIB_OIDC_ENABLED` accepts `on`, `true`, `yes` or `1` to turn the login on and `off`, `false`, `no` or `0` to turn it off, in any case. Unset means off. Any other value, including an empty one, stops Redlib at startup instead of being read as off. If OIDC is off but the issuer, client ID, client secret or session secret is set, Redlib logs a warning, since that usually means the switch was forgotten.
 

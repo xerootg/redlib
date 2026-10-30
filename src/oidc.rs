@@ -47,6 +47,9 @@ const DEFAULT_SCOPES: &str = "openid profile email";
 const DEFAULT_SESSION_TTL: u64 = 86_400;
 /// How long a user has to complete the login round-trip.
 const TX_TTL: u64 = 600;
+/// Shortest accepted `REDLIB_OIDC_SESSION_SECRET`, in bytes: the size of the
+/// HMAC-SHA256 key it becomes.
+const MIN_SESSION_SECRET_LEN: usize = 32;
 
 fn now() -> u64 {
 	SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default()
@@ -177,9 +180,18 @@ impl AuthConfig {
 		let trusted_proxies = parse_cidrs(setting("REDLIB_TRUSTED_PROXIES"), "REDLIB_TRUSTED_PROXIES");
 
 		// Derive a fixed-length key from the configured secret so that
-		// operators are not forced to supply exactly N bytes.
+		// operators are not forced to supply exactly N bytes. Hashing hides
+		// the length but adds no strength, so a minimum is enforced.
 		let session_key = match setting("REDLIB_OIDC_SESSION_SECRET") {
-			Some(secret) => Sha256::digest(secret.as_bytes()).to_vec(),
+			Some(secret) => {
+				if enabled && secret.trim().len() < MIN_SESSION_SECRET_LEN {
+					problems.push(format!(
+						"REDLIB_OIDC_SESSION_SECRET is {} bytes; it must be at least {MIN_SESSION_SECRET_LEN}, e.g. `openssl rand -hex 32`",
+						secret.trim().len()
+					));
+				}
+				Sha256::digest(secret.as_bytes()).to_vec()
+			}
 			None if enabled => {
 				// A random per-process key still works, but every restart (and
 				// every replica) invalidates sessions, so say so loudly.

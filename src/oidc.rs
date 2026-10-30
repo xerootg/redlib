@@ -281,15 +281,29 @@ fn resolve_with(trusted: &[IpNet], peer: IpAddr, headers: &HeaderMap) -> Option<
 		return Some(peer);
 	}
 
-	let xff = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())?;
+	// Every header line counts, in order: a proxy may append a line of its
+	// own rather than extend the client's.
+	let lines = headers.get_all("x-forwarded-for").iter().map(|v| v.to_str().ok()).collect::<Option<Vec<_>>>()?;
 
-	xff
-		.split(',')
-		.map(str::trim)
-		.filter_map(|s| s.parse::<IpAddr>().ok())
-		.map(canonical)
-		.rev()
-		.find(|ip| !trusted.iter().any(|net| net.contains(ip)))
+	// Nearest hop first. The first entry that can't be read ends the walk with
+	// an unknown client: skipping it would let entries the client wrote
+	// further left decide.
+	for entry in lines.iter().flat_map(|line| line.split(',')).rev() {
+		let ip = canonical(parse_forwarded_ip(entry.trim())?);
+		if !trusted.iter().any(|net| net.contains(&ip)) {
+			return Some(ip);
+		}
+	}
+	None
+}
+
+/// One `X-Forwarded-For` entry: a bare IPv4 or IPv6 address, or an IPv6
+/// address in brackets. Ports and anything else are refused.
+fn parse_forwarded_ip(entry: &str) -> Option<IpAddr> {
+	match entry.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+		Some(v6) => v6.parse::<std::net::Ipv6Addr>().ok().map(IpAddr::V6),
+		None => entry.parse().ok(),
+	}
 }
 
 /// Normalises IPv4-mapped IPv6 addresses (`::ffff:10.0.0.1`) down to plain

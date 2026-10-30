@@ -513,6 +513,8 @@ mod tests {
 			("/user/spez/comments/abc/title.json", Kind::Comments),
 			("/user/spez/comments.json?sort=new", Kind::User),
 			("/user/spez/about.json?raw_json=1", Kind::User),
+			("/user/kjoneslol/m/sfwpornnetwork/hot.json?raw_json=1", Kind::Listing),
+			("/u/kjoneslol/m/sfwpornnetwork.json", Kind::Listing),
 			("/r/rust.json", Kind::Listing),
 			("/r/rust+linux/new.json", Kind::Listing),
 			("/.json?raw_json=1", Kind::Listing),

@@ -31,6 +31,10 @@ struct SubredditTemplate {
 	/// Whether all posts were hidden because they are NSFW (and user has disabled show NSFW)
 	all_posts_hidden_nsfw: bool,
 	no_posts: bool,
+	/// Path of the multireddit being shown (eg. /user/kjoneslol/m/sfwpornnetwork), empty for subreddits.
+	multi_root: String,
+	/// Owner of the multireddit being shown, empty for subreddits.
+	multi_owner: String,
 }
 
 #[derive(Template)]
@@ -154,6 +158,8 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			all_posts_filtered: false,
 			all_posts_hidden_nsfw: false,
 			no_posts: false,
+			multi_root: String::new(),
+			multi_owner: String::new(),
 		}))
 	} else {
 		match Post::fetch(&path, quarantined).await {
@@ -181,6 +187,8 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 					all_posts_filtered,
 					all_posts_hidden_nsfw,
 					no_posts,
+					multi_root: String::new(),
+					multi_owner: String::new(),
 				}))
 			}
 			Err(msg) => match msg.as_str() {
@@ -191,6 +199,11 @@ pub async fn community(req: Request<Body>) -> Result<Response<Body>, String> {
 			},
 		}
 	}
+}
+
+/// Builds the Reddit API path for a user's multireddit listing.
+fn multi_api_path(_name: &str, _multi: &str, _sort: &str, _query: &str) -> Result<String, String> {
+	Err("Invalid multireddit".to_string())
 }
 
 pub fn quarantine(req: &Request<Body>, sub: String, restriction: &str) -> Response<Body> {
@@ -663,6 +676,57 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn test_multi_api_path() {
+		assert_eq!(
+			multi_api_path("kjoneslol", "sfwpornnetwork", "hot", "").unwrap(),
+			"/user/kjoneslol/m/sfwpornnetwork/hot.json?&raw_json=1"
+		);
+		assert_eq!(
+			multi_api_path("kjoneslol", "sfwpornnetwork", "top", "t=week&after=t3_abc").unwrap(),
+			"/user/kjoneslol/m/sfwpornnetwork/top.json?t=week&after=t3_abc&raw_json=1"
+		);
+		for sort in ["hot", "new", "top", "rising", "controversial"] {
+			assert!(multi_api_path("a", "b", sort, "").is_ok(), "{sort} should be accepted");
+		}
+	}
+
+	#[test]
+	fn test_multi_api_path_rejects_bad_input() {
+		assert!(multi_api_path("a", "b", "bogus", "").is_err());
+		assert!(multi_api_path("a", "b", "hot/../x", "").is_err());
+		assert!(multi_api_path("a/b", "c", "hot", "").is_err());
+		assert!(multi_api_path("a", "b?c", "hot", "").is_err());
+		assert!(multi_api_path("", "b", "hot", "").is_err());
+	}
+
+	#[test]
+	fn test_multi_template_header() {
+		let html = SubredditTemplate {
+			sub: Subreddit {
+				title: "m/sfwpornnetwork".to_string(),
+				..Subreddit::default()
+			},
+			posts: Vec::new(),
+			sort: ("hot".to_string(), String::new()),
+			ends: (String::new(), String::new()),
+			prefs: Preferences::default(),
+			url: String::new(),
+			redirect_url: String::new(),
+			is_filtered: false,
+			all_posts_filtered: false,
+			all_posts_hidden_nsfw: false,
+			no_posts: false,
+			multi_root: "/user/kjoneslol/m/sfwpornnetwork".to_string(),
+			multi_owner: "kjoneslol".to_string(),
+		}
+		.render()
+		.unwrap();
+		assert!(html.contains("href=\"/user/kjoneslol/m/sfwpornnetwork/new\""), "sort links must stay inside the multi");
+		assert!(html.contains("u/kjoneslol"), "header must name the owner");
+		assert!(html.contains("sfwpornnetwork"), "header must name the multi");
+	}
 
 	#[test]
 	fn test_wiki_html() {

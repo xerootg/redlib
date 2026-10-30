@@ -172,6 +172,7 @@ Redlib won't start if OIDC is on and any of the issuer, client ID, client secret
 - Browsers without a session are sent to `/oidc/login`, and back to the page they asked for afterwards. Other clients (no `text/html` in `Accept`) get `401` with `{"error":"unauthorized","error_description":"Authentication required."}`.
 - `/oidc/login`, `/oidc/callback` and `/oidc/logout` are the only paths without a login. Health checks (`/healthz`, `/healthz/reddit`) and `/mcp` need one too, so point probes at the instance from an address in `REDLIB_AUTH_BYPASS_CIDRS`.
 - ID tokens must be signed with RS256, or with the asymmetric algorithm the provider's signing key declares in its JWKS `alg`, and must carry `iss`, `aud`, `exp` and `iat`. With more than one audience, `azp` must be the client ID.
+- Each request to the provider (discovery, signing keys, token exchange) gives up after 10 seconds, so a provider that is down fails the login with an error page instead of leaving it hanging.
 - `/oidc/logout` ends the session and then the provider's session, if the provider offers that.
 - The session and login cookies are `__Host-redlib_session` and `__Host-redlib_oidc_tx`. The `__Host-` prefix means browsers only keep them over HTTPS (or `http://localhost`), so serve the instance over HTTPS. The names used to be `redlib_session` and `redlib_oidc_tx`; upgrading from a version with those names logs everyone out once.
 - Sessions are signed cookies; Redlib stores nothing. They can't be revoked one by one: changing `REDLIB_OIDC_SESSION_SECRET` ends all of them.

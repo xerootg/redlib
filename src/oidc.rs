@@ -22,7 +22,7 @@
 
 use std::net::IpAddr;
 use std::sync::LazyLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -479,7 +479,11 @@ struct Discovery {
 static DISCOVERY: LazyLock<tokio::sync::RwLock<Option<Discovery>>> = LazyLock::new(|| tokio::sync::RwLock::new(None));
 static JWKS: LazyLock<tokio::sync::RwLock<Option<JwkSet>>> = LazyLock::new(|| tokio::sync::RwLock::new(None));
 
-static HTTP: LazyLock<wreq::Client> = LazyLock::new(|| wreq::Client::builder().build().expect("failed to build OIDC HTTP client"));
+/// Upper bound on each request to the provider, so one that is down or wedged
+/// fails the login instead of holding the handler open.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+static HTTP: LazyLock<wreq::Client> = LazyLock::new(|| wreq::Client::builder().timeout(HTTP_TIMEOUT).build().expect("failed to build OIDC HTTP client"));
 
 async fn discovery() -> Result<Discovery, String> {
 	if let Some(cached) = DISCOVERY.read().await.clone() {

@@ -676,11 +676,13 @@ pub async fn callback(req: Request<Body>) -> Result<Response<Body>, String> {
 	let params: Vec<(String, String)> = req.uri().query().and_then(|q| serde_urlencoded::from_str(q).ok()).unwrap_or_default();
 	let param = |key: &str| params.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
 
-	// The provider reports failures (e.g. the user hit "deny") in-band.
+	// The provider reports failures (e.g. the user hit "deny") in-band. Both
+	// values are attacker-controlled: they are logged with `{:?}` so they
+	// cannot inject log lines, and the page shows a fixed message so nobody
+	// can put words in this instance's mouth.
 	if let Some(err) = param("error") {
-		let description = param("error_description").unwrap_or_else(|| err.clone());
-		warn!("identity provider returned error {err}: {description}");
-		return Ok(error_page(StatusCode::FORBIDDEN, &description));
+		warn!("identity provider returned error {err:?}: {:?}", param("error_description"));
+		return Ok(error_page(StatusCode::FORBIDDEN, "The identity provider did not complete the sign-in."));
 	}
 
 	let (Some(code), Some(state)) = (param("code"), param("state")) else {

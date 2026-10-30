@@ -81,7 +81,10 @@ pub enum Kind {
 	Post,
 	/// A post page with its comments, "more comments" and comment permalinks.
 	Comments,
-	/// Posts of a subreddit, popular and the front page.
+	/// Posts of a subreddit, popular and the front page. Also a user's
+	/// gilded items, trophies and moderated subreddits: unlike the rest of a
+	/// profile, Reddit still serves those to the anonymous JSON API, and
+	/// GraphQL has no query for them, so they need the JSON-first order.
 	Listing,
 	/// r/all, which Reddit retired; JSON still serves it as `r/all+`.
 	All,
@@ -154,6 +157,7 @@ impl Kind {
 			["by_id", ..] => Self::Post,
 			["duplicates", ..] => Self::Duplicates,
 			["comments", _, ..] | [_, _, "comments", _, ..] => Self::Comments,
+			["user" | "u", _, "gilded" | "trophies" | "moderated_subreddits"] => Self::Listing,
 			["user" | "u", ..] => Self::User,
 			["search", ..] | ["subreddits" | "users", "search", ..] | ["r", _, "search", ..] => Self::Search,
 			["r", _, "wiki", ..] | ["wiki", ..] => Self::Wiki,
@@ -513,6 +517,9 @@ mod tests {
 			("/user/spez/comments/abc/title.json", Kind::Comments),
 			("/user/spez/comments.json?sort=new", Kind::User),
 			("/user/spez/about.json?raw_json=1", Kind::User),
+			("/user/spez/gilded.json?sort=new", Kind::Listing),
+			("/user/spez/trophies.json?raw_json=1", Kind::Listing),
+			("/user/spez/moderated_subreddits.json", Kind::Listing),
 			("/r/rust.json", Kind::Listing),
 			("/r/rust+linux/new.json", Kind::Listing),
 			("/.json?raw_json=1", Kind::Listing),

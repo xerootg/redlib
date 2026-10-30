@@ -450,7 +450,20 @@ fn listing_result(res: &Value, items: Vec<Value>) -> Value {
 /// Every path gets `raw_json=1`: without it Reddit HTML-escapes `&`, `<`, and
 /// `>` inside body text, which corrupts markdown and code blocks.
 async fn get(path: String, quarantine: bool) -> Result<Value, String> {
-	reddit_json(path, quarantine).await
+	reddit_json(path, quarantine).await.map_err(explain_blocked)
+}
+
+/// Appended when Reddit refuses an endpoint to logged-out callers.
+const BLOCKED_HINT: &str = " Reddit refuses this endpoint to callers without an account and this instance has no session for it, so retrying or changing the arguments will not help. Use a different tool, or tell the user it is unavailable.";
+
+/// The instructions tell the model to fix its arguments and retry after an
+/// error. For a block that is wasted effort, so say so.
+fn explain_blocked(error: String) -> String {
+	if crate::backends::is_blocked_error(&error) {
+		format!("{error}{BLOCKED_HINT}")
+	} else {
+		error
+	}
 }
 
 /// The listing path for a subreddit, a `+`-combined feed, or r/all.
@@ -1357,6 +1370,15 @@ mod tests {
 		assert_eq!(fetch.len(), MAX_LOOKUP_IDS);
 		assert_eq!(errors.len(), 5);
 		assert!(errors[0]["error"].as_str().unwrap().contains("at most"), "{}", errors[0]);
+	}
+
+	#[test]
+	fn blocked_errors_tell_the_model_not_to_retry() {
+		let blocked = "Reddit blocked this request (403 Forbidden): Reddit only serves this page to logged-in sessions. | /user/spez/trophies.json".to_string();
+		let out = explain_blocked(blocked.clone());
+		assert!(out.starts_with(&blocked));
+		assert!(out.contains("will not help"), "{out}");
+		assert_eq!(explain_blocked("private".to_string()), "private", "other errors pass through");
 	}
 
 	#[test]

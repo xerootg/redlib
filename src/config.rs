@@ -205,6 +205,24 @@ pub struct Config {
 
 	#[serde(rename = "REDLIB_ENDPOINTS_DUPLICATES")]
 	pub(crate) endpoints_duplicates: Option<String>,
+
+	// --- MCP server -------------------------------------------------------
+	/// Master switch for the Model Context Protocol endpoint at `/mcp`.
+	#[serde(rename = "REDLIB_MCP_ENABLED")]
+	pub(crate) mcp_enabled: Option<String>,
+
+	/// Bearer token accepted at any endpoint, for clients that cannot hold a
+	/// session cookie. Unset means no token is accepted at all.
+	///
+	/// A credential, so never serialized: `/info.json` serializes the config.
+	#[serde(rename = "REDLIB_MCP_TOKEN")]
+	#[serde(skip_serializing)]
+	pub(crate) mcp_token: Option<String>,
+
+	/// Comma-separated origins allowed to call `/mcp` from a browser context.
+	/// The instance's own origin is always allowed.
+	#[serde(rename = "REDLIB_MCP_ALLOWED_ORIGINS")]
+	pub(crate) mcp_allowed_origins: Option<String>,
 }
 
 impl Config {
@@ -299,6 +317,9 @@ impl Config {
 			endpoints_search: parse("REDLIB_ENDPOINTS_SEARCH"),
 			endpoints_wiki: parse("REDLIB_ENDPOINTS_WIKI"),
 			endpoints_duplicates: parse("REDLIB_ENDPOINTS_DUPLICATES"),
+			mcp_enabled: parse("REDLIB_MCP_ENABLED"),
+			mcp_token: parse("REDLIB_MCP_TOKEN"),
+			mcp_allowed_origins: parse("REDLIB_MCP_ALLOWED_ORIGINS"),
 		}
 	}
 }
@@ -357,6 +378,9 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_ENDPOINTS_SEARCH" => config.endpoints_search.clone(),
 		"REDLIB_ENDPOINTS_WIKI" => config.endpoints_wiki.clone(),
 		"REDLIB_ENDPOINTS_DUPLICATES" => config.endpoints_duplicates.clone(),
+		"REDLIB_MCP_ENABLED" => config.mcp_enabled.clone(),
+		"REDLIB_MCP_TOKEN" => config.mcp_token.clone(),
+		"REDLIB_MCP_ALLOWED_ORIGINS" => config.mcp_allowed_origins.clone(),
 		_ => None,
 	}
 }
@@ -409,6 +433,16 @@ mod tests {
 				assert_eq!(get_setting_from_config(key, &config).as_deref(), Some(expected), "{key} = {value}");
 			}
 		}
+	}
+
+	#[test]
+	fn test_mcp_token_is_not_serialized() {
+		// `/info.json` serializes the whole config; the token is a credential.
+		let config = parsed("REDLIB_MCP_TOKEN = \"s3cret\"\nREDLIB_MCP_ENABLED = true\n");
+		assert_eq!(get_setting_from_config("REDLIB_MCP_TOKEN", &config).as_deref(), Some("s3cret"));
+		let json = serde_json::to_string(&config).unwrap();
+		assert!(!json.contains("s3cret"), "{json}");
+		assert!(json.contains("REDLIB_MCP_ENABLED"), "{json}");
 	}
 
 	#[test]

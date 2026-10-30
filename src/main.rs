@@ -13,7 +13,7 @@ use redlib::body::Body;
 use redlib::client::{canonical_path, proxy, CLIENT};
 use redlib::server::{self, RequestExt};
 use redlib::utils::{error, get_source_url, redirect, ThemeAssets};
-use redlib::{config, duplicates, headers, instance_info, post, search, settings, subreddit, user};
+use redlib::{config, duplicates, headers, instance_info, oidc, post, search, settings, subreddit, user};
 
 use redlib::client::OAUTH_CLIENT;
 
@@ -229,6 +229,10 @@ async fn main() {
 	LazyLock::force(&instance_info::INSTANCE_INFO);
 	info!("Creating OAUTH client.");
 	LazyLock::force(&OAUTH_CLIENT);
+	// Refuses to start with OIDC on but half-configured, rather than letting
+	// the first request find out.
+	info!("Evaluating OIDC settings.");
+	LazyLock::force(&oidc::AUTH);
 
 	// Define default headers (added to all responses)
 	app.default_headers = headers! {
@@ -247,6 +251,12 @@ async fn main() {
 	app.at("/healthz").get(|_| resource("ok", "text/plain", false).boxed());
 	app.at("/healthz/reddit").get(|_| reddit_health().boxed());
 	app.at("/healthz/reddit.json").get(|_| reddit_badge().boxed());
+
+	// OIDC endpoints. These are exempt from the auth gate in `server::listen`,
+	// since gating them would make the login redirect loop forever.
+	app.at("/oidc/login").get(|r| oidc::login(r).boxed());
+	app.at("/oidc/callback").get(|r| oidc::callback(r).boxed());
+	app.at("/oidc/logout").get(|r| oidc::logout(r).boxed());
 
 	// Read static files
 	app.at("/style.css").get(|_| style().boxed());

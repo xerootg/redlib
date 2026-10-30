@@ -139,6 +139,7 @@ impl InstanceInfo {
 				["GraphQL feed requests", &effective(&self.config.gql_feed_requests, "2")],
 				["Full URL", &effective(&self.config.full_url, "none")],
 				["Remove default feeds", &effective(&self.config.default_remove_default_feeds, "off")],
+				["OIDC login", &effective(&self.config.oidc_enabled, "off")],
 			])
 			.with_header_row(["Settings"]),
 		);

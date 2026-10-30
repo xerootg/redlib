@@ -24,7 +24,7 @@ use std::{
 };
 use time::OffsetDateTime;
 
-use crate::{body::Body, config, dbg_msg};
+use crate::{body::Body, config, dbg_msg, oidc};
 
 const BANNED_USER_AGENTS: &[&str] = &[
 	"AI2Bot",
@@ -308,7 +308,10 @@ impl Server {
 		let router = std::sync::Arc::new(self.router);
 		let default_headers = self.default_headers;
 
-		let service = service_fn(move |req: Request<Incoming>| {
+		// Called once per request with the connection's real TCP peer, which,
+		// unlike any header, cannot be forged. It anchors the OIDC bypass
+		// allowlist -- see `oidc::resolve_client_ip`.
+		let service = move |req: Request<Incoming>, peer: std::net::IpAddr| {
 			let req = req.map(Body::new);
 			let req_headers = req.headers().clone();
 			let def_headers = default_headers.clone();
@@ -341,6 +344,15 @@ impl Server {
 			// Reddit permalinks end in a slash, so feed URLs are often written `/r/rust/top/.rss`
 			if path != "/.rss" && path.ends_with("/.rss") {
 				path.replace_range(path.len() - "/.rss".len().., ".rss");
+			}
+
+			// Enforce OIDC before anything else routes. Returns None when the
+			// request is allowed through -- because auth is off, the client is
+			// in a bypass CIDR, it already holds a valid session, or it is
+			// hitting the /oidc/ endpoints.
+			if let Some(mut res) = oidc::gate(peer, &path, &req_headers) {
+				res.headers_mut().extend(def_headers);
+				return async move { Ok(res) }.boxed();
 			}
 
 			// Replace HEAD with GET for routing
@@ -378,7 +390,7 @@ impl Server {
 				// If there was a routing error
 				Err(e) => new_boilerplate(def_headers, req_headers, 404, if is_head { Body::empty() } else { e.into() }).boxed(),
 			}
-		});
+		};
 
 		async move {
 			let listener = tokio::net::TcpListener::bind(address).await?;
@@ -391,14 +403,17 @@ impl Server {
 			loop {
 				tokio::select! {
 					conn = listener.accept() => {
-						let (stream, _) = match conn {
+						let (stream, remote) = match conn {
 							Ok(conn) => conn,
 							Err(e) => {
 								dbg_msg!(e);
 								continue;
 							}
 						};
-						let conn = builder.serve_connection_with_upgrades(TokioIo::new(stream), service.clone()).into_owned();
+						let handle = service.clone();
+						let peer = remote.ip();
+						let service = service_fn(move |req| handle(req, peer));
+						let conn = builder.serve_connection_with_upgrades(TokioIo::new(stream), service).into_owned();
 						let conn = graceful.watch(conn);
 						tokio::spawn(async move {
 							if let Err(e) = conn.await {

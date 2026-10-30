@@ -67,6 +67,16 @@ wreq = { version = "0.16", features = ["brotli", "gzip", "deflate", "zstd", "jso
 wreq-util = { version = "0.2" }
 scraper = { version = "0.29.0", default-features = false }
 clearurls = "0.0.4"
+# OIDC: RS256 ID-token verification against the provider's JWKS, and HS256
+# signing of our own stateless session/transaction cookies.
+jsonwebtoken = "9.3.1"
+# CIDR matching for the auth-bypass allowlist and the trusted-proxy list.
+ipnet = "2.12.2"
+# CSPRNG for PKCE verifiers, state, and nonces. `fastrand` is already a
+# dependency but is not cryptographically secure, so it must not be used here.
+getrandom = "0.2.17"
+# PKCE S256 challenges and session-key derivation.
+sha2 = "0.10.9"
 obscura = { git = "https://github.com/h4ckf0r0day/obscura", rev = "3285fbc2357a60aa3a8dcce9fda95a155099fc42", features = ["stealth"], optional = true }
 
 [features]

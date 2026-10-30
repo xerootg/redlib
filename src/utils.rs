@@ -187,6 +187,8 @@ pub struct Media {
 	pub poster: String,
 	pub download_name: String,
 	pub needs_hls_for_audio: bool,
+	/// True when the download link is a video-only file although the video has sound (see `needs_hls_for_audio`)
+	pub download_silent: bool,
 }
 
 impl Media {
@@ -295,6 +297,7 @@ impl Media {
 				poster: format_url(source["url"].as_str().unwrap_or_default()),
 				download_name,
 				needs_hls_for_audio,
+				download_silent: false,
 			},
 			gallery,
 		)
@@ -444,6 +447,7 @@ impl Post {
 					poster: String::new(),
 					download_name: String::new(),
 					needs_hls_for_audio: false,
+					download_silent: false,
 				},
 				media,
 				domain: val(post, "domain"),
@@ -995,6 +999,7 @@ pub async fn parse_post(post: &Value) -> Post {
 			poster: String::new(),
 			download_name: String::new(),
 			needs_hls_for_audio: false,
+			download_silent: false,
 		},
 		flair: Flair {
 			flair_parts: FlairPart::parse(
@@ -2123,6 +2128,33 @@ mod tests {
 		assert!(Media::parse(&video(json!(true))).await.1.needs_hls_for_audio);
 		assert!(Media::parse(&video(Value::Null)).await.1.needs_hls_for_audio);
 		assert!(!Media::parse(&video(json!(false))).await.1.needs_hls_for_audio);
+	}
+
+	#[tokio::test]
+	async fn test_download_silent() {
+		let video = |url: &str, hls: &str, has_audio: Value| {
+			json!({
+				"permalink": "/r/test/comments/abc/test/",
+				"secure_media": { "reddit_video": {
+					"fallback_url": url,
+					"hls_url": hls,
+					"has_audio": has_audio,
+				} },
+			})
+		};
+		let silent = |post: Value| async move { Media::parse(&post).await.1.download_silent };
+		let hls = "https://v.redd.it/abc/HLSPlaylist.m3u8";
+		let cmaf = "https://v.redd.it/abc/CMAF_720.mp4?source=fallback";
+
+		// The download is the video-only rendition although the video has sound
+		assert!(silent(video(cmaf, hls, json!(true))).await);
+		assert!(silent(video(cmaf, hls, Value::Null)).await);
+		// With no HLS to enable, the download is still video-only
+		assert!(silent(video(cmaf, "", json!(true))).await);
+		// A video without sound has nothing to warn about
+		assert!(!silent(video(cmaf, hls, json!(false))).await);
+		// The muxed MP4 of packaged media has sound
+		assert!(!silent(video("https://packaged-media.redd.it/abc/muxed.mp4?e=1", hls, json!(true))).await);
 	}
 
 	#[test]

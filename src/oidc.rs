@@ -1732,11 +1732,19 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 		("REDLIB_MCP_TOKEN", "correct-horse-battery-staple"),
 	])]
-	fn gate_accepts_the_bearer_token_on_any_path() {
-		for path in ["/mcp", "/r/rust", "/"] {
-			assert!(gate(ip(OUTSIDE), path, &bearer("Bearer correct-horse-battery-staple")).is_none(), "{path}");
+	fn gate_accepts_the_bearer_token_only_on_mcp() {
+		// The scheme is case-insensitive (RFC 9110 11.1).
+		for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+			let value = format!("{scheme} correct-horse-battery-staple");
+			assert!(gate(ip(OUTSIDE), "/mcp", &bearer(&value)).is_none(), "{scheme}");
 		}
-		assert!(gate(ip(OUTSIDE), "/mcp", &bearer("bearer correct-horse-battery-staple")).is_none());
+
+		// The token is for the MCP endpoint. A leaked one must not open the
+		// rest of the instance.
+		for path in ["/", "/r/rust", "/info.json", "/mcp/other", "/mcpx"] {
+			let res = gate(ip(OUTSIDE), path, &bearer("Bearer correct-horse-battery-staple")).unwrap_or_else(|| panic!("{path} must be gated"));
+			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
+		}
 	}
 
 	#[test]

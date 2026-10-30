@@ -39,7 +39,9 @@ use crate::config;
 
 /// Everything under this prefix is served by us and must never be gated,
 /// otherwise the login redirect would loop forever.
-pub const OIDC_PREFIX: &str = "/oidc/";
+/// Paths the gate never blocks. `/healthz` answers "ok" without touching
+/// Reddit or any state; `/healthz/reddit` stays gated.
+const UNGATED_PATHS: [&str; 4] = ["/oidc/login", "/oidc/callback", "/oidc/logout", "/healthz"];
 
 /// The only path `REDLIB_MCP_TOKEN` opens.
 const MCP_PATH: &str = "/mcp";
@@ -881,17 +883,21 @@ pub async fn logout(_req: Request<Body>) -> Result<Response<Body>, String> {
 /// Returns `None` to allow the request through, or `Some(response)` to
 /// short-circuit it (a redirect to login for browsers, a 401 otherwise).
 ///
-/// Only `/oidc/` is exempt. Health checks, static files and `/mcp` are gated
-/// like everything else; probes are expected to come from a bypass CIDR, and
-/// MCP clients present `REDLIB_MCP_TOKEN` as a bearer token, which opens
-/// `/mcp` and nothing else.
+/// Only the login endpoints and `/healthz` are exempt (`UNGATED_PATHS`).
+/// Static files, `/healthz/reddit` and `/mcp` are gated like everything
+/// else; MCP clients present `REDLIB_MCP_TOKEN` as a bearer token, which
+/// opens `/mcp` and nothing else.
 pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Body>> {
 	if !AUTH.enabled {
 		return None;
 	}
 
-	// Our own endpoints must stay reachable or login could never complete.
-	if path.starts_with(OIDC_PREFIX) {
+	// The login endpoints must stay reachable or login could never complete,
+	// and kubelet probes /healthz from the pod-network bridge, which is a
+	// trusted-proxy address without X-Forwarded-For and so gets no bypass.
+	// Exact matches only: a prefix would hand every other /oidc/... path,
+	// and whatever request handling sits behind it, to anonymous clients.
+	if UNGATED_PATHS.contains(&path) {
 		return None;
 	}
 

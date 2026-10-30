@@ -1,8 +1,8 @@
 #![allow(clippy::cmp_owned)]
 use crate::body::Body;
 use crate::utils::{
-	build_rss_items, enable_rss, error, filter_posts, format_url, get_filters, nsfw_landing, param, rss_page_link, rss_response, setting, should_be_nsfw_gated, template, Post,
-	Preferences, User, RSS_USER_LISTINGS,
+	build_rss_items, enable_rss, error, filter_posts, format_url, get_filters, is_account_only_user_listing, nsfw_landing, param, rss_page_link, rss_response, setting,
+	should_be_nsfw_gated, template, Post, Preferences, User, ACCOUNT_ONLY_MSG, RSS_USER_LISTINGS,
 };
 use crate::{backends::json, server::RequestExt};
 use askama::Template;
@@ -36,6 +36,11 @@ struct UserTemplate {
 // FUNCTIONS
 pub async fn profile(req: Request<Body>) -> Result<Response<Body>, String> {
 	let listing = req.param("listing").unwrap_or_else(|| "overview".to_string());
+
+	// Saved, upvoted, etc. only exist for the logged-in owner, which anonymous Redlib never is
+	if is_account_only_user_listing(&listing) {
+		return error(req, ACCOUNT_ONLY_MSG).await;
+	}
 
 	// Build the Reddit JSON API path
 	let path = format!(

@@ -667,6 +667,48 @@ mod account_only_tests {
 		}
 	}
 
+	/// Reddit also strips `.api`, `.json-html`, `.json-compact` and `.json/`
+	/// from the name of a subreddit or user, so `/r/mod.api` is `/r/mod`.
+	const EXTENDED_NAMES: [&str; 11] = [
+		"/r/mod.api?/hot.json?&raw_json=1",
+		"/r/friends.api?/hot.json?&raw_json=1",
+		"/r/mod.json-html?/hot.json?&raw_json=1",
+		"/r/mod.json-compact?/hot.json?&raw_json=1",
+		"/r/MOD.api?/hot.json?&raw_json=1",
+		"/r/mod%2Eapi?/hot.json?&raw_json=1",
+		"/r/mod%2ejson-html?/hot.json?&raw_json=1",
+		"/r/mod.json/?/hot.json?&raw_json=1",
+		"/r/rust+mod.api?/hot.json?&raw_json=1",
+		"/user/me.api/about.json",
+		"/user/me.json-html/about.json",
+	];
+
+	#[test]
+	fn test_extended_names_are_account_only() {
+		for path in EXTENDED_NAMES {
+			assert!(is_account_only(path), "{path:?}");
+			assert!(session_refuses(path), "{path:?}");
+		}
+		for path in ["/r/rust.api/hot.json", "/user/spez.api/about.json", "/r/modern/hot.json"] {
+			assert!(!is_account_only(path), "{path:?}");
+		}
+	}
+
+	#[test]
+	fn test_session_backends_refuse_extended_names() {
+		crate::client::block_on_shared(async {
+			for path in EXTENDED_NAMES {
+				let result = cookied_json::CookiedJson.fetch(path, false).await;
+				assert!(matches!(result, Err(Failure::Unsupported)), "{path:?}: {result:?}");
+				assert_eq!(
+					fetch(path.to_string(), false).await.map(|(_, backend)| backend),
+					Err(ACCOUNT_ONLY_ERROR.to_string()),
+					"{path:?}"
+				);
+			}
+		});
+	}
+
 	#[test]
 	fn test_encoded_queries_are_not_account_only() {
 		for path in [

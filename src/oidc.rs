@@ -28,7 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use hyper::{HeaderMap, Request, Response, StatusCode};
+use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use ipnet::IpNet;
 use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
@@ -47,6 +47,11 @@ const UNGATED_PATHS: [&str; 4] = ["/oidc/login", "/oidc/callback", "/oidc/logout
 
 /// The only path `REDLIB_MCP_TOKEN` opens.
 const MCP_PATH: &str = "/mcp";
+
+/// Paths `REDLIB_READ_TOKEN` never opens, together with everything under
+/// them: `/settings/restore` and `/settings/update` change preferences on a
+/// GET, `/mcp` has its own token, and `/oidc` belongs to the login flow.
+const READ_TOKEN_EXCLUDED: [&str; 3] = ["/settings", MCP_PATH, "/oidc"];
 
 // `__Host-` makes browsers accept these only with Secure, Path=/ and no
 // Domain, so another host under the same parent domain cannot set or shadow
@@ -409,11 +414,12 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 		})
 }
 
-/// Whether the request carries the configured API bearer token.
+/// Whether the request carries the bearer token configured under `key`.
 ///
 /// Session cookies are unusable by headless clients such as an MCP client, so
-/// a long random token stands in for them. The gate only consults this for
-/// [`MCP_PATH`]. Returns false whenever no token is
+/// a long random token stands in for them. The gate consults
+/// `REDLIB_MCP_TOKEN` for [`MCP_PATH`] only and `REDLIB_READ_TOKEN` only where
+/// [`read_token_applies`] says so. Returns false whenever no token is
 /// configured, so an unset value can never authorise anything.
 ///
 /// The comparison hashes both sides first. A plain `==` on the raw strings
@@ -421,8 +427,8 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 /// matching prefix and lets an attacker recover the token byte by byte.
 /// Comparing digests makes the timing independent of how much of the token was
 /// correct.
-fn bearer_token_valid(headers: &HeaderMap) -> bool {
-	let Some(expected) = setting("REDLIB_MCP_TOKEN") else {
+fn bearer_token_valid(headers: &HeaderMap, key: &str) -> bool {
+	let Some(expected) = setting(key) else {
 		return false;
 	};
 
@@ -441,6 +447,24 @@ fn bearer_token_valid(headers: &HeaderMap) -> bool {
 	};
 
 	Sha256::digest(presented.as_bytes()) == Sha256::digest(expected.as_bytes())
+}
+
+/// Whether `REDLIB_READ_TOKEN` may open this request: GET or HEAD only, so it
+/// can never submit a form, and nowhere in [`READ_TOKEN_EXCLUDED`]. The prefix
+/// match ignores case, so a differently cased path cannot slip past it.
+fn read_token_applies(method: &Method, path: &str) -> bool {
+	if !matches!(*method, Method::GET | Method::HEAD) {
+		return false;
+	}
+	!READ_TOKEN_EXCLUDED.iter().any(|excluded| is_at_or_under(path, excluded))
+}
+
+/// Whether `path` is `prefix` or lies under it, ignoring ASCII case.
+fn is_at_or_under(path: &str, prefix: &str) -> bool {
+	let Some(head) = path.get(..prefix.len()) else {
+		return false;
+	};
+	head.eq_ignore_ascii_case(prefix) && matches!(path.as_bytes().get(prefix.len()), None | Some(b'/'))
 }
 
 /// Reads and validates the session cookie, if present and well-formed.
@@ -888,8 +912,13 @@ pub async fn logout(_req: Request<Body>) -> Result<Response<Body>, String> {
 /// Only the login endpoints and `/healthz` are exempt (`UNGATED_PATHS`).
 /// Static files, `/healthz/reddit` and `/mcp` are gated like everything
 /// else; MCP clients present `REDLIB_MCP_TOKEN` as a bearer token, which
-/// opens `/mcp` and nothing else.
-pub fn gate(peer: IpAddr, path: &str, query: Option<&str>, headers: &HeaderMap) -> Option<Response<Body>> {
+/// opens `/mcp` and nothing else. Read-only services present
+/// `REDLIB_READ_TOKEN`, which opens GET and HEAD requests outside
+/// [`READ_TOKEN_EXCLUDED`].
+///
+/// `method` is the request's original method, before the server maps HEAD
+/// to GET for routing.
+pub fn gate(peer: IpAddr, method: &Method, path: &str, query: Option<&str>, headers: &HeaderMap) -> Option<Response<Body>> {
 	if !AUTH.enabled {
 		return None;
 	}
@@ -914,8 +943,15 @@ pub fn gate(peer: IpAddr, path: &str, query: Option<&str>, headers: &HeaderMap) 
 	// actually present. Only for `/mcp`: a token handed to an MCP client must
 	// not open the rest of the instance. `path` has already been normalised
 	// by the server (no doubled or trailing slashes).
-	if path == MCP_PATH && bearer_token_valid(headers) {
+	if path == MCP_PATH && bearer_token_valid(headers, "REDLIB_MCP_TOKEN") {
 		note_pass("bearer", client, peer);
+		return None;
+	}
+
+	// For services that only read pages. Never for a method that can submit
+	// a form, never for settings, and never for /mcp or /oidc.
+	if read_token_applies(method, path) && bearer_token_valid(headers, "REDLIB_READ_TOKEN") {
+		note_pass("read-token", client, peer);
 		return None;
 	}
 
@@ -1121,7 +1157,7 @@ mod login_query_tests {
 
 	/// The `Location` the gate answers an anonymous browser with.
 	fn login_location(path: &str, query: Option<&str>) -> String {
-		let res = gate("203.0.113.9".parse().unwrap(), path, query, &browser()).expect("must be gated");
+		let res = gate("203.0.113.9".parse().unwrap(), &Method::GET, path, query, &browser()).expect("must be gated");
 		res.headers().get("location").unwrap().to_str().unwrap().to_string()
 	}
 
@@ -1214,7 +1250,7 @@ mod login_query_tests {
 		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn programmatic_clients_still_get_a_401_with_a_query() {
-		let res = gate("203.0.113.9".parse().unwrap(), "/search", Some("q=x"), &HeaderMap::new()).expect("must be gated");
+		let res = gate("203.0.113.9".parse().unwrap(), &Method::GET, "/search", Some("q=x"), &HeaderMap::new()).expect("must be gated");
 		assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 	}
 }
@@ -1353,7 +1389,13 @@ mod gate_log_tests {
 	fn a_denial_is_logged_at_info_with_the_resolved_client_ip() {
 		capture_info_logs();
 
-		let res = gate(ip("10.42.0.7"), "/r/rust", Some("token=hunter2"), &headers(&[("x-forwarded-for", "203.0.113.9")]));
+		let res = gate(
+			ip("10.42.0.7"),
+			&Method::GET,
+			"/r/rust",
+			Some("token=hunter2"),
+			&headers(&[("x-forwarded-for", "203.0.113.9")]),
+		);
 		assert!(res.is_some());
 
 		let lines = logged();
@@ -1379,14 +1421,14 @@ mod gate_log_tests {
 
 		// One client trying paths: one line, whatever it asks for.
 		for n in 0..500 {
-			assert!(gate(ip("203.0.113.9"), &format!("/oidc/x{n}"), None, &HeaderMap::new()).is_some());
+			assert!(gate(ip("203.0.113.9"), &Method::GET, &format!("/oidc/x{n}"), None, &HeaderMap::new()).is_some());
 		}
 		let lines = logged();
 		assert_eq!(lines.len(), 1, "{} lines", lines.len());
 		assert!(lines[0].contains("203.0.113.9"), "{lines:?}");
 
 		// Another client is a separate story and still gets its line.
-		assert!(gate(ip("203.0.113.10"), "/", None, &HeaderMap::new()).is_some());
+		assert!(gate(ip("203.0.113.10"), &Method::GET, "/", None, &HeaderMap::new()).is_some());
 		let lines = logged();
 		assert_eq!(lines.len(), 1, "{lines:?}");
 		assert!(lines[0].contains("203.0.113.10"), "{lines:?}");
@@ -1404,7 +1446,7 @@ mod gate_log_tests {
 	fn a_logged_path_cannot_forge_log_lines() {
 		capture_info_logs();
 
-		assert!(gate(ip("203.0.113.9"), "/x\n2026-01-01 INFO oidc: forged\r", None, &HeaderMap::new()).is_some());
+		assert!(gate(ip("203.0.113.9"), &Method::GET, "/x\n2026-01-01 INFO oidc: forged\r", None, &HeaderMap::new()).is_some());
 		let lines = logged();
 		assert_eq!(lines.len(), 1, "{lines:?}");
 		assert!(!lines[0].contains('\n') && !lines[0].contains('\r'), "{lines:?}");
@@ -1424,13 +1466,13 @@ mod gate_log_tests {
 		capture_info_logs();
 
 		for _ in 0..20 {
-			assert!(gate(ip("192.168.1.20"), "/", None, &HeaderMap::new()).is_none());
+			assert!(gate(ip("192.168.1.20"), &Method::GET, "/", None, &HeaderMap::new()).is_none());
 		}
 		let lines = logged();
 		assert_eq!(lines.len(), 1, "{lines:?}");
 		assert!(lines[0].contains("bypass") && lines[0].contains("192.168.1.20"), "{lines:?}");
 
-		assert!(gate(ip("192.168.1.21"), "/", None, &HeaderMap::new()).is_none());
+		assert!(gate(ip("192.168.1.21"), &Method::GET, "/", None, &HeaderMap::new()).is_none());
 		let lines = logged();
 		assert_eq!(lines.len(), 1, "{lines:?}");
 		assert!(lines[0].contains("192.168.1.21"), "{lines:?}");
@@ -1451,7 +1493,7 @@ mod gate_log_tests {
 
 		let bearer = headers(&[("authorization", "Bearer correct-horse-battery-staple")]);
 		for _ in 0..20 {
-			assert!(gate(ip("203.0.113.9"), "/mcp", None, &bearer).is_none());
+			assert!(gate(ip("203.0.113.9"), &Method::GET, "/mcp", None, &bearer).is_none());
 		}
 		let lines = logged();
 		assert_eq!(lines.len(), 1, "{lines:?}");
@@ -1474,7 +1516,7 @@ mod gate_log_tests {
 		// The probe and the login endpoints are open by design, and a signed-in
 		// user is not news.
 		for path in ["/healthz", "/oidc/login", "/oidc/callback"] {
-			assert!(gate(ip("203.0.113.9"), path, None, &HeaderMap::new()).is_none());
+			assert!(gate(ip("203.0.113.9"), &Method::GET, path, None, &HeaderMap::new()).is_none());
 		}
 		let token = sign(&Session {
 			sub: "user-1".into(),
@@ -1486,7 +1528,7 @@ mod gate_log_tests {
 		})
 		.unwrap();
 		let cookie = headers(&[("cookie", &format!("{SESSION_COOKIE}={token}"))]);
-		assert!(gate(ip("203.0.113.9"), "/", None, &cookie).is_none());
+		assert!(gate(ip("203.0.113.9"), &Method::GET, "/", None, &cookie).is_none());
 		assert_eq!(logged(), Vec::<String>::new());
 	}
 }
@@ -1555,13 +1597,13 @@ mod gate_log_flood_tests {
 		// A single /64 hands out 2^64 addresses; they are one subscriber.
 		for n in 0..1100u32 {
 			let client = ip(&format!("2001:db8::{n:x}"));
-			assert!(gate(client, "/secret-probe", None, &HeaderMap::new()).is_some());
+			assert!(gate(client, &Method::GET, "/secret-probe", None, &HeaderMap::new()).is_some());
 		}
 		let lines = logged();
 		assert_eq!(lines.len(), 1, "{} lines", lines.len());
 
 		// The next /64 is somebody else.
-		assert!(gate(ip("2001:db8:0:1::1"), "/", None, &HeaderMap::new()).is_some());
+		assert!(gate(ip("2001:db8:0:1::1"), &Method::GET, "/", None, &HeaderMap::new()).is_some());
 		assert_eq!(logged().len(), 1);
 	}
 
@@ -1580,7 +1622,7 @@ mod gate_log_flood_tests {
 		// Fill the table with distinct clients; each gets its own line.
 		let mut itemised = 0;
 		for n in 0..1024 {
-			assert!(gate(v4_client(n), "/filler", None, &HeaderMap::new()).is_some());
+			assert!(gate(v4_client(n), &Method::GET, "/filler", None, &HeaderMap::new()).is_some());
 			itemised += logged().len();
 		}
 		assert_eq!(itemised, 1024);
@@ -1588,7 +1630,7 @@ mod gate_log_flood_tests {
 		// Now a fresh client probes. It cannot get a line of its own, but the
 		// denials must not vanish: a summary line has to say they happened.
 		for n in 0..50 {
-			assert!(gate(v4_client(5000 + n), "/secret-probe", None, &HeaderMap::new()).is_some());
+			assert!(gate(v4_client(5000 + n), &Method::GET, "/secret-probe", None, &HeaderMap::new()).is_some());
 		}
 		let lines = logged();
 		assert_eq!(lines.len(), 1, "one summary line per interval, got {lines:?}");
@@ -1610,13 +1652,13 @@ mod gate_log_flood_tests {
 
 		let mut itemised = 0;
 		for n in 0..1024 {
-			assert!(gate(v4_client(n), "/", None, &HeaderMap::new()).is_none());
+			assert!(gate(v4_client(n), &Method::GET, "/", None, &HeaderMap::new()).is_none());
 			itemised += logged().len();
 		}
 		assert_eq!(itemised, 1024);
 
 		for n in 0..50 {
-			assert!(gate(v4_client(5000 + n), "/", None, &HeaderMap::new()).is_none());
+			assert!(gate(v4_client(5000 + n), &Method::GET, "/", None, &HeaderMap::new()).is_none());
 		}
 		let lines = logged();
 		assert_eq!(lines.len(), 1, "{lines:?}");
@@ -2188,7 +2230,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 	#[test]
 	#[sealed_test]
 	fn gate_is_open_when_disabled() {
-		assert!(gate(ip(OUTSIDE), "/", None, &headers(&[BROWSER])).is_none());
+		assert!(gate(ip(OUTSIDE), &Method::GET, "/", None, &headers(&[BROWSER])).is_none());
 	}
 
 	#[test]
@@ -2201,7 +2243,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_redirects_browsers_to_login() {
-		let res = gate(ip(OUTSIDE), "/r/rust/comments/abc", None, &headers(&[BROWSER])).expect("must be gated");
+		let res = gate(ip(OUTSIDE), &Method::GET, "/r/rust/comments/abc", None, &headers(&[BROWSER])).expect("must be gated");
 		assert_eq!(res.status(), StatusCode::FOUND);
 		assert_eq!(location(&res), "/oidc/login?redirect=%2Fr%2Frust%2Fcomments%2Fabc");
 	}
@@ -2216,7 +2258,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_answers_programmatic_clients_with_401_json() {
-		let res = gate(ip(OUTSIDE), "/r/rust", None, &headers(&[("accept", "application/json")])).expect("must be gated");
+		let res = gate(ip(OUTSIDE), &Method::GET, "/r/rust", None, &headers(&[("accept", "application/json")])).expect("must be gated");
 		assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 		assert_eq!(res.headers()["www-authenticate"], "Bearer realm=\"https://idp.example/application/o/redlib\"");
 		assert_eq!(res.headers()["content-type"], "application/json");
@@ -2238,7 +2280,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		// bridge address: a trusted-proxy address that sends no
 		// X-Forwarded-For, so it gets no bypass.
 		for path in ["/oidc/login", "/oidc/callback", "/oidc/logout", "/healthz"] {
-			assert!(gate(ip(OUTSIDE), path, None, &headers(&[BROWSER])).is_none(), "{path}");
+			assert!(gate(ip(OUTSIDE), &Method::GET, path, None, &headers(&[BROWSER])).is_none(), "{path}");
 		}
 	}
 
@@ -2270,7 +2312,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 			"/oidc/loginx",
 			"/healthzx",
 		] {
-			let res = gate(ip(OUTSIDE), path, None, &HeaderMap::new()).unwrap_or_else(|| panic!("{path} must be gated"));
+			let res = gate(ip(OUTSIDE), &Method::GET, path, None, &HeaderMap::new()).unwrap_or_else(|| panic!("{path} must be gated"));
 			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
 		}
 	}
@@ -2287,14 +2329,14 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		("REDLIB_TRUSTED_PROXIES", "10.42.0.0/16"),
 	])]
 	fn gate_lets_bypass_addresses_through() {
-		assert!(gate(ip("192.168.1.20"), "/", None, &headers(&[BROWSER])).is_none());
+		assert!(gate(ip("192.168.1.20"), &Method::GET, "/", None, &headers(&[BROWSER])).is_none());
 		// Dual-stack sockets report IPv4 clients as mapped IPv6.
-		assert!(gate(ip("::ffff:127.0.0.1"), "/", None, &headers(&[BROWSER])).is_none());
+		assert!(gate(ip("::ffff:127.0.0.1"), &Method::GET, "/", None, &headers(&[BROWSER])).is_none());
 		// Through the trusted proxy, the forwarded address decides.
-		assert!(gate(ip("10.42.0.7"), "/", None, &xff("192.168.1.20")).is_none());
-		assert!(gate(ip("10.42.0.7"), "/", None, &xff(OUTSIDE)).is_some());
+		assert!(gate(ip("10.42.0.7"), &Method::GET, "/", None, &xff("192.168.1.20")).is_none());
+		assert!(gate(ip("10.42.0.7"), &Method::GET, "/", None, &xff(OUTSIDE)).is_some());
 		// The proxy itself is not a bypass address.
-		assert!(gate(ip("10.42.0.7"), "/", None, &HeaderMap::new()).is_some());
+		assert!(gate(ip("10.42.0.7"), &Method::GET, "/", None, &HeaderMap::new()).is_some());
 	}
 
 	#[test]
@@ -2308,7 +2350,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		("REDLIB_AUTH_BYPASS_CIDRS", "192.168.0.0/16"),
 	])]
 	fn gate_ignores_forged_forwarded_for_without_trusted_proxies() {
-		let res = gate(ip(OUTSIDE), "/", None, &xff("192.168.1.20"));
+		let res = gate(ip(OUTSIDE), &Method::GET, "/", None, &xff("192.168.1.20"));
 		assert_eq!(res.expect("forged XFF must not bypass").status(), StatusCode::UNAUTHORIZED);
 	}
 
@@ -2334,17 +2376,17 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 			("only trusted hops, several", xff("10.42.0.3, 10.42.0.4")),
 			("nothing parseable", xff("unknown")),
 		] {
-			let res = gate(proxy, "/", None, &h).unwrap_or_else(|| panic!("{label}: must not bypass"));
+			let res = gate(proxy, &Method::GET, "/", None, &h).unwrap_or_else(|| panic!("{label}: must not bypass"));
 			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{label}");
 		}
 
 		// A forwarded bypass address still gets through the proxy.
-		assert!(gate(proxy, "/", None, &xff("192.168.1.20")).is_none());
+		assert!(gate(proxy, &Method::GET, "/", None, &xff("192.168.1.20")).is_none());
 		// A peer that is not a proxy is the client, e.g. a kubelet probe from a node.
-		assert!(gate(ip("192.168.1.20"), "/", None, &HeaderMap::new()).is_none());
+		assert!(gate(ip("192.168.1.20"), &Method::GET, "/", None, &HeaderMap::new()).is_none());
 		// An unknown client can still log in.
 		let token = sign(&session(now() + 3600)).unwrap();
-		assert!(gate(proxy, "/", None, &session_cookie(&token)).is_none());
+		assert!(gate(proxy, &Method::GET, "/", None, &session_cookie(&token)).is_none());
 	}
 
 	fn session(exp: u64) -> Session {
@@ -2373,7 +2415,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 	])]
 	fn gate_accepts_a_valid_session_cookie() {
 		let token = sign(&session(now() + 3600)).unwrap();
-		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&token)).is_none());
+		assert!(gate(ip(OUTSIDE), &Method::GET, "/", None, &session_cookie(&token)).is_none());
 		assert_eq!(session_from(&session_cookie(&token)).unwrap().sub, "user-1");
 	}
 
@@ -2389,7 +2431,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 	fn gate_rejects_expired_tampered_and_foreign_sessions() {
 		// Expired beyond jsonwebtoken's default 60 s leeway.
 		let expired = sign(&session(now() - 3600)).unwrap();
-		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&expired)).is_some(), "expired");
+		assert!(gate(ip(OUTSIDE), &Method::GET, "/", None, &session_cookie(&expired)).is_some(), "expired");
 
 		// Payload swapped under an existing signature.
 		let valid = sign(&session(now() + 3600)).unwrap();
@@ -2402,16 +2444,19 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 			.unwrap(),
 		);
 		parts[1] = &forged_claims;
-		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&parts.join("."))).is_some(), "tampered");
+		assert!(gate(ip(OUTSIDE), &Method::GET, "/", None, &session_cookie(&parts.join("."))).is_some(), "tampered");
 
 		// Signed with a different key.
 		let foreign = encode(&Header::new(Algorithm::HS256), &session(now() + 3600), &EncodingKey::from_secret(b"other")).unwrap();
-		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&foreign)).is_some(), "foreign key");
+		assert!(gate(ip(OUTSIDE), &Method::GET, "/", None, &session_cookie(&foreign)).is_some(), "foreign key");
 
 		// `alg: none` must never be accepted.
 		let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
 		let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&session(now() + 3600)).unwrap());
-		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&format!("{header}.{claims}."))).is_some(), "alg none");
+		assert!(
+			gate(ip(OUTSIDE), &Method::GET, "/", None, &session_cookie(&format!("{header}.{claims}."))).is_some(),
+			"alg none"
+		);
 	}
 
 	#[test]
@@ -2433,7 +2478,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 			exp: now() + TX_TTL,
 		})
 		.unwrap();
-		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&tx)).is_some());
+		assert!(gate(ip(OUTSIDE), &Method::GET, "/", None, &session_cookie(&tx)).is_some());
 	}
 
 	#[test]
@@ -2446,7 +2491,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 	])]
 	fn sessions_still_work_with_an_ephemeral_key() {
 		let token = sign(&session(now() + 3600)).unwrap();
-		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&token)).is_none());
+		assert!(gate(ip(OUTSIDE), &Method::GET, "/", None, &session_cookie(&token)).is_none());
 	}
 
 	fn bearer(value: &str) -> HeaderMap {
@@ -2467,13 +2512,13 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		// The scheme is case-insensitive (RFC 9110 11.1).
 		for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
 			let value = format!("{scheme} correct-horse-battery-staple");
-			assert!(gate(ip(OUTSIDE), "/mcp", None, &bearer(&value)).is_none(), "{scheme}");
+			assert!(gate(ip(OUTSIDE), &Method::GET, "/mcp", None, &bearer(&value)).is_none(), "{scheme}");
 		}
 
 		// The token is for the MCP endpoint. A leaked one must not open the
 		// rest of the instance.
 		for path in ["/", "/r/rust", "/info.json", "/mcp/other", "/mcpx"] {
-			let res = gate(ip(OUTSIDE), path, None, &bearer("Bearer correct-horse-battery-staple")).unwrap_or_else(|| panic!("{path} must be gated"));
+			let res = gate(ip(OUTSIDE), &Method::GET, path, None, &bearer("Bearer correct-horse-battery-staple")).unwrap_or_else(|| panic!("{path} must be gated"));
 			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
 		}
 	}
@@ -2496,7 +2541,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 			"Basic correct-horse-battery-staple",
 			"correct-horse-battery-staple",
 		] {
-			let res = gate(ip(OUTSIDE), "/mcp", None, &bearer(value)).unwrap_or_else(|| panic!("{value:?} must not pass"));
+			let res = gate(ip(OUTSIDE), &Method::GET, "/mcp", None, &bearer(value)).unwrap_or_else(|| panic!("{value:?} must not pass"));
 			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{value:?}");
 		}
 	}
@@ -2513,7 +2558,181 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 	])]
 	fn an_unset_or_blank_token_authorises_nothing() {
 		for value in ["Bearer ", "Bearer    ", "Bearer x"] {
-			assert!(gate(ip(OUTSIDE), "/mcp", None, &bearer(value)).is_some(), "{value:?}");
+			assert!(gate(ip(OUTSIDE), &Method::GET, "/mcp", None, &bearer(value)).is_some(), "{value:?}");
 		}
+	}
+}
+
+/// `REDLIB_READ_TOKEN`: a bearer token for in-cluster services that only
+/// read pages. Kept apart from the main test module, which covers sessions,
+/// bypasses and the MCP token.
+#[cfg(test)]
+mod read_token_tests {
+	use super::*;
+	use hyper::header::HeaderValue;
+	use sealed_test::prelude::*;
+
+	const OUTSIDE: &str = "203.0.113.9";
+	const TOKEN: &str = "read-only-token-0123456789abcdef";
+
+	fn outside() -> IpAddr {
+		OUTSIDE.parse().unwrap()
+	}
+
+	fn bearer(value: &str) -> HeaderMap {
+		let mut map = HeaderMap::new();
+		map.append("authorization", HeaderValue::from_str(value).unwrap());
+		map.append("accept", HeaderValue::from_static("application/json"));
+		map
+	}
+
+	fn with_token() -> HeaderMap {
+		bearer(&format!("Bearer {TOKEN}"))
+	}
+
+	fn assert_rejected(method: &Method, path: &str, headers: &HeaderMap) {
+		let res = gate(outside(), method, path, None, headers).unwrap_or_else(|| panic!("{method} {path} must be gated"));
+		assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_READ_TOKEN", "read-only-token-0123456789abcdef"),
+	])]
+	fn opens_pages_for_get_and_head() {
+		for path in ["/r/rust", "/r/rust/comments/1abcdef/some_title", "/", "/user/someone", "/info.json"] {
+			for method in [Method::GET, Method::HEAD] {
+				assert!(gate(outside(), &method, path, None, &with_token()).is_none(), "{method} {path}");
+			}
+		}
+
+		// The scheme is case-insensitive (RFC 9110 11.1).
+		for scheme in ["bearer", "BEARER", "BeArEr"] {
+			let headers = bearer(&format!("{scheme} {TOKEN}"));
+			assert!(gate(outside(), &Method::GET, "/r/rust", None, &headers).is_none(), "{scheme}");
+		}
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_READ_TOKEN", "read-only-token-0123456789abcdef"),
+	])]
+	fn never_allows_a_method_that_can_change_state() {
+		for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE, Method::OPTIONS] {
+			for path in ["/r/rust", "/r/rust/subscribe", "/settings", "/settings/encoded-restore"] {
+				assert_rejected(&method, path, &with_token());
+			}
+		}
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_READ_TOKEN", "read-only-token-0123456789abcdef"),
+	])]
+	fn never_opens_settings_mcp_or_oidc() {
+		// /settings/restore and /settings/update change preferences on GET,
+		// /mcp has its own token, and /oidc/ belongs to the login flow.
+		for path in [
+			"/settings",
+			"/settings/update",
+			"/settings/restore",
+			"/Settings",
+			"/SETTINGS/update",
+			"/mcp",
+			"/mcp/other",
+			"/oidc",
+			"/oidc/other",
+		] {
+			for method in [Method::GET, Method::HEAD] {
+				assert_rejected(&method, path, &with_token());
+			}
+		}
+
+		// Paths that merely start with the same letters are ordinary pages.
+		for path in ["/settingsx", "/mcpx", "/oidcx"] {
+			assert!(gate(outside(), &Method::GET, path, None, &with_token()).is_none(), "{path}");
+		}
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_READ_TOKEN", "read-only-token-0123456789abcdef"),
+		("REDLIB_MCP_TOKEN", "mcp-token-0123456789abcdef"),
+	])]
+	fn rejects_wrong_or_malformed_tokens() {
+		for value in [
+			"Bearer read-only-token-0123456789abcde",
+			"Bearer read-only-token-0123456789abcdefx",
+			"Bearer ",
+			"Basic read-only-token-0123456789abcdef",
+			"read-only-token-0123456789abcdef",
+			// The MCP token is not a read token.
+			"Bearer mcp-token-0123456789abcdef",
+		] {
+			assert_rejected(&Method::GET, "/r/rust", &bearer(value));
+		}
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_READ_TOKEN", "   "),
+	])]
+	fn a_blank_token_authorises_nothing() {
+		for value in ["Bearer ", "Bearer    ", "Bearer x"] {
+			assert_rejected(&Method::GET, "/r/rust", &bearer(value));
+		}
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn an_unset_token_authorises_nothing() {
+		for value in ["Bearer ", "Bearer x", "Bearer read-only-token-0123456789abcdef"] {
+			assert_rejected(&Method::GET, "/r/rust", &bearer(value));
+		}
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_READ_TOKEN", "read-only-token-0123456789abcdef")])]
+	fn is_loaded_but_never_reaches_info_json() {
+		assert_eq!(crate::config::get_setting("REDLIB_READ_TOKEN").as_deref(), Some(TOKEN));
+		let json = serde_json::to_string(&crate::config::Config::load()).unwrap();
+		assert!(!json.contains(TOKEN), "the read token is in /info.json");
 	}
 }

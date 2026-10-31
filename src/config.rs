@@ -283,6 +283,15 @@ pub struct Config {
 	/// The instance's own origin is always allowed.
 	#[serde(rename = "REDLIB_MCP_ALLOWED_ORIGINS")]
 	pub(crate) mcp_allowed_origins: Option<String>,
+
+	/// Bearer token the OIDC gate accepts for GET and HEAD requests, except on
+	/// `/settings`, `/mcp` and `/oidc` and everything under them, for
+	/// in-cluster services that only read pages.
+	/// Unset means no token is accepted at all. A credential, so it is never
+	/// serialized.
+	#[serde(rename = "REDLIB_READ_TOKEN")]
+	#[serde(skip_serializing)]
+	pub(crate) read_token: Option<String>,
 }
 
 impl Config {
@@ -391,6 +400,7 @@ impl Config {
 			mcp_token: parse("REDLIB_MCP_TOKEN"),
 			mcp_enabled: parse("REDLIB_MCP_ENABLED"),
 			mcp_allowed_origins: parse("REDLIB_MCP_ALLOWED_ORIGINS"),
+			read_token: parse("REDLIB_READ_TOKEN"),
 		}
 	}
 }
@@ -463,6 +473,7 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_MCP_TOKEN" => config.mcp_token.clone(),
 		"REDLIB_MCP_ENABLED" => config.mcp_enabled.clone(),
 		"REDLIB_MCP_ALLOWED_ORIGINS" => config.mcp_allowed_origins.clone(),
+		"REDLIB_READ_TOKEN" => config.read_token.clone(),
 		_ => None,
 	}
 }
@@ -471,7 +482,7 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 /// settings never had one, so a stray variable under such a name must not
 /// switch authentication off, widen the bypass list or set a token.
 fn has_legacy_name(key: &str) -> bool {
-	!(key.starts_with("REDLIB_OIDC_") || matches!(key, "REDLIB_AUTH_BYPASS_CIDRS" | "REDLIB_TRUSTED_PROXIES" | "REDLIB_MCP_TOKEN"))
+	!(key.starts_with("REDLIB_OIDC_") || matches!(key, "REDLIB_AUTH_BYPASS_CIDRS" | "REDLIB_TRUSTED_PROXIES" | "REDLIB_MCP_TOKEN" | "REDLIB_READ_TOKEN"))
 }
 
 /// Retrieves setting from environment variable or config file.
@@ -678,15 +689,16 @@ mod tests {
 		("LIBREDDIT_AUTH_BYPASS_CIDRS", "0.0.0.0/0"),
 		("LIBREDDIT_TRUSTED_PROXIES", "0.0.0.0/0"),
 		("LIBREDDIT_MCP_TOKEN", "token"),
+		("LIBREDDIT_READ_TOKEN", "token"),
 	])]
 	fn test_auth_settings_have_no_legacy_names() {
 		// These never existed under LIBREDDIT_. A stray variable with such a
 		// name must not quietly switch auth off, widen the bypass or set a token.
 		let auth_keys: Vec<String> = serde_names("rename")
 			.into_iter()
-			.filter(|k| k.starts_with("REDLIB_OIDC_") || ["REDLIB_AUTH_BYPASS_CIDRS", "REDLIB_TRUSTED_PROXIES", "REDLIB_MCP_TOKEN"].contains(&k.as_str()))
+			.filter(|k| k.starts_with("REDLIB_OIDC_") || ["REDLIB_AUTH_BYPASS_CIDRS", "REDLIB_TRUSTED_PROXIES", "REDLIB_MCP_TOKEN", "REDLIB_READ_TOKEN"].contains(&k.as_str()))
 			.collect();
-		assert_eq!(auth_keys.len(), 12, "update the env list above: {auth_keys:?}");
+		assert_eq!(auth_keys.len(), 13, "update the env list above: {auth_keys:?}");
 		let config = Config::load();
 		for key in &auth_keys {
 			assert!(var(key.replace("REDLIB_", "LIBREDDIT_")).is_ok(), "{key} has no legacy variable set above");

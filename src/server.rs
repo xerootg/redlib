@@ -346,7 +346,7 @@ impl Server {
 			// request is allowed through -- because auth is off, the client is
 			// in a bypass CIDR, it already holds a valid session, or it is
 			// hitting the /oidc/ endpoints.
-			if let Some(mut res) = oidc::gate(peer, &path, req.uri().query(), &req_headers) {
+			if let Some(mut res) = oidc::gate(peer, req.method(), &path, req.uri().query(), &req_headers) {
 				res.headers_mut().extend(def_headers);
 				return async move { Ok(res) }.boxed();
 			}

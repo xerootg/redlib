@@ -17,7 +17,7 @@ use std::result::Result;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize};
 use std::sync::{Arc, LazyLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wreq::dns::{Addrs, GaiResolver, Name, Resolve, Resolving};
 use wreq::redirect::Policy;
 use wreq::{header as wreq_header, Client as WreqClient, Method, Response as WreqResponse};
@@ -231,10 +231,23 @@ fn pick(weights: &[u32], current: usize) -> usize {
 	unreachable!("the draw is below the total weight")
 }
 
+/// How long a connection (DNS, TCP and TLS) may take to come up.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the upstream may stay silent, before the response headers and
+/// between the chunks of a body. A steady stream is not cut off.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn client_for(profile: Profile, platform: Platform) -> WreqClient {
+	client_with_read_timeout(profile, platform, READ_IDLE_TIMEOUT)
+}
+
+fn client_with_read_timeout(profile: Profile, platform: Platform, read_timeout: Duration) -> WreqClient {
 	WreqClient::builder()
 		.emulation(Emulation::builder().profile(profile).platform(platform).build())
 		.redirect(Policy::none())
+		.connect_timeout(CONNECT_TIMEOUT)
+		.read_timeout(read_timeout)
 		.dns_resolver(RedgifsIpv4Resolver(GaiResolver::new()))
 		.build()
 		.expect("Should always be able to build a client")
@@ -1140,7 +1153,13 @@ mod outbound_timeout_tests {
 	}
 
 	fn client() -> WreqClient {
-		client_for(Profile::Chrome131, Platform::Linux)
+		client_with_read_timeout(Profile::Chrome131, Platform::Linux, Duration::from_secs(1))
+	}
+
+	#[test]
+	fn test_the_timeouts_are_short_enough_to_matter() {
+		assert!(CONNECT_TIMEOUT <= Duration::from_secs(10));
+		assert!(READ_IDLE_TIMEOUT <= Duration::from_secs(60));
 	}
 
 	#[test]

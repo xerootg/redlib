@@ -7,7 +7,7 @@ use crate::{
 use askama::Template;
 use build_html::{Container, Html, HtmlContainer, Table};
 use hyper::{http::Error, Request, Response};
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeMap, Deserialize, Serialize, Serializer};
 use std::sync::LazyLock;
 use time::{macros::format_description, OffsetDateTime};
 
@@ -82,7 +82,77 @@ pub struct InstanceInfo {
 	deploy_date: String,
 	compile_mode: String,
 	deploy_unix_ts: i64,
+	#[serde(serialize_with = "serialize_public_config")]
 	config: Config,
+}
+
+/// The settings `/info.json` publishes. See `serialize_public_config`.
+const PUBLIC_CONFIG_KEYS: &[&str] = &[
+	"REDLIB_SFW_ONLY",
+	"REDLIB_DEFAULT_THEME",
+	"REDLIB_DEFAULT_FRONT_PAGE",
+	"REDLIB_DEFAULT_LAYOUT",
+	"REDLIB_DEFAULT_WIDE",
+	"REDLIB_DEFAULT_COMMENT_SORT",
+	"REDLIB_DEFAULT_POST_SORT",
+	"REDLIB_DEFAULT_BLUR_SPOILER",
+	"REDLIB_DEFAULT_SHOW_NSFW",
+	"REDLIB_DEFAULT_BLUR_NSFW",
+	"REDLIB_DEFAULT_USE_HLS",
+	"REDLIB_DEFAULT_HIDE_HLS_NOTIFICATION",
+	"REDLIB_DEFAULT_HIDE_AWARDS",
+	"REDLIB_DEFAULT_HIDE_SIDEBAR_AND_SUMMARY",
+	"REDLIB_DEFAULT_HIDE_SCORE",
+	"REDLIB_DEFAULT_SUBSCRIPTIONS",
+	"REDLIB_DEFAULT_FILTERS",
+	"REDLIB_DEFAULT_DISABLE_VISIT_REDDIT_CONFIRMATION",
+	"REDLIB_BANNER",
+	"REDLIB_ROBOTS_DISABLE_INDEXING",
+	"REDLIB_PUSHSHIFT_FRONTEND",
+	"REDLIB_ENABLE_RSS",
+	"REDLIB_ENABLE_REDGIFS",
+	"REDLIB_ENABLE_GIPHY",
+	"REDLIB_ENABLE_SCRAPE_FALLBACK",
+	"REDLIB_ENABLE_GQL",
+	"REDLIB_SCRAPE_COMMENT_PREFETCH",
+	"REDLIB_GQL_FEED_REQUESTS",
+	"REDLIB_FULL_URL",
+	"REDLIB_DEFAULT_REMOVE_DEFAULT_FEEDS",
+	"REDLIB_SOURCE_URL",
+	"REDLIB_DEFAULT_GEO_FILTER",
+	"REDLIB_DEFAULT_CLEAN_URLS",
+	"REDLIB_DEFAULT_POSTS_PER_PAGE",
+	"REDLIB_DEFAULT_MAX_COMMENT_THREAD_DEPTH",
+	"REDLIB_ENDPOINTS",
+	"REDLIB_ENDPOINTS_POST",
+	"REDLIB_ENDPOINTS_COMMENTS",
+	"REDLIB_ENDPOINTS_LISTING",
+	"REDLIB_ENDPOINTS_ALL",
+	"REDLIB_ENDPOINTS_SUBREDDIT",
+	"REDLIB_ENDPOINTS_USER",
+	"REDLIB_ENDPOINTS_SEARCH",
+	"REDLIB_ENDPOINTS_WIKI",
+	"REDLIB_ENDPOINTS_DUPLICATES",
+];
+
+/// The `config` entries of `/info.json`: the settings named in
+/// `PUBLIC_CONFIG_KEYS` and nothing else.
+fn public_config_entries<T: Serialize>(config: &T) -> Vec<(String, serde_json::Value)> {
+	// Behavior-preserving seam: everything the config serializes.
+	let _ = PUBLIC_CONFIG_KEYS;
+	match serde_json::to_value(config) {
+		Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
+		_ => Vec::new(),
+	}
+}
+
+fn serialize_public_config<S: Serializer>(config: &Config, serializer: S) -> Result<S::Ok, S::Error> {
+	let entries = public_config_entries(config);
+	let mut map = serializer.serialize_map(Some(entries.len()))?;
+	for (key, value) in &entries {
+		map.serialize_entry(key, value)?;
+	}
+	map.end()
 }
 
 impl InstanceInfo {
@@ -189,6 +259,78 @@ struct MessageTemplate {
 	body: String,
 	prefs: Preferences,
 	url: String,
+}
+
+#[cfg(test)]
+mod allowlist_tests {
+	use super::{public_config_entries, InstanceInfo, PUBLIC_CONFIG_KEYS};
+	use crate::config::Config;
+	use serde::Serialize;
+	use std::collections::BTreeSet;
+
+	/// A config that has grown a setting `/info.json` doesn't know about,
+	/// the way a future setting or a carried branch's would.
+	#[derive(Serialize)]
+	struct ConfigWithNewSecret {
+		#[serde(flatten)]
+		config: Config,
+		#[serde(rename = "REDLIB_NEW_SECRET")]
+		new_secret: String,
+		#[serde(rename = "REDLIB_OIDC_CLIENT_SECRET")]
+		oidc_client_secret: String,
+	}
+
+	fn json_config_keys(info: &InstanceInfo) -> BTreeSet<String> {
+		let json = serde_json::to_value(info).unwrap();
+		json["config"].as_object().unwrap().keys().cloned().collect()
+	}
+
+	#[test]
+	fn a_setting_that_is_not_on_the_allowlist_never_appears() {
+		let config = ConfigWithNewSecret {
+			config: Config::default(),
+			new_secret: "canary-new-secret".into(),
+			oidc_client_secret: "canary-oidc-secret".into(),
+		};
+		let entries = public_config_entries(&config);
+		let json = serde_json::to_string(&entries).unwrap();
+		assert!(!json.contains("canary"), "a field nobody put on the allowlist leaked: {json}");
+		assert!(entries.iter().all(|(key, _)| PUBLIC_CONFIG_KEYS.contains(&key.as_str())));
+	}
+
+	#[test]
+	fn info_json_config_has_exactly_the_allowlisted_keys() {
+		let info = InstanceInfo::default();
+		let expected: BTreeSet<String> = PUBLIC_CONFIG_KEYS.iter().map(|key| key.to_string()).collect();
+		assert_eq!(json_config_keys(&info), expected);
+	}
+
+	#[test]
+	fn every_allowlisted_key_is_a_real_setting() {
+		// A typo in the allowlist would silently hide a setting. Give every
+		// allowlisted key a value and expect each to come back.
+		let values: serde_json::Map<String, serde_json::Value> = PUBLIC_CONFIG_KEYS.iter().map(|key| (key.to_string(), "set".into())).collect();
+		let config: Config = serde_json::from_value(values.into()).unwrap();
+		let entries = public_config_entries(&config);
+		assert!(entries.iter().all(|(_, value)| value == "set"), "{entries:?}");
+		assert_eq!(entries.len(), PUBLIC_CONFIG_KEYS.len());
+	}
+
+	#[test]
+	fn credentials_and_listener_settings_are_not_published() {
+		let secret_keys = [
+			"REDLIB_REDDIT_COOKIE",
+			"REDLIB_REDDIT_COOKIE_FILE",
+			"REDLIB_LISTEN_PORT",
+			"REDLIB_LISTEN_ADDRESS",
+			"REDLIB_HSTS",
+			"REDLIB_IPV4_ONLY",
+			"REDLIB_IPV6_ONLY",
+		];
+		for key in secret_keys {
+			assert!(!PUBLIC_CONFIG_KEYS.contains(&key), "{key} must not be on the /info.json allowlist");
+		}
+	}
 }
 
 #[cfg(test)]

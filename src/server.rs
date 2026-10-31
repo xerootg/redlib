@@ -423,21 +423,33 @@ impl Server {
 
 /// The path the gate and the router both see: doubled slashes collapsed,
 /// encoded slashes decoded and trailing slashes removed.
+///
+/// Repeated until nothing changes, because one round can leave work for the
+/// next: `/%2Fmcp` becomes `//mcp`. The gate compares the result with exact
+/// paths such as `/mcp`, so it has to be the form the router sees too.
+/// Every round that changes anything makes the path shorter, so this ends.
 fn normalize_path(raw: &str) -> String {
-	// Remove double slashes and decode encoded slashes
-	let mut path = raw.replace("//", "/").replace("%2F", "/");
+	let mut path = raw.to_string();
+	loop {
+		let before = path.len();
 
-	// Remove trailing slashes
-	if path != "/" && path.ends_with('/') {
-		path.pop();
+		// Remove double slashes and decode encoded slashes
+		path = path.replace("//", "/").replace("%2F", "/");
+
+		// Remove trailing slashes
+		if path != "/" && path.ends_with('/') {
+			path.pop();
+		}
+
+		// Reddit permalinks end in a slash, so feed URLs are often written `/r/rust/top/.rss`
+		if path != "/.rss" && path.ends_with("/.rss") {
+			path.replace_range(path.len() - "/.rss".len().., ".rss");
+		}
+
+		if path.len() == before {
+			return path;
+		}
 	}
-
-	// Reddit permalinks end in a slash, so feed URLs are often written `/r/rust/top/.rss`
-	if path != "/.rss" && path.ends_with("/.rss") {
-		path.replace_range(path.len() - "/.rss".len().., ".rss");
-	}
-
-	path
 }
 
 async fn shutdown_signal() {

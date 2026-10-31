@@ -299,21 +299,60 @@ fn cursor_owner(path: &str) -> Option<&'static str> {
 /// What `fetch` answers for a page that only exists for a logged-in account.
 pub const ACCOUNT_ONLY_ERROR: &str = "Reddit only shows this page to the account it belongs to, and Redlib never signs in as a visitor.";
 
+/// The user pages Reddit shows to everyone.
+const PUBLIC_USER_LISTINGS: [&str; 5] = ["about", "overview", "submitted", "comments", "gilded"];
+
+/// The decoded, lowercased segments of the route of a JSON API path, as the
+/// servers behind the backends see them.
+fn route_segments(path: &str) -> Vec<String> {
+	let route = path.split('?').next().unwrap_or_default().trim_end_matches(".json");
+	route
+		.split('/')
+		.filter(|segment| !segment.is_empty())
+		.map(|segment| percent_encoding::percent_decode_str(segment).decode_utf8_lossy().to_lowercase())
+		.collect()
+}
+
 /// Whether `path` is a page that belongs to a logged-in account, so no backend may be asked for it.
-fn is_account_only(_path: &str) -> bool {
-	false
+///
+/// Reddit answers the saved, upvoted, downvoted and hidden listings of a user,
+/// `/user/me` and the `mod` and `friends` feeds with the data of whichever
+/// account asks, and a visitor can ask for any path. Anonymous requests get
+/// nothing for them, but a session backend would answer as its account. User
+/// pages are therefore an allowlist, so spellings Reddit decodes or
+/// normalizes (`%73aved`, `comments/../saved`) can't slip past.
+fn is_account_only(path: &str) -> bool {
+	let segments = route_segments(path);
+	if segments.iter().any(|segment| segment == "." || segment == ".." || segment.contains('/')) {
+		return true;
+	}
+	match segments.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+		["user" | "u", name, rest @ ..] => {
+			*name == "me"
+				|| !match rest {
+					[] | ["comments", ..] | ["m", _, ..] => true,
+					[listing] => PUBLIC_USER_LISTINGS.contains(listing),
+					_ => false,
+				}
+		}
+		["r", sub, ..] => sub.split('+').any(|part| part == "mod" || part == "friends"),
+		_ => false,
+	}
 }
 
 /// Whether a logged-in session must not be asked for `path`: everything
-/// `is_account_only` refuses, plus pages that show an account's private data
-/// when the account owns them.
-pub(crate) fn session_refuses(_path: &str) -> bool {
-	false
+/// `is_account_only` refuses, plus multireddits, which show the private ones
+/// of the account when it owns them.
+pub(crate) fn session_refuses(path: &str) -> bool {
+	is_account_only(path) || matches!(route_segments(path).iter().map(String::as_str).collect::<Vec<_>>().as_slice(), ["user" | "u", _, "m", ..])
 }
 
 /// Fetches `path` from the first backend that serves it, and names that backend.
 #[cached(max_size = 100, ttl_secs = 30)]
 pub async fn fetch(path: String, quarantine: bool) -> Result<(Value, &'static str), String> {
+	if is_account_only(&path) {
+		return Err(ACCOUNT_ONLY_ERROR.to_string());
+	}
 	let kind = Kind::of(&path);
 	let mut blocked = false;
 	let mut last_error = None;

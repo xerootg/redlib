@@ -12,7 +12,7 @@ use log::{info, warn};
 use redlib::body::Body;
 use redlib::client::{canonical_path, proxy, CLIENT};
 use redlib::server::{self, RequestExt};
-use redlib::utils::{error, gallery_redirect_path, get_source_url, redirect, ThemeAssets};
+use redlib::utils::{error, gallery_redirect_path, get_source_url, redirect, redirect_local, ThemeAssets};
 use redlib::{config, duplicates, headers, instance_info, mcp, oidc, post, search, settings, subreddit, user};
 
 use redlib::client::OAUTH_CLIENT;
@@ -236,7 +236,10 @@ async fn main() {
 
 	// Define default headers (added to all responses)
 	app.default_headers = headers! {
-		"Referrer-Policy" => "no-referrer",
+		// Not `no-referrer`: that makes browsers send `Origin: null` on same-origin form POSTs, which
+		// the cross-site POST check (utils::is_same_origin_post) has to refuse for browsers without
+		// `Sec-Fetch-Site`. Other sites still get no Referer.
+		"Referrer-Policy" => "same-origin",
 		"X-Content-Type-Options" => "nosniff",
 		"X-Frame-Options" => "DENY",
 		"Content-Security-Policy" => "default-src 'none'; font-src 'self'; script-src 'self' blob:; manifest-src 'self'; media-src 'self' data: blob: about:; style-src 'self' 'unsafe-inline'; base-uri 'none'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; connect-src 'self'; worker-src blob:;"
@@ -391,9 +394,9 @@ async fn main() {
 
 	// Configure settings
 	app.at("/settings").get(|r| settings::get(r).boxed()).post(|r| settings::set(r).boxed());
-	app.at("/settings/restore").get(|r| settings::restore(r).boxed());
+	app.at("/settings/restore").get(|r| settings::restore(r).boxed()).post(|r| settings::restore(r).boxed());
 	app.at("/settings/encoded-restore").post(|r| settings::encoded_restore(r).boxed());
-	app.at("/settings/update").get(|r| settings::update(r).boxed());
+	app.at("/settings/update").get(|r| settings::update(r).boxed()).post(|r| settings::update(r).boxed());
 
 	// RSS Subscriptions. Feeds are built from the JSON API, not Reddit's own feeds.
 	// A trailing slash before the extension (`/r/rust/top/.rss`) is normalized away by the server.
@@ -483,7 +486,7 @@ async fn main() {
 			match req.param("id").as_deref() {
 				// Subreddit post share link
 				Some(id) if (8..12).contains(&id.len()) => match canonical_path(format!("/r/{sub}/s/{id}"), 3).await {
-					Ok(Some(path)) => Ok(redirect(&path)),
+					Ok(Some(path)) => Ok(redirect_local(&path)),
 					Ok(None) => error(req, "Post ID is invalid. It may point to a post on a community that has been banned.").await,
 					Err(e) => error(req, &e).await,
 				},
@@ -499,7 +502,7 @@ async fn main() {
 			match req.param("id").as_deref() {
 				// User post share link
 				Some(id) if (8..12).contains(&id.len()) => match canonical_path(format!("/u/{name}/s/{id}"), 3).await {
-					Ok(Some(path)) => Ok(redirect(&path)),
+					Ok(Some(path)) => Ok(redirect_local(&path)),
 					Ok(None) => error(req, "Post ID is invalid. It may point to a post on a user that has been banned.").await,
 					Err(e) => error(req, &e).await,
 				},
@@ -529,7 +532,7 @@ async fn main() {
 				// Short link for post
 				Some(id) if (5..8).contains(&id.len()) => match canonical_path(format!("/comments/{id}"), 3).await {
 					Ok(path_opt) => match path_opt {
-						Some(path) => Ok(redirect(&path)),
+						Some(path) => Ok(redirect_local(&path)),
 						None => error(req, "Post ID is invalid. It may point to a post on a community that has been banned.").await,
 					},
 					Err(e) => error(req, &e).await,

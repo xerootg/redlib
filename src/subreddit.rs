@@ -6,6 +6,7 @@ use crate::utils::{
 	redirect, rewrite_urls, rss_page_link, rss_page_path, rss_response, setting, setting_or_default, should_be_nsfw_gated, template, val, Post, Preferences, Subreddit,
 	ACCOUNT_ONLY_MSG, RSS_LISTING_SORTS,
 };
+use crate::utils::{local_path, redirect_local, reject_cross_site_post};
 use crate::{backends::json, server::RequestExt, server::ResponseExt};
 use askama::Template;
 use cookie::Cookie;
@@ -294,9 +295,12 @@ pub fn quarantine(req: &Request<Body>, sub: String, restriction: &str) -> Respon
 }
 
 pub async fn add_quarantine_exception(req: Request<Body>) -> Result<Response<Body>, String> {
+	if let Some(res) = reject_cross_site_post(&req) {
+		return Ok(res);
+	}
 	let subreddit = req.param("sub").ok_or("Invalid URL")?;
 	let redir = param(&format!("?{}", req.uri().query().unwrap_or_default()), "redir").ok_or("Invalid URL")?;
-	let mut response = redirect(&redir);
+	let mut response = redirect_local(&redir);
 	response.insert_cookie(
 		Cookie::build((&format!("allow_quaran_{}", subreddit.to_lowercase()), "true"))
 			.path("/")
@@ -347,8 +351,21 @@ pub fn join_until_size_limit<T: std::fmt::Display>(vec: &[T]) -> Vec<std::string
 	result
 }
 
+/// Where to send the user after subscribing or filtering: back to the subreddit
+/// or, when unsubscribing/unfiltering from outside the sidebar, to the `redirect` parameter
+fn subscription_redirect(sub: &str, query: &str) -> String {
+	match param(&format!("?{query}"), "redirect").as_deref().and_then(local_path) {
+		Some(path) => path,
+		None => format!("/r/{sub}"),
+	}
+}
+
 // Sub, filter, unfilter, or unsub by setting subscription cookie using response "Set-Cookie" header
 pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>, String> {
+	if let Some(res) = reject_cross_site_post(&req) {
+		return Ok(res);
+	}
+
 	let sub = req.param("sub").unwrap_or_default();
 	let action: Vec<String> = req.uri().path().split('/').map(String::from).collect();
 
@@ -429,15 +446,7 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 		}
 	}
 
-	// Redirect back to subreddit
-	// check for redirect parameter if unsubscribing/unfiltering from outside sidebar
-	let path = if let Some(redirect_path) = param(&format!("?{query}"), "redirect") {
-		format!("/{redirect_path}")
-	} else {
-		format!("/r/{sub}")
-	};
-
-	let mut response = redirect(&path);
+	let mut response = redirect(&subscription_redirect(&sub, &query));
 
 	// If sub_list is empty remove all subscriptions cookies, otherwise update them and remove old ones
 	if sub_list.is_empty() {
@@ -742,6 +751,106 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 		.build();
 
 	Ok(rss_response(&channel))
+}
+
+#[cfg(test)]
+mod redirect_tests {
+	use super::*;
+	use crate::utils::redirect_test_support::{assert_local_redirect, OFFSITE_PAYLOADS};
+	use futures_lite::future::block_on;
+
+	#[test]
+	fn subscription_redirect_stays_on_the_instance() {
+		for payload in OFFSITE_PAYLOADS {
+			let path = subscription_redirect("rust", &format!("redirect={payload}"));
+			assert_local_redirect(&redirect(&path), payload);
+		}
+	}
+
+	#[test]
+	fn subscription_redirect_keeps_the_in_app_forms() {
+		assert_eq!(subscription_redirect("rust", ""), "/r/rust");
+		assert_eq!(subscription_redirect("rust", "redirect=settings"), "/settings");
+		assert_eq!(subscription_redirect("rust", "redirect=r/news%3Fsort%3Dtop"), "/r/news?sort=top");
+	}
+
+	fn quarantine_request(query: &str) -> Request<Body> {
+		let mut req = Request::builder().method("POST").uri(format!("/r/foo?{query}")).body(Body::empty()).unwrap();
+		let mut params = route_recognizer::Params::new();
+		params.insert("sub".to_string(), "foo".to_string());
+		req.set_params(params);
+		req
+	}
+
+	#[test]
+	fn quarantine_opt_in_redirect_stays_on_the_instance() {
+		for payload in OFFSITE_PAYLOADS {
+			let res = block_on(add_quarantine_exception(quarantine_request(&format!("redir={payload}")))).unwrap();
+			assert_local_redirect(&res, payload);
+		}
+	}
+
+	#[test]
+	fn quarantine_opt_in_keeps_a_local_path() {
+		let res = block_on(add_quarantine_exception(quarantine_request("redir=/r/foo/hot"))).unwrap();
+		assert_eq!(res.headers()["location"], "/r/foo/hot");
+	}
+}
+
+/// POSTs that change subscriptions, filters or quarantine opt-ins must come from a page on
+/// this instance (audit finding #9)
+#[cfg(test)]
+mod origin_tests {
+	use super::*;
+	use futures_lite::future::block_on;
+
+	fn post(uri: &str, sub: &str, headers: &[(&str, &str)]) -> Request<Body> {
+		let mut builder = Request::builder().method("POST").uri(uri).header("host", "redlib.example");
+		for (name, value) in headers {
+			builder = builder.header(*name, *value);
+		}
+		let mut req = builder.body(Body::empty()).unwrap();
+		let mut params = route_recognizer::Params::new();
+		params.insert("sub".to_string(), sub.to_string());
+		req.set_params(params);
+		req
+	}
+
+	const CROSS_SITE: [&[(&str, &str)]; 4] = [
+		&[("sec-fetch-site", "cross-site")],
+		&[("sec-fetch-site", "same-site")],
+		&[("origin", "https://evil.example")],
+		&[("origin", "null")],
+	];
+
+	#[test]
+	fn quarantine_opt_in_refuses_cross_site_requests() {
+		for headers in CROSS_SITE {
+			let res = block_on(add_quarantine_exception(post("/r/foo?redir=/r/foo", "foo", headers))).unwrap();
+			assert_eq!(res.status(), 403, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_none(), "{headers:?}: opted in");
+		}
+	}
+
+	#[test]
+	fn quarantine_opt_in_accepts_same_origin_requests() {
+		for headers in [&[][..], &[("sec-fetch-site", "same-origin")][..], &[("origin", "https://redlib.example")][..]] {
+			let res = block_on(add_quarantine_exception(post("/r/foo?redir=/r/foo", "foo", headers))).unwrap();
+			assert_eq!(res.status(), 302, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_some(), "{headers:?}");
+		}
+	}
+
+	#[test]
+	fn subscribe_and_filter_refuse_cross_site_requests() {
+		// `random` makes the handler fail before it would call Reddit, if the request got that far
+		for action in ["subscribe", "unsubscribe", "filter", "unfilter"] {
+			for headers in CROSS_SITE {
+				let res = block_on(subscriptions_filters(post(&format!("/r/random/{action}"), "random", headers)));
+				assert_eq!(res.as_ref().map(Response::status).ok(), Some(hyper::StatusCode::FORBIDDEN), "{action} {headers:?}");
+			}
+		}
+	}
 }
 
 #[cfg(test)]

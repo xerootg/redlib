@@ -1527,12 +1527,106 @@ pub fn template(t: &impl Template) -> Response<Body> {
 		.unwrap_or_default()
 }
 
+/// Turns a user-supplied redirect target into a path on this instance, or `None`.
+///
+/// A relative value such as `r/rust` gets its leading slash. The result always starts with a
+/// single `/`, so a browser can never read it as `//host`, `/\host` or `scheme:...`. Control
+/// characters, whitespace and backslashes are rejected, and so is an encoded slash or backslash
+/// right after the first `/`, in case something downstream decodes the path a second time.
+pub fn local_path(value: &str) -> Option<String> {
+	let path = if value.starts_with('/') {
+		value.to_owned()
+	} else {
+		// `https://host` and `javascript:...` are not relative paths
+		if value.split(['/', '?', '#']).next().unwrap_or_default().contains(':') {
+			return None;
+		}
+		format!("/{value}")
+	};
+
+	if matches!(path.as_bytes().get(1), Some(b'/' | b'\\')) {
+		return None;
+	}
+	if path.chars().any(|c| c == '\\' || c.is_control() || c.is_whitespace()) {
+		return None;
+	}
+	if path[1..]
+		.get(..3)
+		.is_some_and(|prefix| prefix.eq_ignore_ascii_case("%2f") || prefix.eq_ignore_ascii_case("%5c"))
+	{
+		return None;
+	}
+
+	Some(path)
+}
+
+/// Redirects to `path` when it is a path on this instance (see [`local_path`]), otherwise to `/`
+pub fn redirect_local(path: &str) -> Response<Body> {
+	redirect(&local_path(path).unwrap_or_else(|| "/".to_string()))
+}
+
+/// Value of the `Sec-Fetch-Site` header, which browsers add to every request they make
+fn fetch_site(req: &Request<Body>) -> Option<&str> {
+	req.headers().get("sec-fetch-site").and_then(|value| value.to_str().ok())
+}
+
+/// Whether a state-changing request (POST) was made by a page on this instance.
+///
+/// Browsers label requests with `Sec-Fetch-Site`; older ones send `Origin` on a POST instead,
+/// which has to match `Host` (or `X-Forwarded-Host` behind a proxy that rewrites it). A request
+/// with neither header does not come from a browser, so it cannot be a cross-site form post.
+///
+/// `X-Forwarded-Host` is taken as sent. A cross-site page cannot add request headers to a form
+/// POST (and a CORS preflight for a custom header gets no approval from Redlib), so only a
+/// non-browser client could forge it, and such a client has no victim's cookies to abuse.
+pub fn is_same_origin_post(req: &Request<Body>) -> bool {
+	if let Some(site) = fetch_site(req) {
+		return site == "same-origin";
+	}
+
+	let Some(origin) = req.headers().get("origin") else {
+		return true;
+	};
+	let Some((_, authority)) = origin.to_str().ok().and_then(|origin| origin.split_once("://")) else {
+		// `Origin: null`, or garbage
+		return false;
+	};
+
+	let host = req.headers().get("host").and_then(|host| host.to_str().ok());
+	let forwarded_host = req
+		.headers()
+		.get("x-forwarded-host")
+		.and_then(|host| host.to_str().ok())
+		.and_then(|hosts| hosts.split(',').next())
+		.map(str::trim);
+	let uri_host = req.uri().authority().map(|authority| authority.as_str());
+
+	[host, forwarded_host, uri_host]
+		.into_iter()
+		.flatten()
+		.any(|candidate| candidate.eq_ignore_ascii_case(authority))
+}
+
+/// The response for a state-changing request that did not come from this instance, or `None`
+pub fn reject_cross_site_post(req: &Request<Body>) -> Option<Response<Body>> {
+	if is_same_origin_post(req) {
+		return None;
+	}
+	Some(
+		Response::builder()
+			.status(403)
+			.header("content-type", "text/plain; charset=utf-8")
+			.body("Cross-site request blocked".into())
+			.unwrap_or_default(),
+	)
+}
+
 pub fn redirect(path: &str) -> Response<Body> {
 	Response::builder()
 		.status(302)
 		.header("content-type", "text/html")
 		.header("Location", path)
-		.body(format!("Redirecting to <a href=\"{path}\">{path}</a>...").into())
+		.body(format!("Redirecting to <a href=\"{0}\">{0}</a>...", htmlescape::encode_minimal(path)).into())
 		.unwrap_or_default()
 }
 
@@ -1985,6 +2079,218 @@ fn get_mime_type(url: &str) -> &'static str {
 		"webp" => "image/webp",
 		"svg" => "image/svg+xml",
 		_ => "application/octet-stream",
+	}
+}
+
+#[cfg(test)]
+mod referrer_policy_tests {
+	/// A browser puts `Origin: null` on a same-origin form POST when the page was served with
+	/// `Referrer-Policy: no-referrer`. Browsers without `Sec-Fetch-Site` rely on `Origin` alone to
+	/// show a POST is same-origin (see `is_same_origin_post`), so the policy has to keep it, while
+	/// still sending no Referer to other sites.
+	#[test]
+	fn default_policy_keeps_origin_on_same_origin_posts() {
+		let main = include_str!("main.rs");
+		let line = main.lines().find(|line| line.contains("\"Referrer-Policy\"")).expect("main.rs sets a Referrer-Policy");
+		assert!(line.contains("=> \"same-origin\""), "{line}");
+	}
+}
+
+#[cfg(test)]
+mod origin_check_tests {
+	use super::{is_same_origin_post, reject_cross_site_post};
+	use crate::body::Body;
+	use hyper::Request;
+
+	fn request(uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+		let mut builder = Request::builder().uri(uri);
+		for (name, value) in headers {
+			builder = builder.header(*name, *value);
+		}
+		builder.body(Body::empty()).unwrap()
+	}
+
+	#[test]
+	fn post_decided_by_sec_fetch_site_when_present() {
+		assert!(is_same_origin_post(&request("/", &[("sec-fetch-site", "same-origin")])));
+		for site in ["cross-site", "same-site", "none", "", "nonsense"] {
+			assert!(!is_same_origin_post(&request("/", &[("sec-fetch-site", site)])), "{site:?}");
+		}
+		// It wins over a matching Origin
+		let headers = [("sec-fetch-site", "cross-site"), ("origin", "https://redlib.example"), ("host", "redlib.example")];
+		assert!(!is_same_origin_post(&request("/", &headers)));
+	}
+
+	#[test]
+	fn post_falls_back_to_origin_matching_the_host() {
+		assert!(is_same_origin_post(&request("/", &[])));
+		assert!(is_same_origin_post(&request("/", &[("origin", "https://redlib.example"), ("host", "redlib.example")])));
+		assert!(is_same_origin_post(&request(
+			"/",
+			&[("origin", "http://redlib.example:8080"), ("host", "REDLIB.example:8080")]
+		)));
+		assert!(is_same_origin_post(&request(
+			"/",
+			&[("origin", "https://front.example"), ("host", "10.0.0.5"), ("x-forwarded-host", "front.example, other")]
+		)));
+		assert!(is_same_origin_post(&request("https://redlib.example/x", &[("origin", "https://redlib.example")])));
+
+		for origin in [
+			"https://evil.example",
+			"null",
+			"",
+			"redlib.example",
+			"https://redlib.example.evil.example",
+			"https://redlib.example:81",
+		] {
+			let req = request("/", &[("origin", origin), ("host", "redlib.example")]);
+			assert!(!is_same_origin_post(&req), "{origin:?}");
+		}
+		// No Host to compare against
+		assert!(!is_same_origin_post(&request("/", &[("origin", "https://redlib.example")])));
+	}
+
+	#[test]
+	fn rejection_is_a_403() {
+		assert!(reject_cross_site_post(&request("/", &[])).is_none());
+		let res = reject_cross_site_post(&request("/", &[("sec-fetch-site", "cross-site")])).unwrap();
+		assert_eq!(res.status(), 403);
+	}
+}
+
+#[cfg(test)]
+mod local_path_tests {
+	use super::{local_path, redirect_local};
+
+	#[test]
+	fn accepts_paths_on_the_instance() {
+		assert_eq!(local_path("/"), Some("/".to_string()));
+		assert_eq!(local_path("/settings"), Some("/settings".to_string()));
+		assert_eq!(
+			local_path("/r/rust/comments/abc/a_title?sort=top&t=week#c"),
+			Some("/r/rust/comments/abc/a_title?sort=top&t=week#c".to_string())
+		);
+		assert_eq!(local_path("/r/rust/search?q=a:b"), Some("/r/rust/search?q=a:b".to_string()));
+		assert_eq!(local_path("/r/%C3%A9"), Some("/r/%C3%A9".to_string()));
+		assert_eq!(local_path("/r/rust%2Fhot"), Some("/r/rust%2Fhot".to_string()));
+	}
+
+	#[test]
+	fn adds_the_leading_slash_to_relative_values() {
+		assert_eq!(local_path("settings"), Some("/settings".to_string()));
+		assert_eq!(local_path("r/rust?x=a:b"), Some("/r/rust?x=a:b".to_string()));
+		assert_eq!(local_path(""), Some("/".to_string()));
+	}
+
+	#[test]
+	fn rejects_other_origins() {
+		for bad in [
+			"//evil.example",
+			"///evil.example",
+			"//evil.example/path",
+			"/\\evil.example",
+			"\\evil.example",
+			"\\\\evil.example",
+			"https://evil.example",
+			"http://evil.example/",
+			"javascript:alert(1)",
+			"data:text/html,x",
+			"evil.example:80/x",
+			"/%2F%2Fevil.example",
+			"/%2fevil.example",
+			"/%5Cevil.example",
+			"/%5cevil.example",
+		] {
+			assert_eq!(local_path(bad), None, "{bad:?}");
+		}
+	}
+
+	#[test]
+	fn rejects_control_characters_and_whitespace() {
+		for bad in [
+			"/ok\r\nSet-Cookie: a=b",
+			"/ok\nx",
+			"/ok\rx",
+			"/ok\0x",
+			"/ok\tx",
+			"/ok x",
+			"/ok\u{a0}x",
+			"/ok\u{85}x",
+			"/\t/evil.example",
+			"/\u{b}/evil.example",
+		] {
+			assert_eq!(local_path(bad), None, "{bad:?}");
+		}
+	}
+
+	#[test]
+	fn redirect_local_falls_back_to_the_front_page() {
+		assert_eq!(redirect_local("/r/rust").headers()["location"], "/r/rust");
+		for bad in ["//evil.example", "/\\evil.example", "https://evil.example", "/a\r\nSet-Cookie: x=1"] {
+			let res = redirect_local(bad);
+			assert_eq!(res.status(), 302, "{bad:?}");
+			assert_eq!(res.headers()["location"], "/", "{bad:?}");
+		}
+	}
+}
+
+/// Shared by the redirect tests in `utils`, `settings` and `subreddit`
+#[cfg(test)]
+pub(crate) mod redirect_test_support {
+	use hyper::Response;
+
+	use crate::body::Body;
+
+	/// Percent-encoded values for a `redirect` / `return_to` / `redir` parameter. Each one
+	/// decodes (once) to something that would leave the instance, or inject a header.
+	pub const OFFSITE_PAYLOADS: [&str; 8] = [
+		"//evil.example",
+		"///evil.example",
+		"/%5Cevil.example",
+		"%2F%2Fevil.example",
+		"%2F%5Cevil.example",
+		"https://evil.example/",
+		"%5C%5Cevil.example",
+		"/ok%0D%0ASet-Cookie:%20pwned=1",
+	];
+
+	/// The response is a redirect to a path on this instance and sets no attacker cookie
+	pub fn assert_local_redirect(res: &Response<Body>, payload: &str) {
+		assert_eq!(res.status(), 302, "{payload}: not a redirect");
+		let location = res.headers().get("location").unwrap_or_else(|| panic!("{payload}: no Location header")).to_str().unwrap();
+		assert!(location.starts_with('/'), "{payload}: Location {location:?} is not a path");
+		assert!(!location.starts_with("//"), "{payload}: Location {location:?} is protocol-relative");
+		assert!(!location.contains('\\'), "{payload}: Location {location:?} has a backslash");
+		assert!(!location.chars().any(char::is_control), "{payload}: Location {location:?} has control characters");
+		assert!(
+			res.headers().get_all("set-cookie").iter().all(|c| !c.to_str().unwrap_or_default().contains("pwned")),
+			"{payload}: injected a header"
+		);
+	}
+}
+
+#[cfg(test)]
+mod redirect_escape_tests {
+	use super::redirect;
+	use futures_lite::future::block_on;
+
+	fn body_of(res: hyper::Response<crate::body::Body>) -> String {
+		String::from_utf8(block_on(res.into_body().collect_bytes()).unwrap().to_vec()).unwrap()
+	}
+
+	#[test]
+	fn redirect_body_escapes_the_target() {
+		// Audit info item: `redirect()` formatted the target into the HTML body unescaped.
+		let body = body_of(redirect("/x\"><script>alert(1)</script>&'"));
+		assert!(!body.contains("<script>"), "unescaped markup in redirect body: {body}");
+		assert!(!body.contains("\"><"), "attribute can be closed by the target: {body}");
+		assert!(body.contains("&lt;script&gt;"), "target should be HTML-escaped: {body}");
+	}
+
+	#[test]
+	fn redirect_body_keeps_plain_paths_readable() {
+		let body = body_of(redirect("/r/rust/comments/abc/title"));
+		assert!(body.contains("href=\"/r/rust/comments/abc/title\""), "{body}");
 	}
 }
 

@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use crate::body::{Body, CollectError};
 use crate::server::ResponseExt;
 use crate::subreddit::join_until_size_limit;
-use crate::utils::{deflate_decompress, redirect, template, Preferences};
+use crate::utils::{deflate_decompress, local_path, redirect, reject_cross_site_post, template, Preferences};
 use askama::Template;
 use cookie::Cookie;
-use hyper::{Request, Response};
+use hyper::{Method, Request, Response};
 use time::{Duration, OffsetDateTime};
 use url::form_urlencoded;
 
@@ -20,6 +20,15 @@ struct SettingsTemplate {
 	prefs: Preferences,
 	url: String,
 	return_url: String,
+}
+
+/// Shown instead of changing cookies when a settings link was followed from another site
+#[derive(Template)]
+#[template(path = "confirm_settings.html")]
+struct ConfirmSettingsTemplate {
+	prefs: Preferences,
+	url: String,
+	restore: bool,
 }
 
 // CONSTANTS
@@ -327,15 +336,16 @@ pub async fn get(req: Request<Body>) -> Result<Response<Body>, String> {
 	Ok(template(&SettingsTemplate {
 		prefs: Preferences::new(&req),
 		url,
-		return_url: match form.get("return_to") {
-			Some(url) => url.clone().to_string(),
-			None => String::new(),
-		},
+		return_url: form.get("return_to").and_then(|url| local_path(url)).unwrap_or_default(),
 	}))
 }
 
 /// Set cookies using response "Set-Cookie" header
 pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
+	if let Some(res) = reject_cross_site_post(&req) {
+		return Ok(res);
+	}
+
 	// Split the body into parts
 	let (parts, body) = req.into_parts();
 
@@ -361,7 +371,7 @@ pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 			if value.is_empty() {
 				redirect("/settings")
 			} else {
-				redirect(value)
+				redirect(&local_path(value).unwrap_or_else(|| "/settings".to_string()))
 			}
 		}
 		None => redirect("/settings"),
@@ -384,6 +394,31 @@ pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 }
 
 fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body> {
+	// A link (on another site, in a Reddit comment, in a chat message) must not wipe or change
+	// settings, so a GET only shows what would change and a button that POSTs the same URL back.
+	if req.method() != Method::POST {
+		// The action is a fixed route, not the request URI: routing normalises the path (`//`,
+		// `%2F`) but the handler sees it raw, and `//settings//restore` would be a protocol-relative URL
+		let route = if remove_cookies { "/settings/restore" } else { "/settings/update" };
+		let url = match req.uri().query() {
+			Some(query) => format!("{route}?{query}"),
+			None => route.to_string(),
+		};
+		return template(&ConfirmSettingsTemplate {
+			prefs: Preferences::new(&req),
+			url,
+			restore: remove_cookies,
+		});
+	}
+	if let Some(res) = reject_cross_site_post(&req) {
+		return res;
+	}
+
+	apply_settings(req, remove_cookies)
+}
+
+/// Sets the cookies for the settings in the query string of `req`
+fn apply_settings(req: Request<Body>, remove_cookies: bool) -> Response<Body> {
 	// Split the body into parts
 	let (parts, _) = req.into_parts();
 
@@ -402,11 +437,7 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 	let path = match form.get("redirect") {
 		Some(value) => {
 			let value = value.replace("%26", "&").replace("%23", "#");
-			if value.starts_with('/') {
-				value
-			} else {
-				format!("/{value}")
-			}
+			local_path(&value).unwrap_or_else(|| "/".to_string())
 		}
 		None => "/".to_string(),
 	};
@@ -556,7 +587,13 @@ pub async fn update(req: Request<Body>) -> Result<Response<Body>, String> {
 }
 
 pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, String> {
-	let body = match req.into_body().collect_bytes_limited(MAX_ENCODED_RESTORE_BODY_LEN).await {
+	if let Some(res) = reject_cross_site_post(&req) {
+		return Ok(res);
+	}
+
+	let (parts, body) = req.into_parts();
+	let cookies = parts.headers.get_all("cookie").iter().cloned().collect::<Vec<_>>();
+	let body = match body.collect_bytes_limited(MAX_ENCODED_RESTORE_BODY_LEN).await {
 		Ok(bytes) => bytes,
 		Err(CollectError::TooLarge) => return Ok(payload_too_large()),
 		Err(e) => return Err(e.to_string()),
@@ -575,9 +612,351 @@ pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, Strin
 
 	prefs.available_themes = vec![];
 
+	// Already a same-origin POST, so apply the settings here rather than redirecting to a GET link
 	let url = format!("/settings/restore/?{}", prefs.to_urlencoded()?);
+	let mut restore = Request::builder().uri(url);
+	for cookie in cookies {
+		restore = restore.header("cookie", cookie);
+	}
 
-	Ok(redirect(&url))
+	Ok(apply_settings(restore.body(Body::empty()).map_err(|e| e.to_string())?, true))
+}
+
+#[cfg(test)]
+mod redirect_tests {
+	use super::*;
+	use crate::utils::redirect_test_support::{assert_local_redirect, OFFSITE_PAYLOADS};
+	use futures_lite::future::block_on;
+
+	fn post(path: &str, body: String) -> Request<Body> {
+		Request::builder().method("POST").uri(path).body(Body::from(body)).unwrap()
+	}
+
+	fn get_request(uri: String) -> Request<Body> {
+		Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
+	}
+
+	// Settings links only change anything when posted back from the confirmation page
+	fn post_request(uri: String) -> Request<Body> {
+		Request::builder().method("POST").uri(uri).body(Body::empty()).unwrap()
+	}
+
+	#[test]
+	fn settings_post_return_to_stays_on_the_instance() {
+		for payload in OFFSITE_PAYLOADS {
+			let res = block_on(set(post("/settings", format!("theme=dark&return_to={payload}")))).unwrap();
+			assert_local_redirect(&res, payload);
+		}
+	}
+
+	#[test]
+	fn settings_post_return_to_keeps_a_local_path() {
+		let res = block_on(set(post("/settings", "return_to=%2Fr%2Frust%3Fsort%3Dtop".to_string()))).unwrap();
+		assert_eq!(res.headers()["location"], "/r/rust?sort=top");
+	}
+
+	/// The `return_to` value the settings form would send back
+	fn prefilled_return_to(uri: String) -> String {
+		let res = block_on(get(get_request(uri))).unwrap();
+		let body = String::from_utf8(block_on(res.into_body().collect_bytes()).unwrap().to_vec()).unwrap();
+		let field = regex::Regex::new(r#"value="([^"]*)" name="return_to""#).unwrap();
+		field.captures(&body).expect("settings form has a return_to field")[1].to_string()
+	}
+
+	#[test]
+	fn settings_get_does_not_prefill_an_offsite_return_to() {
+		for payload in OFFSITE_PAYLOADS {
+			assert_eq!(prefilled_return_to(format!("/settings?return_to={payload}")), "", "{payload}: prefilled the form");
+		}
+	}
+
+	#[test]
+	fn settings_get_prefills_a_local_return_to() {
+		assert_eq!(prefilled_return_to("/settings?return_to=/r/rust".to_string()), "/r/rust");
+	}
+
+	#[test]
+	fn settings_restore_redirect_stays_on_the_instance() {
+		for payload in OFFSITE_PAYLOADS {
+			let res = block_on(restore(post_request(format!("/settings/restore?redirect={payload}")))).unwrap();
+			assert_local_redirect(&res, payload);
+		}
+	}
+
+	#[test]
+	fn settings_update_redirect_stays_on_the_instance() {
+		for payload in OFFSITE_PAYLOADS {
+			let res = block_on(update(post_request(format!("/settings/update?theme=dark&redirect={payload}")))).unwrap();
+			assert_local_redirect(&res, payload);
+		}
+	}
+
+	#[test]
+	fn settings_update_redirect_keeps_a_local_path() {
+		// The in-app links pass the current path, with or without the leading slash
+		let res = block_on(update(post_request("/settings/update?use_hls=on&redirect=/r/rust/comments/abc".to_string()))).unwrap();
+		assert_eq!(res.headers()["location"], "/r/rust/comments/abc");
+		let res = block_on(update(post_request("/settings/update?use_hls=on&redirect=r/rust".to_string()))).unwrap();
+		assert_eq!(res.headers()["location"], "/r/rust");
+	}
+}
+
+/// POSTs that change preferences must come from a page on this instance (audit finding #9)
+#[cfg(test)]
+mod confirm_page_tests {
+	use super::*;
+	use futures_lite::future::block_on;
+
+	fn get(uri: &str) -> Request<Body> {
+		Request::builder().method("GET").uri(uri).header("host", "redlib.example").body(Body::empty()).unwrap()
+	}
+
+	fn body_of(res: Response<Body>) -> String {
+		String::from_utf8(block_on(res.into_body().collect_bytes()).unwrap().to_vec()).unwrap()
+	}
+
+	/// Routing collapses `//` in the path before a handler runs, but the handler sees the raw URI:
+	/// the form action must not be taken from it, or `//settings//restore` becomes a
+	/// protocol-relative URL pointing at another host.
+	#[test]
+	fn form_action_is_a_fixed_route_with_the_query() {
+		for uri in [
+			"//settings//restore?theme=light",
+			"/settings%2Frestore?theme=light",
+			"/settings/restore/?theme=light",
+			"/settings/restore?theme=light",
+		] {
+			let body = body_of(block_on(restore(get(uri))).unwrap());
+			assert!(body.contains("method=\"post\" action=\"/settings/restore?theme=light\""), "{uri}: {body}");
+		}
+		for uri in ["//settings//update?theme=light", "/settings/update/?theme=light"] {
+			let body = body_of(block_on(update(get(uri))).unwrap());
+			assert!(body.contains("method=\"post\" action=\"/settings/update?theme=light\""), "{uri}: {body}");
+		}
+	}
+
+	#[test]
+	fn update_page_does_not_claim_to_restore() {
+		let update_page = body_of(block_on(update(get("/settings/update?theme=light"))).unwrap());
+		assert!(!update_page.contains("Restoring replaces"), "{update_page}");
+		let restore_page = body_of(block_on(restore(get("/settings/restore?theme=light"))).unwrap());
+		assert!(restore_page.contains("Restoring replaces all of your settings"), "{restore_page}");
+	}
+}
+
+#[cfg(test)]
+mod origin_tests {
+	use super::*;
+	use futures_lite::future::block_on;
+
+	fn post(uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+		let mut builder = Request::builder().method("POST").uri(uri).header("host", "redlib.example");
+		for (name, value) in headers {
+			builder = builder.header(*name, *value);
+		}
+		builder.body(Body::from("theme=dark&return_to=%2Fr%2Frust")).unwrap()
+	}
+
+	const CROSS_SITE: [&[(&str, &str)]; 6] = [
+		&[("sec-fetch-site", "cross-site")],
+		&[("sec-fetch-site", "same-site")],
+		&[("sec-fetch-site", "none")],
+		&[("origin", "https://evil.example")],
+		&[("origin", "null")],
+		&[("origin", "https://redlib.example.evil.example")],
+	];
+
+	const SAME_ORIGIN: [&[(&str, &str)]; 5] = [
+		// curl, scripts, anything that is not a browser
+		&[],
+		&[("sec-fetch-site", "same-origin")],
+		&[("origin", "https://redlib.example")],
+		&[("origin", "http://REDLIB.example")],
+		// Behind a proxy that rewrites Host
+		&[("origin", "https://front.example"), ("x-forwarded-host", "front.example")],
+	];
+
+	#[test]
+	fn settings_post_refuses_cross_site_requests() {
+		for headers in CROSS_SITE {
+			let res = block_on(set(post("/settings", headers))).unwrap();
+			assert_eq!(res.status(), 403, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_none(), "{headers:?}: changed settings");
+		}
+	}
+
+	#[test]
+	fn settings_post_accepts_same_origin_requests() {
+		for headers in SAME_ORIGIN {
+			let res = block_on(set(post("/settings", headers))).unwrap();
+			assert_eq!(res.status(), 302, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_some(), "{headers:?}");
+		}
+	}
+
+	#[test]
+	fn encoded_restore_refuses_cross_site_requests() {
+		for headers in CROSS_SITE {
+			let res = block_on(encoded_restore(post("/settings/encoded-restore", headers))).unwrap();
+			assert_eq!(res.status(), 403, "{headers:?}");
+		}
+	}
+}
+
+/// /settings/restore and /settings/update change cookies, so a GET (a link, which anyone can put
+/// on a page, in a Reddit comment or in a chat message) must not be able to trigger them
+/// (audit finding #7). Only a same-origin POST does.
+#[cfg(test)]
+mod navigation_tests {
+	use super::*;
+	use futures_lite::future::block_on;
+
+	fn request(method: &str, uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+		let mut builder = Request::builder()
+			.method(method)
+			.uri(uri)
+			.header("host", "redlib.example")
+			.header("cookie", "theme=dark; subscriptions=rust+news; filters=memes");
+		for (name, value) in headers {
+			builder = builder.header(*name, *value);
+		}
+		builder.body(Body::empty()).unwrap()
+	}
+
+	// Every way a GET can arrive: from another site, from a Reddit comment rendered by this
+	// instance, from an email or chat app, typed in, or from something that is not a browser
+	const ANY_GET: [&[(&str, &str)]; 6] = [
+		&[],
+		&[("sec-fetch-site", "cross-site")],
+		&[("sec-fetch-site", "same-site")],
+		&[("sec-fetch-site", "same-origin")],
+		&[("sec-fetch-site", "none")],
+		&[("sec-fetch-user", "?1"), ("sec-fetch-site", "none")],
+	];
+
+	const SAME_ORIGIN: [&[(&str, &str)]; 3] = [&[("sec-fetch-site", "same-origin")], &[("origin", "https://redlib.example")], &[]];
+
+	const CROSS_SITE: [&[(&str, &str)]; 4] = [
+		&[("sec-fetch-site", "cross-site")],
+		&[("sec-fetch-site", "same-site")],
+		&[("sec-fetch-site", "none")],
+		&[("origin", "https://evil.example")],
+	];
+
+	fn body_of(res: Response<Body>) -> String {
+		String::from_utf8(block_on(res.into_body().collect_bytes()).unwrap().to_vec()).unwrap()
+	}
+
+	fn cookies_of(res: &Response<Body>) -> Vec<String> {
+		res.headers().get_all("set-cookie").iter().map(|c| c.to_str().unwrap().to_string()).collect()
+	}
+
+	#[test]
+	fn restore_by_get_does_not_touch_cookies() {
+		for headers in ANY_GET {
+			let res = block_on(restore(request("GET", "/settings/restore?redirect=/", headers))).unwrap();
+			assert_eq!(res.status(), 200, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_none(), "{headers:?}: wiped or changed cookies");
+			assert!(res.headers().get("location").is_none(), "{headers:?}");
+		}
+	}
+
+	#[test]
+	fn update_by_get_does_not_touch_cookies() {
+		for headers in ANY_GET {
+			let res = block_on(update(request("GET", "/settings/update?theme=light&redirect=/", headers))).unwrap();
+			assert_eq!(res.status(), 200, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_none(), "{headers:?}: changed cookies");
+			assert!(res.headers().get("location").is_none(), "{headers:?}");
+		}
+	}
+
+	#[test]
+	fn link_gets_a_page_that_continues_with_a_post() {
+		// Restore links are meant to be shared, so they still work: one click on the page continues
+		let res = block_on(restore(request(
+			"GET",
+			"/settings/restore/?theme=light&subscriptions=a+b&redirect=/r/a",
+			&[("sec-fetch-site", "cross-site")],
+		)))
+		.unwrap();
+		let body = body_of(res);
+		assert!(
+			body.contains("method=\"post\" action=\"/settings/restore?theme=light&#38;subscriptions=a+b&#38;redirect=/r/a\""),
+			"{body}"
+		);
+	}
+
+	#[test]
+	fn restore_by_post_works() {
+		for headers in SAME_ORIGIN {
+			let res = block_on(restore(request("POST", "/settings/restore?theme=light&redirect=/r/rust", headers))).unwrap();
+			assert_eq!(res.status(), 302, "{headers:?}");
+			assert_eq!(res.headers()["location"], "/r/rust", "{headers:?}");
+			let cookies = cookies_of(&res);
+			assert!(cookies.iter().any(|c| c.starts_with("theme=light")), "{headers:?}: {cookies:?}");
+			assert!(
+				cookies.iter().any(|c| c.starts_with("subscriptions=;")),
+				"{headers:?}: restore removes what the link does not carry: {cookies:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn update_by_post_works() {
+		for headers in SAME_ORIGIN {
+			let res = block_on(update(request("POST", "/settings/update?use_hls=on&redirect=/r/rust", headers))).unwrap();
+			assert_eq!(res.status(), 302, "{headers:?}");
+			assert_eq!(res.headers()["location"], "/r/rust", "{headers:?}");
+			let cookies = cookies_of(&res);
+			assert!(cookies.iter().any(|c| c.starts_with("use_hls=on")), "{headers:?}: {cookies:?}");
+			assert!(!cookies.iter().any(|c| c.starts_with("subscriptions=;")), "{headers:?}: update keeps the rest: {cookies:?}");
+		}
+	}
+
+	#[test]
+	fn restore_and_update_by_cross_site_post_are_refused() {
+		for headers in CROSS_SITE {
+			let res = block_on(restore(request("POST", "/settings/restore?redirect=/", headers))).unwrap();
+			assert_eq!(res.status(), 403, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_none(), "{headers:?}");
+			let res = block_on(update(request("POST", "/settings/update?theme=light", headers))).unwrap();
+			assert_eq!(res.status(), 403, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_none(), "{headers:?}");
+		}
+	}
+
+	#[tokio::test]
+	async fn encoded_restore_applies_the_settings_without_another_click() {
+		let prefs = Preferences {
+			theme: "light".to_string(),
+			..Preferences::default()
+		};
+		let form = form_urlencoded::Serializer::new(String::new())
+			.append_pair("encoded_prefs", &prefs.to_bincode_str().unwrap())
+			.finish();
+		let mut req = request("POST", "/settings/encoded-restore", &[("sec-fetch-site", "same-origin")]);
+		*req.body_mut() = Body::from(form);
+		let res = encoded_restore(req).await.unwrap();
+		assert_eq!(res.status(), 302);
+		assert_eq!(res.headers()["location"], "/");
+		let cookies = cookies_of(&res);
+		assert!(cookies.iter().any(|c| c.starts_with("theme=light")), "{cookies:?}");
+		assert!(cookies.iter().any(|c| c.starts_with("subscriptions=;")), "{cookies:?}");
+	}
+
+	/// Links in Redlib's own pages must not be GETs to the settings routes: those only show a
+	/// confirmation page.
+	#[test]
+	fn templates_do_not_link_to_the_settings_routes() {
+		for (name, template) in [
+			("utils.html", include_str!("../templates/utils.html")),
+			("nsfwlanding.html", include_str!("../templates/nsfwlanding.html")),
+		] {
+			assert!(!template.contains("href=\"/settings/update"), "{name} links to /settings/update");
+			assert!(!template.contains("href=\"/settings/restore"), "{name} links to /settings/restore");
+		}
+	}
 }
 
 /// Hostile settings codes and request bodies (audit findings 3, 4, 5).

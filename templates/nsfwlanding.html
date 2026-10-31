@@ -20,9 +20,13 @@
                 This instance of Redlib is SFW-only.</p>
             {% else %}
                 Enable "Show NSFW posts" in <a href="/settings">settings</a> to view this {% if res_type == crate::utils::ResourceType::Subreddit %}subreddit{% else if res_type == crate::utils::ResourceType::User %}user's posts or comments{% else if res_type == crate::utils::ResourceType::Post %}post{% endif %}. <br>
-                {% if res_type == crate::utils::ResourceType::Post %} You can also quickly bypass this gate and view the post by clicking on this <a href="/settings/update/?show_nsfw=on&redirect={{url}}">link</a>.{% endif %}
             {% endif %}
         </p>
+        {% if !crate::utils::sfw_only() && res_type == crate::utils::ResourceType::Post %}
+            <form method="post" action="/settings/update/?show_nsfw=on&redirect={{url}}">
+                <p>You can also quickly bypass this gate and view the post by <button class="link-button" type="submit">enabling NSFW posts</button>.</p>
+            </form>
+        {% endif %}
     </div>
 {% endblock %}
 {% block footer %}

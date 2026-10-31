@@ -1420,6 +1420,139 @@ mod gate_log_tests {
 }
 
 #[cfg(test)]
+mod gate_log_flood_tests {
+	use super::*;
+	use sealed_test::prelude::*;
+	use std::sync::Mutex;
+
+	// Review of the observability branch: the throttle tables are capped, but
+	// once full they dropped new clients without a trace, so an attacker with
+	// a /64 (or a proxy pool) could switch denial logging off for everyone
+	// else. Each test runs in its own process (`sealed_test`).
+	struct Capture(Mutex<Vec<(log::Level, String)>>);
+
+	impl log::Log for Capture {
+		fn enabled(&self, _: &log::Metadata) -> bool {
+			true
+		}
+		fn log(&self, record: &log::Record) {
+			self.0.lock().unwrap().push((record.level(), record.args().to_string()));
+		}
+		fn flush(&self) {}
+	}
+
+	static CAPTURE: Capture = Capture(Mutex::new(Vec::new()));
+
+	fn capture_info_logs() {
+		log::set_logger(&CAPTURE).expect("one logger per test process");
+		log::set_max_level(log::LevelFilter::Info);
+		// Loading the config logs its own summary; that is not what is under test.
+		let _ = enabled();
+		logged();
+	}
+
+	fn logged() -> Vec<String> {
+		std::mem::take(&mut *CAPTURE.0.lock().unwrap())
+			.into_iter()
+			.filter(|(level, _)| *level <= log::Level::Info)
+			.map(|(_, line)| line)
+			.collect()
+	}
+
+	fn ip(s: &str) -> IpAddr {
+		s.parse().unwrap()
+	}
+
+	/// The n-th distinct IPv4 client, none of them in the test's trusted or bypass ranges.
+	fn v4_client(n: u32) -> IpAddr {
+		IpAddr::from([100, 64 + (n >> 16) as u8, (n >> 8) as u8, n as u8])
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn one_ipv6_prefix_is_one_client_for_the_log() {
+		capture_info_logs();
+
+		// A single /64 hands out 2^64 addresses; they are one subscriber.
+		for n in 0..1100u32 {
+			let client = ip(&format!("2001:db8::{n:x}"));
+			assert!(gate(client, "/secret-probe", None, &HeaderMap::new()).is_some());
+		}
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{} lines", lines.len());
+
+		// The next /64 is somebody else.
+		assert!(gate(ip("2001:db8:0:1::1"), "/", None, &HeaderMap::new()).is_some());
+		assert_eq!(logged().len(), 1);
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn a_full_denial_table_still_leaves_a_trace_for_new_clients() {
+		capture_info_logs();
+
+		// Fill the table with distinct clients; each gets its own line.
+		let mut itemised = 0;
+		for n in 0..1024 {
+			assert!(gate(v4_client(n), "/filler", None, &HeaderMap::new()).is_some());
+			itemised += logged().len();
+		}
+		assert_eq!(itemised, 1024);
+
+		// Now a fresh client probes. It cannot get a line of its own, but the
+		// denials must not vanish: a summary line has to say they happened.
+		for n in 0..50 {
+			assert!(gate(v4_client(5000 + n), "/secret-probe", None, &HeaderMap::new()).is_some());
+		}
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "one summary line per interval, got {lines:?}");
+		assert!(lines[0].contains("not itemised"), "{lines:?}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_AUTH_BYPASS_CIDRS", "100.64.0.0/10"),
+	])]
+	fn a_full_pass_table_still_leaves_a_trace_for_new_clients() {
+		capture_info_logs();
+
+		let mut itemised = 0;
+		for n in 0..1024 {
+			assert!(gate(v4_client(n), "/", None, &HeaderMap::new()).is_none());
+			itemised += logged().len();
+		}
+		assert_eq!(itemised, 1024);
+
+		for n in 0..50 {
+			assert!(gate(v4_client(5000 + n), "/", None, &HeaderMap::new()).is_none());
+		}
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{lines:?}");
+		assert!(lines[0].contains("not itemised"), "{lines:?}");
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use hyper::header::HeaderValue;

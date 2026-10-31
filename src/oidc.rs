@@ -952,6 +952,117 @@ fn wants_html(headers: &HeaderMap) -> bool {
 }
 
 #[cfg(test)]
+mod login_query_tests {
+	use super::*;
+	use hyper::header::HeaderValue;
+	use sealed_test::prelude::*;
+
+	fn browser() -> HeaderMap {
+		let mut map = HeaderMap::new();
+		map.insert("accept", HeaderValue::from_static("text/html,application/xhtml+xml,*/*;q=0.8"));
+		map
+	}
+
+	/// The `Location` the gate answers an anonymous browser with.
+	fn login_location(path: &str, query: Option<&str>) -> String {
+		let res = gate("203.0.113.9".parse().unwrap(), path, query, &browser()).expect("must be gated");
+		res.headers().get("location").unwrap().to_str().unwrap().to_string()
+	}
+
+	/// Where the login endpoint would send the user back to, given the gate's `Location`.
+	fn landing(location: &str) -> String {
+		redirect_target(location.split_once('?').map(|(_, q)| q))
+	}
+
+	// Audit info item: server.rs passed only the path to the gate, so a login
+	// started from `/search?q=x` came back as `/search`.
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn the_login_round_trip_keeps_the_query_string() {
+		let location = login_location("/search", Some("q=x&sort=new"));
+		assert_eq!(location, "/oidc/login?redirect=%2Fsearch%3Fq%3Dx%26sort%3Dnew");
+		assert_eq!(landing(&location), "/search?q=x&sort=new");
+
+		// Reserved characters survive both layers of encoding.
+		let location = login_location("/r/rust/search", Some("q=a+b%26c&restrict_sr=on"));
+		assert_eq!(landing(&location), "/r/rust/search?q=a+b%26c&restrict_sr=on");
+
+		// No query, no question mark.
+		assert_eq!(landing(&login_location("/r/rust", None)), "/r/rust");
+		assert_eq!(landing(&login_location("/r/rust", Some(""))), "/r/rust");
+	}
+
+	// The query rides through the same same-origin validation as the path.
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn the_query_cannot_point_the_redirect_off_site() {
+		// A query is just data after a local path, however URL-shaped.
+		for query in ["redirect=https://evil.example", "next=//evil.example", "u=http://evil.example/&x=\\evil"] {
+			let target = landing(&login_location("/", Some(query)));
+			assert_eq!(target, format!("/?{query}"));
+			assert!(target.starts_with("/?"), "{target}");
+		}
+
+		// A path the validator refuses is refused whatever the query says.
+		assert_eq!(landing(&login_location("/\\evil.example", Some("q=x"))), "/");
+		assert_eq!(landing(&login_location("//evil.example", Some("q=x"))), "/");
+		// So is a query a browser would read differently from the server.
+		assert_eq!(landing(&login_location("/search", Some("q=a\tb"))), "/");
+	}
+
+	// The target lives in a cookie, and browsers drop cookies over 4 KiB, which
+	// would break the login altogether.
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn an_oversized_query_is_dropped_and_the_path_kept() {
+		let long = format!("q={}", "a".repeat(5000));
+		let location = login_location("/search", Some(&long));
+		assert_eq!(landing(&location), "/search");
+		assert!(location.len() < 200, "{}", location.len());
+
+		// A path that long has nowhere sensible to go back to.
+		let location = login_location(&format!("/{}", "a".repeat(5000)), Some("q=x"));
+		assert_eq!(landing(&location), "/");
+	}
+
+	// Programmatic clients still get the plain 401, with nothing of the URL in it.
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn programmatic_clients_still_get_a_401_with_a_query() {
+		let res = gate("203.0.113.9".parse().unwrap(), "/search", Some("q=x"), &HeaderMap::new()).expect("must be gated");
+		assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use hyper::header::HeaderValue;

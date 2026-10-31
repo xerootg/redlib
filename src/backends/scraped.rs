@@ -6,9 +6,9 @@
 //! `Listing` JSON, so comment parsing and rendering stay unchanged.
 
 use super::{json as reddit_json, Backend, Failure, Fetch, Kind};
+use crate::byte_cache::{value_size, ByteCache};
 use crate::client::{ALTERNATIVE_REDDIT_URL_BASE, CLIENT};
 use crate::utils::{enable_scrape_fallback, param, scrape_comment_prefetch};
-use cached::proc_macro::cached;
 use chrono::DateTime;
 use log::{trace, warn};
 use scraper::{ElementRef, Html, Selector};
@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use wreq::cookie::Jar;
 use wreq::header as wreq_header;
 
@@ -124,8 +125,26 @@ async fn thread(path: &str, quarantine: bool) -> Result<Value, String> {
 /// returned as top-level comments. When `comment_id` is set, only that
 /// comment's thread is returned, preceded by up to `context` ancestors,
 /// mirroring the API's comment permalinks.
-#[cached(max_size = 100, ttl_secs = 30)]
 pub async fn comments(subreddit: String, post_id: String, comment_id: Option<String>, sort: String, context: Option<String>, more: Option<More>) -> Result<Value, String> {
+	let key = format!("{subreddit} {post_id} {comment_id:?} {sort} {context:?} {more:?}");
+	if let Some(hit) = COMMENTS_CACHE.get(&key) {
+		return hit;
+	}
+	let result = comments_uncached(subreddit, post_id, comment_id, sort, context, more).await;
+	let size = match &result {
+		Ok(tree) => value_size(tree),
+		Err(msg) => msg.len(),
+	};
+	COMMENTS_CACHE.insert(key, result.clone(), size);
+	result
+}
+
+/// The memory the comment cache may hold, as `value_size` counts it.
+const COMMENTS_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+static COMMENTS_CACHE: LazyLock<ByteCache<Result<Value, String>>> = LazyLock::new(|| ByteCache::new(COMMENTS_CACHE_BYTES, 100, Duration::from_secs(30)));
+
+async fn comments_uncached(subreddit: String, post_id: String, comment_id: Option<String>, sort: String, context: Option<String>, more: Option<More>) -> Result<Value, String> {
 	let html = match &more {
 		Some(more) => shreddit_fragment(more_path(&subreddit, &post_id, &more.query), Some(more.cursor.clone())).await?,
 		None => shreddit_fragment(comments_path(&subreddit, &post_id, comment_id.as_deref(), &sort), None).await?,

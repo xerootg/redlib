@@ -18,18 +18,18 @@ pub mod obscura;
 mod score;
 pub mod scraped;
 
+use crate::byte_cache::{value_size, ByteCache};
 use crate::cache_key;
 use crate::config::get_setting;
 use crate::oauth::force_refresh_token;
 use crate::utils::param;
-use cached::proc_macro::cached;
 use log::{debug, error, info, warn};
 use score::{Outcome, Ranking};
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A place redlib can get Reddit's JSON from.
 pub trait Backend: Sync {
@@ -297,21 +297,39 @@ fn cursor_owner(path: &str) -> Option<&'static str> {
 	})
 }
 
+/// The memory the fetch cache may hold, as `value_size` counts it. Parsed
+/// pages are megabytes each, and the pod has 256Mi for everything.
+const FETCH_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+type Fetched = Result<(Value, &'static str), String>;
+
+static FETCH_CACHE: LazyLock<ByteCache<Fetched>> = LazyLock::new(|| ByteCache::new(FETCH_CACHE_BYTES, 100, Duration::from_secs(30)));
+
 /// Fetches `path` from the first backend that serves it, and names that backend.
 ///
 /// The cache is keyed on the path, so only the query parameters that change
 /// the answer are kept (see `cache_key`): anyone can add to a URL, and every
 /// variation would otherwise be a copy of the page in memory and a request to
-/// Reddit.
+/// Reddit. What the cache holds is limited in bytes, not entries, for the
+/// variations that no key can rule out.
 pub async fn fetch(path: String, quarantine: bool) -> Result<(Value, &'static str), String> {
 	let Some(path) = cache_key::fetch_key(&path) else {
 		return Err("Invalid URL: a path segment is too long".to_string());
 	};
-	fetch_cached(path, quarantine).await
+	let key = format!("{quarantine} {}", cache_key::entry_key(&path));
+	if let Some(hit) = FETCH_CACHE.get(&key) {
+		return hit;
+	}
+	let result = fetch_uncached(path, quarantine).await;
+	let size = match &result {
+		Ok((json, _)) => value_size(json),
+		Err(msg) => msg.len(),
+	};
+	FETCH_CACHE.insert(key, result.clone(), size);
+	result
 }
 
-#[cached(max_size = 100, ttl_secs = 30)]
-async fn fetch_cached(path: String, quarantine: bool) -> Result<(Value, &'static str), String> {
+async fn fetch_uncached(path: String, quarantine: bool) -> Fetched {
 	let kind = Kind::of(&path);
 	let mut blocked = false;
 	let mut last_error = None;
@@ -365,7 +383,8 @@ async fn check_json(json: Value, path: &str) -> Result<Value, Failure> {
 		// OAuth token has expired; http status 401
 		if json["message"] == "Unauthorized" {
 			error!("Forcing a token refresh");
-			let () = force_refresh_token().await;
+			// Not awaited: with the token endpoint down, a refresh retries for minutes
+			tokio::spawn(force_refresh_token());
 			return Err(Failure::Invalid("OAuth token has expired. Please refresh the page!".to_string()));
 		}
 

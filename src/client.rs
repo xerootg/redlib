@@ -1118,6 +1118,18 @@ mod proxy_response_tests {
 		assert_eq!(untyped.status().as_u16(), 502);
 	}
 
+	/// Browsers take the last valid type of a comma separated list, so a list
+	/// that starts with a media type can still end as a page or a script.
+	#[test]
+	fn test_a_list_or_repeat_of_content_types_is_refused() {
+		for content_type in ["image/png, text/html", "image/png,text/javascript", "image/png; x=1, text/html"] {
+			let res = restrict_proxy_response(upstream(200, &[("Content-Type", content_type)]));
+			assert_eq!(res.status().as_u16(), 502, "{content_type}");
+		}
+		let res = restrict_proxy_response(upstream(200, &[("Content-Type", "image/png"), ("Content-Type", "text/html")]));
+		assert_eq!(res.status().as_u16(), 502, "two Content-Type headers");
+	}
+
 	#[test]
 	fn test_upstream_errors_keep_their_status_but_not_their_page() {
 		let res = restrict_proxy_response(upstream(404, &[("Content-Type", "text/html")]));

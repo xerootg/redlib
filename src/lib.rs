@@ -7,6 +7,7 @@ pub mod instance_info;
 pub mod oauth;
 pub mod oauth_resources;
 pub mod post;
+pub mod pref_validation;
 pub mod reddit_health;
 pub mod redgifs;
 pub mod search;

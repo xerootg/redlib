@@ -1,6 +1,7 @@
 #![allow(clippy::cmp_owned)]
 
 use crate::body::Body;
+use crate::pref_validation::is_valid_subreddit_name;
 use crate::utils::{
 	build_rss_items, catch_random, clean_url, enable_rss, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls,
 	rss_page_link, rss_page_path, rss_response, setting, setting_or_default, should_be_nsfw_gated, template, val, Post, Preferences, Subreddit, RSS_LISTING_SORTS,
@@ -211,6 +212,9 @@ pub fn quarantine(req: &Request<Body>, sub: String, restriction: &str) -> Respon
 
 pub async fn add_quarantine_exception(req: Request<Body>) -> Result<Response<Body>, String> {
 	let subreddit = req.param("sub").ok_or("Invalid URL")?;
+	if !is_valid_subreddit_name(&subreddit) {
+		return Err("Invalid URL".to_string());
+	}
 	let redir = param(&format!("?{}", req.uri().query().unwrap_or_default()), "redir").ok_or("Invalid URL")?;
 	let mut response = redirect(&redir);
 	response.insert_cookie(
@@ -276,6 +280,11 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 		return Err("Can't subscribe to random subreddit!".to_string());
 	}
 
+	// The names end up in a Reddit API path and in a cookie
+	if !sub.split('+').filter(|part| !part.is_empty()).all(is_valid_subreddit_name) {
+		return Err("Invalid subreddit name".to_string());
+	}
+
 	let query = req.uri().query().unwrap_or_default().to_string();
 
 	let preferences = Preferences::new(&req);
@@ -320,6 +329,11 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 			}
 			.unwrap_or(part)
 		};
+
+		// The display name comes from the API; it still has to be safe to store in a cookie
+		if !is_valid_subreddit_name(part) {
+			continue;
+		}
 
 		// Modify sub list based on action
 		if action.contains(&"subscribe".to_string()) && !sub_list.contains(&part.to_owned()) {

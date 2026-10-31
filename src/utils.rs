@@ -1046,8 +1046,8 @@ pub fn param(path: &str, value: &str) -> Option<String> {
 	)
 }
 
-/// Retrieve the value of a setting by name
-pub fn setting(req: &Request<Body>, name: &str) -> String {
+/// Retrieve the unchecked value of a setting by name
+fn raw_setting(req: &Request<Body>, name: &str) -> String {
 	// Parse a cookie value from request
 
 	// If this was called with "subscriptions" and the "subscriptions" cookie has a value
@@ -1115,6 +1115,12 @@ pub fn setting(req: &Request<Body>, name: &str) -> String {
 			.value()
 			.to_string()
 	}
+}
+
+/// Retrieve the value of a setting by name. Prefs whose value is not one of their known
+/// options (see [`crate::pref_validation`]) read as unset.
+pub fn setting(req: &Request<Body>, name: &str) -> String {
+	crate::pref_validation::sanitize_pref(name, raw_setting(req, name))
 }
 
 /// Retrieve the value of a setting by name or the default value

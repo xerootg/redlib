@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -965,12 +965,17 @@ fn login_target(path: &str, query: Option<&str>) -> String {
 
 /// Lets one line through per key and interval, and counts what it held back.
 /// The table is capped, so an attacker who varies the key cannot grow it
-/// without bound: once it is full of live entries, new keys are not logged
-/// until old ones expire. That also caps the lines per interval at `cap`.
+/// without bound: once it is full of live entries, new keys are not
+/// itemised until old ones expire. They are counted, and `summary` reports
+/// the count once per interval, so a full table never hides activity. That
+/// caps the lines per interval at `cap` plus one.
 struct LogThrottle<K> {
 	interval: Duration,
 	cap: usize,
 	seen: HashMap<K, (Instant, u32)>,
+	/// Keys turned away because the table was full, since the last summary.
+	refused: u32,
+	last_summary: Option<Instant>,
 }
 
 impl<K: Hash + Eq> LogThrottle<K> {
@@ -979,6 +984,8 @@ impl<K: Hash + Eq> LogThrottle<K> {
 			interval,
 			cap,
 			seen: HashMap::new(),
+			refused: 0,
+			last_summary: None,
 		}
 	}
 
@@ -997,11 +1004,33 @@ impl<K: Hash + Eq> LogThrottle<K> {
 			let interval = self.interval;
 			self.seen.retain(|_, (last, _)| now.duration_since(*last) < interval);
 			if self.seen.len() >= self.cap {
+				self.refused = self.refused.saturating_add(1);
 				return None;
 			}
 		}
 		self.seen.insert(key, (now, 0));
 		Some(0)
+	}
+
+	/// `Some(n)` if a summary line may be logged now, where `n` is how many
+	/// requests from keys the full table could not itemise were turned away
+	/// since the last one.
+	fn summary(&mut self, now: Instant) -> Option<u32> {
+		if self.refused == 0 || self.last_summary.is_some_and(|last| now.duration_since(last) < self.interval) {
+			return None;
+		}
+		self.last_summary = Some(now);
+		Some(std::mem::take(&mut self.refused))
+	}
+}
+
+/// The throttle key for a client: IPv6 addresses are keyed by their /64,
+/// because one subscriber holds a whole /64 and could otherwise present a
+/// new "client" with every request.
+fn log_key(ip: IpAddr) -> IpAddr {
+	match canonical(ip) {
+		IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64))),
+		v4 => v4,
 	}
 }
 
@@ -1025,7 +1054,16 @@ fn describe_client(client: Option<IpAddr>) -> String {
 /// string is left out because it can carry secrets.
 fn note_denial(client: Option<IpAddr>, peer: IpAddr, path: &str) {
 	let peer = canonical(peer);
-	let allowed = DENIAL_LOG.lock().unwrap_or_else(PoisonError::into_inner).allow(client.unwrap_or(peer), Instant::now());
+	let now = Instant::now();
+	let (allowed, overflow) = {
+		let mut table = DENIAL_LOG.lock().unwrap_or_else(PoisonError::into_inner);
+		let allowed = table.allow(log_key(client.unwrap_or(peer)), now);
+		let overflow = if allowed.is_none() { table.summary(now) } else { None };
+		(allowed, overflow)
+	};
+	if let Some(n) = overflow {
+		info!("OIDC gate: {n} more denials from clients not itemised (log table full)");
+	}
 	if let Some(held) = allowed {
 		let path: String = path.chars().take(MAX_LOGGED_PATH).collect();
 		let held = if held > 0 {
@@ -1041,10 +1079,16 @@ fn note_denial(client: Option<IpAddr>, peer: IpAddr, path: &str) {
 /// `kind` of "bypass" (address allowlist) or "bearer" (MCP token).
 fn note_pass(kind: &'static str, client: Option<IpAddr>, peer: IpAddr) {
 	let peer = canonical(peer);
-	let allowed = PASS_LOG
-		.lock()
-		.unwrap_or_else(PoisonError::into_inner)
-		.allow((kind, client.unwrap_or(peer)), Instant::now());
+	let now = Instant::now();
+	let (allowed, overflow) = {
+		let mut table = PASS_LOG.lock().unwrap_or_else(PoisonError::into_inner);
+		let allowed = table.allow((kind, log_key(client.unwrap_or(peer))), now);
+		let overflow = if allowed.is_none() { table.summary(now) } else { None };
+		(allowed, overflow)
+	};
+	if let Some(n) = overflow {
+		info!("OIDC gate: {n} more {kind} passes from clients not itemised (log table full)");
+	}
 	if allowed.is_some() {
 		info!("OIDC gate: first {kind} pass from client {} (peer {peer})", describe_client(client));
 	}
@@ -1194,6 +1238,34 @@ mod log_throttle_tests {
 		// After the interval the next line reports what was held back.
 		assert_eq!(t.allow("a", start + MINUTE), Some(5));
 		assert_eq!(t.allow("a", start + MINUTE + Duration::from_secs(1)), None);
+	}
+
+	#[test]
+	fn keys_the_full_table_turns_away_are_counted_and_summarised_once_per_interval() {
+		let mut t = LogThrottle::new(MINUTE, 2);
+		let start = Instant::now();
+		assert_eq!(t.summary(start), None, "nothing refused, nothing to say");
+		assert_eq!(t.allow(1, start), Some(0));
+		assert_eq!(t.allow(2, start), Some(0));
+		for key in 3..=7 {
+			assert_eq!(t.allow(key, start), None);
+		}
+		assert_eq!(t.summary(start), Some(5));
+		assert_eq!(t.summary(start), None);
+		// More turned away inside the interval wait for the next summary.
+		assert_eq!(t.allow(8, start + Duration::from_secs(1)), None);
+		assert_eq!(t.summary(start + Duration::from_secs(1)), None);
+		assert_eq!(t.allow(9, start + Duration::from_secs(2)), None);
+		assert_eq!(t.summary(start + MINUTE), Some(2));
+	}
+
+	#[test]
+	fn ipv6_clients_are_keyed_by_their_64_and_mapped_ipv4_by_the_v4_address() {
+		let key = |s: &str| log_key(s.parse().unwrap());
+		assert_eq!(key("2001:db8::1"), key("2001:db8::ffff:ffff:ffff:ffff"));
+		assert_ne!(key("2001:db8::1"), key("2001:db8:0:1::1"));
+		assert_eq!(key("::ffff:203.0.113.9"), key("203.0.113.9"));
+		assert_ne!(key("203.0.113.9"), key("203.0.113.10"));
 	}
 
 	#[test]

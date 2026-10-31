@@ -1942,6 +1942,80 @@ fn get_mime_type(url: &str) -> &'static str {
 	}
 }
 
+/// Audit finding #16: every HTML response must declare its charset in the
+/// HTTP header, and `<meta charset>` must be the first thing in `<head>`.
+#[cfg(test)]
+mod html_charset_tests {
+	use super::{error, info, nsfw_landing, redirect, template, ErrorTemplate, InfoTemplate, Preferences};
+	use crate::body::Body;
+	use askama::Template;
+	use futures_lite::future::block_on;
+	use hyper::{Request, Response};
+
+	const HTML_UTF8: &str = "text/html; charset=utf-8";
+
+	fn req() -> Request<Body> {
+		Request::builder().uri("/").body(Body::empty()).unwrap()
+	}
+
+	fn content_type(res: &Response<Body>) -> Option<&str> {
+		res.headers().get("content-type").and_then(|v| v.to_str().ok())
+	}
+
+	#[test]
+	fn template_declares_charset() {
+		let page = InfoTemplate {
+			msg: "hi".into(),
+			prefs: Preferences::new(&req()),
+			url: "/".into(),
+		};
+		assert_eq!(content_type(&template(&page)), Some(HTML_UTF8));
+	}
+
+	#[test]
+	fn redirect_declares_charset() {
+		assert_eq!(content_type(&redirect("/r/rust")), Some(HTML_UTF8));
+	}
+
+	#[test]
+	fn error_declares_charset() {
+		let res = block_on(error(req(), "Oops: detail")).unwrap();
+		assert_eq!(content_type(&res), Some(HTML_UTF8));
+	}
+
+	#[test]
+	fn info_declares_charset() {
+		let res = block_on(info(req(), "hello")).unwrap();
+		assert_eq!(content_type(&res), Some(HTML_UTF8));
+	}
+
+	#[test]
+	fn nsfw_landing_declares_charset() {
+		let res = block_on(nsfw_landing(req(), "/r/test".into())).unwrap();
+		assert_eq!(content_type(&res), Some(HTML_UTF8));
+	}
+
+	/// The audit's payload: 100 `"` in the search query escape to 10 bytes each
+	/// inside `<title>`, which used to push the meta tag past the browser's
+	/// 1024-byte encoding prescan.
+	#[test]
+	fn meta_charset_precedes_attacker_controlled_title() {
+		let page = ErrorTemplate {
+			msg: "\"".repeat(100),
+			detail: String::new(),
+			reddit_url: String::new(),
+			blocked: false,
+			prefs: Preferences::new(&req()),
+			url: "/".into(),
+		};
+		let html = page.render().unwrap();
+		let meta = html.find("<meta charset=\"utf-8\">").expect("base.html must have <meta charset=\"utf-8\">");
+		let title = html.find("<title").expect("page has a <title>");
+		assert!(meta < title, "<meta charset> at {meta} must come before <title> at {title}");
+		assert!(meta < 1024, "<meta charset> at byte {meta} is outside the prescan window");
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::{deflate_compress, deflate_decompress, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, url_path_basename, Post, Preferences};

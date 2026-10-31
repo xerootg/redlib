@@ -775,6 +775,25 @@ fn compress_body(compressor: CompressionType, body_bytes: Vec<u8>) -> Result<Vec
 	Ok(compressed)
 }
 
+/// Audit finding #16: the plain-text error bodies need a Content-Type too.
+#[cfg(test)]
+mod boilerplate_content_type_tests {
+	use super::*;
+	use futures_lite::future::block_on;
+
+	#[test]
+	fn boilerplate_responses_declare_a_content_type() {
+		for status in [403, 404, 500] {
+			let res = block_on(new_boilerplate(HeaderMap::new(), HeaderMap::new(), status, Body::from("body"))).unwrap();
+			assert_eq!(
+				res.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+				Some("text/plain; charset=utf-8"),
+				"status {status}"
+			);
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

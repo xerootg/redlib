@@ -2,10 +2,10 @@
 
 use crate::body::Body;
 use crate::utils::{
-	build_rss_items, catch_random, clean_url, enable_rss, error, filter_posts, format_num, format_url, get_filters, info, local_path, nsfw_landing, param, redirect,
-	redirect_local, rewrite_urls, rss_page_link, rss_page_path, rss_response, setting, setting_or_default, should_be_nsfw_gated, template, val, Post, Preferences, Subreddit,
-	RSS_LISTING_SORTS,
+	build_rss_items, catch_random, clean_url, enable_rss, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls,
+	rss_page_link, rss_page_path, rss_response, setting, setting_or_default, should_be_nsfw_gated, template, val, Post, Preferences, Subreddit, RSS_LISTING_SORTS,
 };
+use crate::utils::{local_path, redirect_local, reject_cross_site_post};
 use crate::{backends::json, server::RequestExt, server::ResponseExt};
 use askama::Template;
 use cookie::Cookie;
@@ -211,6 +211,9 @@ pub fn quarantine(req: &Request<Body>, sub: String, restriction: &str) -> Respon
 }
 
 pub async fn add_quarantine_exception(req: Request<Body>) -> Result<Response<Body>, String> {
+	if let Some(res) = reject_cross_site_post(&req) {
+		return Ok(res);
+	}
 	let subreddit = req.param("sub").ok_or("Invalid URL")?;
 	let redir = param(&format!("?{}", req.uri().query().unwrap_or_default()), "redir").ok_or("Invalid URL")?;
 	let mut response = redirect_local(&redir);
@@ -275,6 +278,10 @@ fn subscription_redirect(sub: &str, query: &str) -> String {
 
 // Sub, filter, unfilter, or unsub by setting subscription cookie using response "Set-Cookie" header
 pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>, String> {
+	if let Some(res) = reject_cross_site_post(&req) {
+		return Ok(res);
+	}
+
 	let sub = req.param("sub").unwrap_or_default();
 	let action: Vec<String> = req.uri().path().split('/').map(String::from).collect();
 

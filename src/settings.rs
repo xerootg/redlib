@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::body::Body;
 use crate::server::ResponseExt;
 use crate::subreddit::join_until_size_limit;
-use crate::utils::{deflate_decompress, local_path, redirect, template, Preferences};
+use crate::utils::{deflate_decompress, local_path, redirect, reject_cross_site_post, template, Preferences};
 use askama::Template;
 use cookie::Cookie;
 use hyper::{Request, Response};
@@ -319,6 +319,10 @@ pub async fn get(req: Request<Body>) -> Result<Response<Body>, String> {
 
 /// Set cookies using response "Set-Cookie" header
 pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
+	if let Some(res) = reject_cross_site_post(&req) {
+		return Ok(res);
+	}
+
 	// Split the body into parts
 	let (parts, body) = req.into_parts();
 
@@ -531,6 +535,10 @@ pub async fn update(req: Request<Body>) -> Result<Response<Body>, String> {
 }
 
 pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, String> {
+	if let Some(res) = reject_cross_site_post(&req) {
+		return Ok(res);
+	}
+
 	let body = req.into_body().collect_bytes().await.map_err(|e| format!("Failed to get bytes from request body: {e}"))?;
 
 	if body.len() > 1024 * 1024 {

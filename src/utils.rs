@@ -1539,6 +1539,65 @@ pub fn redirect_local(path: &str) -> Response<Body> {
 	redirect(&local_path(path).unwrap_or_else(|| "/".to_string()))
 }
 
+/// Value of the `Sec-Fetch-Site` header, which browsers add to every request they make
+fn fetch_site(req: &Request<Body>) -> Option<&str> {
+	req.headers().get("sec-fetch-site").and_then(|value| value.to_str().ok())
+}
+
+/// Whether a state-changing request (POST) was made by a page on this instance.
+///
+/// Browsers label requests with `Sec-Fetch-Site`; older ones send `Origin` on a POST instead,
+/// which has to match `Host` (or `X-Forwarded-Host` behind a proxy that rewrites it). A request
+/// with neither header does not come from a browser, so it cannot be a cross-site form post.
+pub fn is_same_origin_post(req: &Request<Body>) -> bool {
+	if let Some(site) = fetch_site(req) {
+		return site == "same-origin";
+	}
+
+	let Some(origin) = req.headers().get("origin") else {
+		return true;
+	};
+	let Some((_, authority)) = origin.to_str().ok().and_then(|origin| origin.split_once("://")) else {
+		// `Origin: null`, or garbage
+		return false;
+	};
+
+	let host = req.headers().get("host").and_then(|host| host.to_str().ok());
+	let forwarded_host = req
+		.headers()
+		.get("x-forwarded-host")
+		.and_then(|host| host.to_str().ok())
+		.and_then(|hosts| hosts.split(',').next())
+		.map(str::trim);
+	let uri_host = req.uri().authority().map(|authority| authority.as_str());
+
+	[host, forwarded_host, uri_host]
+		.into_iter()
+		.flatten()
+		.any(|candidate| candidate.eq_ignore_ascii_case(authority))
+}
+
+/// Whether a GET that changes settings was followed by the user on this instance, typed in the
+/// address bar or opened from a bookmark, rather than triggered by a link or redirect on another
+/// site. Requests without `Sec-Fetch-Site` (non-browsers, old browsers) are let through.
+pub fn is_user_navigation(req: &Request<Body>) -> bool {
+	matches!(fetch_site(req), None | Some("same-origin" | "none"))
+}
+
+/// The response for a state-changing request that did not come from this instance, or `None`
+pub fn reject_cross_site_post(req: &Request<Body>) -> Option<Response<Body>> {
+	if is_same_origin_post(req) {
+		return None;
+	}
+	Some(
+		Response::builder()
+			.status(403)
+			.header("content-type", "text/plain; charset=utf-8")
+			.body("Cross-site request blocked".into())
+			.unwrap_or_default(),
+	)
+}
+
 pub fn redirect(path: &str) -> Response<Body> {
 	Response::builder()
 		.status(302)
@@ -1977,6 +2036,79 @@ fn get_mime_type(url: &str) -> &'static str {
 		"webp" => "image/webp",
 		"svg" => "image/svg+xml",
 		_ => "application/octet-stream",
+	}
+}
+
+#[cfg(test)]
+mod origin_check_tests {
+	use super::{is_same_origin_post, is_user_navigation, reject_cross_site_post};
+	use crate::body::Body;
+	use hyper::Request;
+
+	fn request(uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+		let mut builder = Request::builder().uri(uri);
+		for (name, value) in headers {
+			builder = builder.header(*name, *value);
+		}
+		builder.body(Body::empty()).unwrap()
+	}
+
+	#[test]
+	fn post_decided_by_sec_fetch_site_when_present() {
+		assert!(is_same_origin_post(&request("/", &[("sec-fetch-site", "same-origin")])));
+		for site in ["cross-site", "same-site", "none", "", "nonsense"] {
+			assert!(!is_same_origin_post(&request("/", &[("sec-fetch-site", site)])), "{site:?}");
+		}
+		// It wins over a matching Origin
+		let headers = [("sec-fetch-site", "cross-site"), ("origin", "https://redlib.example"), ("host", "redlib.example")];
+		assert!(!is_same_origin_post(&request("/", &headers)));
+	}
+
+	#[test]
+	fn post_falls_back_to_origin_matching_the_host() {
+		assert!(is_same_origin_post(&request("/", &[])));
+		assert!(is_same_origin_post(&request("/", &[("origin", "https://redlib.example"), ("host", "redlib.example")])));
+		assert!(is_same_origin_post(&request(
+			"/",
+			&[("origin", "http://redlib.example:8080"), ("host", "REDLIB.example:8080")]
+		)));
+		assert!(is_same_origin_post(&request(
+			"/",
+			&[("origin", "https://front.example"), ("host", "10.0.0.5"), ("x-forwarded-host", "front.example, other")]
+		)));
+		assert!(is_same_origin_post(&request("https://redlib.example/x", &[("origin", "https://redlib.example")])));
+
+		for origin in [
+			"https://evil.example",
+			"null",
+			"",
+			"redlib.example",
+			"https://redlib.example.evil.example",
+			"https://redlib.example:81",
+		] {
+			let req = request("/", &[("origin", origin), ("host", "redlib.example")]);
+			assert!(!is_same_origin_post(&req), "{origin:?}");
+		}
+		// No Host to compare against
+		assert!(!is_same_origin_post(&request("/", &[("origin", "https://redlib.example")])));
+	}
+
+	#[test]
+	fn rejection_is_a_403() {
+		assert!(reject_cross_site_post(&request("/", &[])).is_none());
+		let res = reject_cross_site_post(&request("/", &[("sec-fetch-site", "cross-site")])).unwrap();
+		assert_eq!(res.status(), 403);
+	}
+
+	#[test]
+	fn get_navigation_is_same_origin_none_or_unlabelled() {
+		assert!(is_user_navigation(&request("/", &[])));
+		for site in ["same-origin", "none"] {
+			assert!(is_user_navigation(&request("/", &[("sec-fetch-site", site)])), "{site:?}");
+		}
+		for site in ["cross-site", "same-site", "", "nonsense"] {
+			assert!(!is_user_navigation(&request("/", &[("sec-fetch-site", site)])), "{site:?}");
+		}
 	}
 }
 

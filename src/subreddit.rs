@@ -264,6 +264,15 @@ pub fn join_until_size_limit<T: std::fmt::Display>(vec: &[T]) -> Vec<std::string
 }
 
 // Sub, filter, unfilter, or unsub by setting subscription cookie using response "Set-Cookie" header
+/// Adds a removal for `{base}{start}`, `{base}{start + 1}`, ... for as long as the request carries them
+fn remove_numbered_cookies(req: &Request<Body>, response: &mut Response<Body>, base: &str, start: usize) {
+	let mut number = start;
+	while req.cookie(&format!("{base}{number}")).is_some() {
+		response.remove_cookie(format!("{base}{number}"));
+		number += 1;
+	}
+}
+
 pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>, String> {
 	let sub = req.param("sub").unwrap_or_default();
 	let action: Vec<String> = req.uri().path().split('/').map(String::from).collect();
@@ -360,17 +369,8 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 		// Remove subscriptions cookie
 		response.remove_cookie("subscriptions".to_string());
 
-		// Start with first numbered subscriptions cookie
-		let mut subscriptions_number = 1;
-
-		// While whatever subscriptionsNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("subscriptions{subscriptions_number}")).is_some() {
-			// Remove that subscriptions cookie
-			response.remove_cookie(format!("subscriptions{subscriptions_number}"));
-
-			// Increment subscriptions cookie number
-			subscriptions_number += 1;
-		}
+		// Remove every numbered subscriptions cookie, starting with the first
+		remove_numbered_cookies(&req, &mut response, "subscriptions", 1);
 	} else {
 		// Start at 0 to keep track of what number we need to start deleting old subscription cookies from
 		let mut subscriptions_number_to_delete_from = 0;
@@ -394,14 +394,8 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 			subscriptions_number_to_delete_from += 1;
 		}
 
-		// While whatever subscriptionsNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("subscriptions{subscriptions_number_to_delete_from}")).is_some() {
-			// Remove that subscriptions cookie
-			response.remove_cookie(format!("subscriptions{subscriptions_number_to_delete_from}"));
-
-			// Increment subscriptions cookie number
-			subscriptions_number_to_delete_from += 1;
-		}
+		// Remove the old numbered subscriptions cookies that were not overwritten
+		remove_numbered_cookies(&req, &mut response, "subscriptions", subscriptions_number_to_delete_from);
 	}
 
 	// If filters is empty remove all filters cookies, otherwise update them and remove old ones
@@ -409,17 +403,8 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 		// Remove filters cookie
 		response.remove_cookie("filters".to_string());
 
-		// Start with first numbered filters cookie
-		let mut filters_number = 1;
-
-		// While whatever filtersNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("filters{filters_number}")).is_some() {
-			// Remove that filters cookie
-			response.remove_cookie(format!("filters{filters_number}"));
-
-			// Increment filters cookie number
-			filters_number += 1;
-		}
+		// Remove every numbered filters cookie, starting with the first
+		remove_numbered_cookies(&req, &mut response, "filters", 1);
 	} else {
 		// Start at 0 to keep track of what number we need to start deleting old filters cookies from
 		let mut filters_number_to_delete_from = 0;
@@ -442,14 +427,8 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 			filters_number_to_delete_from += 1;
 		}
 
-		// While whatever filtersNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("filters{filters_number_to_delete_from}")).is_some() {
-			// Remove that filters cookie
-			response.remove_cookie(format!("filters{filters_number_to_delete_from}"));
-
-			// Increment filters cookie number
-			filters_number_to_delete_from += 1;
-		}
+		// Remove the old numbered filters cookies that were not overwritten
+		remove_numbered_cookies(&req, &mut response, "filters", filters_number_to_delete_from);
 	}
 
 	Ok(response)
@@ -689,5 +668,30 @@ mod tests {
 			let gated = subreddit("drugs", true).await;
 			assert!(gated.is_ok());
 		});
+	}
+}
+
+#[cfg(test)]
+mod numbered_cookie_removal_tests {
+	use super::remove_numbered_cookies;
+	use crate::body::Body;
+	use hyper::{Request, Response};
+
+	// The security audit's payload: "name=a; name1=a; ...; name{count-1}=a"
+	fn request_with_numbered_cookies(name: &str, count: usize) -> Request<Body> {
+		let mut cookies = format!("{name}=a");
+		for n in 1..count {
+			cookies.push_str(&format!("; {name}{n}=a"));
+		}
+		Request::builder().uri("/").header("Cookie", cookies).body(Body::empty()).unwrap()
+	}
+
+	#[test]
+	fn removing_numbered_cookies_is_capped() {
+		// Every lookup re-parsed the whole Cookie header: 18000 cookies stalled POST /r/x/unsubscribe for 66 s
+		let req = request_with_numbered_cookies("subscriptions", 3000);
+		let mut response = Response::new(Body::empty());
+		remove_numbered_cookies(&req, &mut response, "subscriptions", 1);
+		assert_eq!(response.headers().get_all("Set-Cookie").iter().count(), 64);
 	}
 }

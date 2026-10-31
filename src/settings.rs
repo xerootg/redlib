@@ -566,3 +566,35 @@ pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, Strin
 
 	Ok(redirect(&url))
 }
+
+#[cfg(test)]
+mod numbered_cookie_removal_tests {
+	use super::set_cookies_method;
+	use crate::body::Body;
+	use hyper::Request;
+
+	// The security audit's payload: "name=a; name1=a; ...; name{count-1}=a"
+	fn numbered_cookies(name: &str, count: usize) -> String {
+		let mut cookies = format!("{name}=a");
+		for n in 1..count {
+			cookies.push_str(&format!("; {name}{n}=a"));
+		}
+		cookies
+	}
+
+	#[test]
+	fn restore_and_update_remove_a_capped_number_of_cookies() {
+		// Without a cap the response carried one Set-Cookie per forged cookie, several times the request size
+		let cookies = format!("{}; {}", numbered_cookies("subscriptions", 3000), numbered_cookies("filters", 3000));
+		let req = Request::builder().uri("/settings/restore").header("Cookie", cookies).body(Body::empty()).unwrap();
+		let response = set_cookies_method(req, true);
+		// subscriptions and filters: the unnumbered cookie plus numbered 1..=64 each
+		let removed = response
+			.headers()
+			.get_all("Set-Cookie")
+			.iter()
+			.filter(|value| value.to_str().is_ok_and(|v| v.starts_with("subscriptions") || v.starts_with("filters")))
+			.count();
+		assert_eq!(removed, 2 * 65);
+	}
+}

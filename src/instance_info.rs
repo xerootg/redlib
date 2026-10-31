@@ -86,7 +86,18 @@ pub struct InstanceInfo {
 	config: Config,
 }
 
-/// The settings `/info.json` publishes. See `serialize_public_config`.
+/// The settings `/info.json` publishes, by their config keys.
+///
+/// This is an allowlist on purpose. `/info.json` is public, and `Config` also
+/// holds credentials, so a setting is only published once it is named here.
+/// A setting added later (a new credential, or a carried branch's OIDC or MCP
+/// settings) stays out of `/info.json` until someone adds it to this list, and
+/// `skip_serializing` on the field is a second line of defense, not the only
+/// one. Settings that say nothing useful to visitors (listener address and
+/// port, HSTS, IPv4/IPv6-only) are left off as well.
+///
+/// The HTML `/info` page lists the settings it shows by hand in `to_table`, so
+/// it is an allowlist already.
 const PUBLIC_CONFIG_KEYS: &[&str] = &[
 	"REDLIB_SFW_ONLY",
 	"REDLIB_DEFAULT_THEME",
@@ -136,14 +147,10 @@ const PUBLIC_CONFIG_KEYS: &[&str] = &[
 ];
 
 /// The `config` entries of `/info.json`: the settings named in
-/// `PUBLIC_CONFIG_KEYS` and nothing else.
-fn public_config_entries<T: Serialize>(config: &T) -> Vec<(String, serde_json::Value)> {
-	// Behavior-preserving seam: everything the config serializes.
-	let _ = PUBLIC_CONFIG_KEYS;
-	match serde_json::to_value(config) {
-		Ok(serde_json::Value::Object(map)) => map.into_iter().collect(),
-		_ => Vec::new(),
-	}
+/// `PUBLIC_CONFIG_KEYS` and nothing else, in that order.
+fn public_config_entries<T: Serialize>(config: &T) -> Vec<(&'static str, serde_json::Value)> {
+	let all = serde_json::to_value(config).unwrap_or_default();
+	PUBLIC_CONFIG_KEYS.iter().filter_map(|key| all.get(key).map(|value| (*key, value.clone()))).collect()
 }
 
 fn serialize_public_config<S: Serializer>(config: &Config, serializer: S) -> Result<S::Ok, S::Error> {
@@ -295,7 +302,7 @@ mod allowlist_tests {
 		let entries = public_config_entries(&config);
 		let json = serde_json::to_string(&entries).unwrap();
 		assert!(!json.contains("canary"), "a field nobody put on the allowlist leaked: {json}");
-		assert!(entries.iter().all(|(key, _)| PUBLIC_CONFIG_KEYS.contains(&key.as_str())));
+		assert!(entries.iter().all(|(key, _)| PUBLIC_CONFIG_KEYS.contains(key)));
 	}
 
 	#[test]

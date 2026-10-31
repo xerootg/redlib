@@ -132,6 +132,10 @@ enum CompressionType {
 /// doesn't support it yet.
 const DEFAULT_COMPRESSOR: CompressionType = CompressionType::Gzip;
 
+/// Longest Accept-Encoding header we will parse. Real clients send well under
+/// 100 bytes.
+const MAX_ACCEPT_ENCODING_LEN: usize = 256;
+
 impl CompressionType {
 	/// Returns a `CompressionType` given a content coding
 	/// in [RFC 7231](https://datatracker.ietf.org/doc/html/rfc7231#section-5.3.4)
@@ -467,9 +471,12 @@ async fn new_boilerplate(
 /// Accept-Encoding: gzip, compress, br
 /// Accept-Encoding: br;q=1.0, gzip;q=0.8, *;q=0.1
 /// ```
-#[cached]
+///
+/// The result is deliberately not memoised: the header is attacker-controlled,
+/// so a cache keyed on it grows without bound, while parsing it is cheap.
+/// Headers longer than [`MAX_ACCEPT_ENCODING_LEN`] are not compressed for.
 fn determine_compressor(accept_encoding: String) -> Option<CompressionType> {
-	if accept_encoding.is_empty() {
+	if accept_encoding.is_empty() || accept_encoding.len() > MAX_ACCEPT_ENCODING_LEN {
 		return None;
 	};
 

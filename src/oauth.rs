@@ -83,16 +83,27 @@ pub struct Oauth {
 impl Oauth {
 	/// Create a new OAuth client
 	pub(crate) async fn new() -> Self {
+		Self::new_with(Self::new_with_timeout_with_backend, OAUTH_TIMEOUT)
+			.await
+			.expect("new_with gives up by exiting the process")
+	}
+
+	/// Calls `attempt` until it yields a client, waiting `pause` between tries.
+	async fn new_with<F, Fut>(mut attempt: F, pause: Duration) -> Option<Self>
+	where
+		F: FnMut(OauthBackendImpl) -> Fut,
+		Fut: std::future::Future<Output = Result<Result<Self, AuthError>, Elapsed>>,
+	{
 		// Try MobileSpoofAuth first, then fall back to GenericWebAuth
 		let mut failure_count = 0;
 		let mut backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new());
 
 		loop {
-			let attempt = Self::new_with_timeout_with_backend(backend.clone()).await;
-			match attempt {
+			let result = attempt(backend.clone()).await;
+			match result {
 				Ok(Ok(oauth)) => {
 					info!("[✅] Successfully created OAuth client");
-					return oauth;
+					return Some(oauth);
 				}
 				Ok(Err(e)) => {
 					error!(
@@ -123,7 +134,7 @@ impl Oauth {
 				std::process::exit(1);
 			}
 
-			tokio::time::sleep(OAUTH_TIMEOUT).await;
+			tokio::time::sleep(pause).await;
 		}
 	}
 
@@ -483,6 +494,81 @@ impl Device {
 
 fn choose<T: Copy>(list: &[T]) -> T {
 	*fastrand::choose_multiple(list.iter(), 1)[0]
+}
+
+#[cfg(test)]
+mod retry_tests {
+	use super::*;
+	use std::sync::{
+		atomic::{AtomicU32, Ordering},
+		Arc,
+	};
+
+	fn failure() -> Result<Result<Oauth, AuthError>, Elapsed> {
+		Ok(Err(AuthError::Field((serde_json::Value::Null, "token endpoint is down"))))
+	}
+
+	fn client(token: &str) -> Oauth {
+		Oauth {
+			headers_map: HashMap::from([("Authorization".to_owned(), format!("Bearer {token}"))]),
+			expires_in: 86400,
+			backend: OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new()),
+		}
+	}
+
+	// Audit #18: ten failed attempts ended the process (oauth.rs, Oauth::new),
+	// from a refresh a page view had started.
+	#[test]
+	fn test_gives_up_instead_of_exiting() {
+		let tries = Arc::new(AtomicU32::new(0));
+		let counter = tries.clone();
+		let result = crate::client::block_on_shared(Oauth::new_with(
+			move |_| {
+				counter.fetch_add(1, Ordering::SeqCst);
+				async { failure() }
+			},
+			Duration::ZERO,
+		));
+		assert!(result.is_none());
+		assert_eq!(tries.load(Ordering::SeqCst), 10);
+	}
+
+	#[test]
+	fn test_recovers_after_failures() {
+		let tries = Arc::new(AtomicU32::new(0));
+		let counter = tries.clone();
+		let result = crate::client::block_on_shared(Oauth::new_with(
+			move |_| {
+				let n = counter.fetch_add(1, Ordering::SeqCst);
+				async move {
+					if n < 7 {
+						failure()
+					} else {
+						Ok(Ok(client("fresh")))
+					}
+				}
+			},
+			Duration::ZERO,
+		));
+		assert_eq!(result.unwrap().headers_map["Authorization"], "Bearer fresh");
+		assert_eq!(tries.load(Ordering::SeqCst), 8);
+	}
+
+	#[test]
+	fn test_falls_back_to_the_web_backend_after_five_failures() {
+		let generic_tries = Arc::new(AtomicU32::new(0));
+		let counter = generic_tries.clone();
+		let _ = crate::client::block_on_shared(Oauth::new_with(
+			move |backend| {
+				if matches!(backend, OauthBackendImpl::GenericWeb(_)) {
+					counter.fetch_add(1, Ordering::SeqCst);
+				}
+				async { failure() }
+			},
+			Duration::ZERO,
+		));
+		assert_eq!(generic_tries.load(Ordering::SeqCst), 5);
+	}
 }
 
 #[cfg(test)]

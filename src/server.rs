@@ -340,24 +340,13 @@ impl Server {
 				}
 			}
 
-			// Remove double slashes and decode encoded slashes
-			let mut path = req.uri().path().replace("//", "/").replace("%2F", "/");
-
-			// Remove trailing slashes
-			if path != "/" && path.ends_with('/') {
-				path.pop();
-			}
-
-			// Reddit permalinks end in a slash, so feed URLs are often written `/r/rust/top/.rss`
-			if path != "/.rss" && path.ends_with("/.rss") {
-				path.replace_range(path.len() - "/.rss".len().., ".rss");
-			}
+			let path = normalize_path(req.uri().path());
 
 			// Enforce OIDC before anything else routes. Returns None when the
 			// request is allowed through -- because auth is off, the client is
 			// in a bypass CIDR, it already holds a valid session, or it is
 			// hitting the /oidc/ endpoints.
-			if let Some(mut res) = oidc::gate(peer, &path, &req_headers) {
+			if let Some(mut res) = oidc::gate(peer, &path, req.uri().query(), &req_headers) {
 				res.headers_mut().extend(def_headers);
 				return async move { Ok(res) }.boxed();
 			}
@@ -436,6 +425,37 @@ impl Server {
 			Ok(())
 		}
 		.boxed()
+	}
+}
+
+/// The path the gate and the router both see: doubled slashes collapsed,
+/// encoded slashes decoded and trailing slashes removed.
+///
+/// Repeated until nothing changes, because one round can leave work for the
+/// next: `/%2Fmcp` becomes `//mcp`. The gate compares the result with exact
+/// paths such as `/mcp`, so it has to be the form the router sees too.
+/// Every round that changes anything makes the path shorter, so this ends.
+fn normalize_path(raw: &str) -> String {
+	let mut path = raw.to_string();
+	loop {
+		let before = path.len();
+
+		// Remove double slashes and decode encoded slashes
+		path = path.replace("//", "/").replace("%2F", "/");
+
+		// Remove trailing slashes
+		if path != "/" && path.ends_with('/') {
+			path.pop();
+		}
+
+		// Reddit permalinks end in a slash, so feed URLs are often written `/r/rust/top/.rss`
+		if path != "/.rss" && path.ends_with("/.rss") {
+			path.replace_range(path.len() - "/.rss".len().., ".rss");
+		}
+
+		if path.len() == before {
+			return path;
+		}
 	}
 }
 
@@ -910,6 +930,75 @@ mod boilerplate_tests {
 			let res = futures_lite::future::block_on(new_boilerplate(HeaderMap::new(), HeaderMap::new(), status, Body::from("<script>alert(1)</script>"))).unwrap();
 			assert_eq!(res.status().as_u16(), status);
 			assert_eq!(res.headers().get(header::CONTENT_TYPE).map(|v| v.to_str().unwrap()), Some("text/plain; charset=utf-8"));
+		}
+	}
+}
+
+#[cfg(test)]
+mod path_normalization_tests {
+	use super::*;
+	use route_recognizer::Router as RouteRecognizer;
+
+	/// Spellings of `/mcp` that only collapse to it after more than one round
+	/// of removing doubled slashes, decoding `%2F` and trimming slashes.
+	const MCP_SPELLINGS: [&str; 9] = [
+		"/%2Fmcp",
+		"//%2Fmcp",
+		"/%2F/mcp",
+		"/%2F%2Fmcp",
+		"///mcp",
+		"/mcp%2F%2F",
+		"/mcp///",
+		"/mcp/%2F",
+		"/%2F%2F%2Fmcp%2F%2F%2F",
+	];
+
+	// Audit info item: path normalisation is single-pass (server.rs:337-347).
+	// The OIDC gate scopes the MCP bearer token to exactly `/mcp` on the
+	// normalised path, so the gate and the router must see one stable form.
+	#[test]
+	fn normalising_a_path_twice_changes_nothing() {
+		for raw in MCP_SPELLINGS
+			.into_iter()
+			.chain(["/", "//", "/%2F", "/r/rust//", "/r/rust%2F%2F", "/a/%2F/b", "/a/.rss", "/a//.rss", "/a%2F.rss%2F", "/.rss/"])
+		{
+			let once = normalize_path(raw);
+			assert_eq!(normalize_path(&once), once, "{raw:?} normalised to {once:?}, which normalises again");
+		}
+	}
+
+	#[test]
+	fn every_spelling_of_mcp_normalises_to_mcp() {
+		for raw in MCP_SPELLINGS {
+			assert_eq!(normalize_path(raw), "/mcp", "{raw:?}");
+		}
+	}
+
+	#[test]
+	fn ordinary_paths_are_unchanged() {
+		for (raw, want) in [
+			("/", "/"),
+			("/r/rust", "/r/rust"),
+			("/r/rust/", "/r/rust"),
+			("/r//rust", "/r/rust"),
+			("/r%2Frust", "/r/rust"),
+			("/r/rust/top/.rss", "/r/rust/top.rss"),
+			("/mcp/other", "/mcp/other"),
+			("/mcpx", "/mcpx"),
+		] {
+			assert_eq!(normalize_path(raw), want, "{raw:?}");
+		}
+	}
+
+	// The reverse of the above: the router must not be more generous than the
+	// gate. A path the gate does not see as `/mcp` must not route to it.
+	#[test]
+	fn the_router_does_not_read_unnormalised_slashes_as_mcp() {
+		let mut router = RouteRecognizer::new();
+		router.add("/GET/mcp", ());
+		assert!(router.recognize("/GET/mcp").is_ok());
+		for raw in ["//mcp", "/mcp/", "///mcp"] {
+			assert!(router.recognize(&format!("/GET{raw}")).is_err(), "{raw}");
 		}
 	}
 }

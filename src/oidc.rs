@@ -20,9 +20,11 @@
 //!   trusted proxy, and the chain is walked from the right, skipping trusted
 //!   hops. See [`resolve_client_ip`].
 
-use std::net::IpAddr;
-use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::net::{IpAddr, Ipv6Addr};
+use std::sync::{LazyLock, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -887,7 +889,7 @@ pub async fn logout(_req: Request<Body>) -> Result<Response<Body>, String> {
 /// Static files, `/healthz/reddit` and `/mcp` are gated like everything
 /// else; MCP clients present `REDLIB_MCP_TOKEN` as a bearer token, which
 /// opens `/mcp` and nothing else.
-pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Body>> {
+pub fn gate(peer: IpAddr, path: &str, query: Option<&str>, headers: &HeaderMap) -> Option<Response<Body>> {
 	if !AUTH.enabled {
 		return None;
 	}
@@ -904,6 +906,7 @@ pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Bo
 	// An unknown client is never bypassed, but can still authenticate.
 	let client = resolve_client_ip(peer, headers);
 	if client.is_some_and(is_bypassed) {
+		note_pass("bypass", client, peer);
 		return None;
 	}
 
@@ -912,6 +915,7 @@ pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Bo
 	// not open the rest of the instance. `path` has already been normalised
 	// by the server (no doubled or trailing slashes).
 	if path == MCP_PATH && bearer_token_valid(headers) {
+		note_pass("bearer", client, peer);
 		return None;
 	}
 
@@ -920,6 +924,7 @@ pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Bo
 	}
 
 	debug!("unauthenticated request from {client:?} for {path}");
+	note_denial(client, peer, path);
 
 	// Programmatic clients get a plain 401 rather than an HTML redirect they
 	// cannot follow. This is what an MCP client or curl will see.
@@ -934,11 +939,162 @@ pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Bo
 		);
 	}
 
-	let target = format!("/oidc/login?redirect={}", urlencoding_path(path));
-	Some(redirect_to(&target, &[]))
+	Some(redirect_to(&login_target(path, query), &[]))
 }
 
-/// Percent-encodes a path for use as a query-string value.
+/// Longest path and query the login redirect will carry. It comes back in
+/// the signed login cookie, and browsers drop cookies over 4 KiB.
+const MAX_REDIRECT_LEN: usize = 1024;
+
+/// The login URL that sends the user back to `path` and `query` afterwards.
+/// The login endpoint validates the target again, so this only has to keep
+/// it small: the query is dropped if it is too long, the path as well if
+/// that is.
+fn login_target(path: &str, query: Option<&str>) -> String {
+	let full = match query.filter(|q| !q.is_empty()) {
+		Some(q) => format!("{path}?{q}"),
+		None => path.to_string(),
+	};
+	let back = [full.as_str(), path].into_iter().find(|p| p.len() <= MAX_REDIRECT_LEN).unwrap_or("/");
+	format!("/oidc/login?redirect={}", urlencoding_path(back))
+}
+
+// ---------------------------------------------------------------------------
+// Gate logging
+// ---------------------------------------------------------------------------
+
+/// Lets one line through per key and interval, and counts what it held back.
+/// The table is capped, so an attacker who varies the key cannot grow it
+/// without bound: once it is full of live entries, new keys are not
+/// itemised until old ones expire. They are counted, and `summary` reports
+/// the count once per interval, so a full table never hides activity. That
+/// caps the lines per interval at `cap` plus one.
+struct LogThrottle<K> {
+	interval: Duration,
+	cap: usize,
+	seen: HashMap<K, (Instant, u32)>,
+	/// Keys turned away because the table was full, since the last summary.
+	refused: u32,
+	last_summary: Option<Instant>,
+}
+
+impl<K: Hash + Eq> LogThrottle<K> {
+	fn new(interval: Duration, cap: usize) -> Self {
+		Self {
+			interval,
+			cap,
+			seen: HashMap::new(),
+			refused: 0,
+			last_summary: None,
+		}
+	}
+
+	/// `Some(n)` if a line may be logged now, where `n` is how many were held
+	/// back for this key since the last one; `None` if it should be held back.
+	fn allow(&mut self, key: K, now: Instant) -> Option<u32> {
+		if let Some((last, held)) = self.seen.get_mut(&key) {
+			if now.duration_since(*last) < self.interval {
+				*held = held.saturating_add(1);
+				return None;
+			}
+			*last = now;
+			return Some(std::mem::take(held));
+		}
+		if self.seen.len() >= self.cap {
+			let interval = self.interval;
+			self.seen.retain(|_, (last, _)| now.duration_since(*last) < interval);
+			if self.seen.len() >= self.cap {
+				self.refused = self.refused.saturating_add(1);
+				return None;
+			}
+		}
+		self.seen.insert(key, (now, 0));
+		Some(0)
+	}
+
+	/// `Some(n)` if a summary line may be logged now, where `n` is how many
+	/// requests from keys the full table could not itemise were turned away
+	/// since the last one.
+	fn summary(&mut self, now: Instant) -> Option<u32> {
+		if self.refused == 0 || self.last_summary.is_some_and(|last| now.duration_since(last) < self.interval) {
+			return None;
+		}
+		self.last_summary = Some(now);
+		Some(std::mem::take(&mut self.refused))
+	}
+}
+
+/// The throttle key for a client: IPv6 addresses are keyed by their /64,
+/// because one subscriber holds a whole /64 and could otherwise present a
+/// new "client" with every request.
+fn log_key(ip: IpAddr) -> IpAddr {
+	match canonical(ip) {
+		IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & (u128::MAX << 64))),
+		v4 => v4,
+	}
+}
+
+/// One denial line per client per minute.
+static DENIAL_LOG: LazyLock<Mutex<LogThrottle<IpAddr>>> = LazyLock::new(|| Mutex::new(LogThrottle::new(Duration::from_secs(60), 1024)));
+
+/// One line per client and kind of pass per day, so the first use of a
+/// bypass address or of the MCP token is on record without logging every
+/// request.
+static PASS_LOG: LazyLock<Mutex<LogThrottle<(&'static str, IpAddr)>>> = LazyLock::new(|| Mutex::new(LogThrottle::new(Duration::from_secs(86_400), 1024)));
+
+/// The most of a path that goes into a log line.
+const MAX_LOGGED_PATH: usize = 200;
+
+fn describe_client(client: Option<IpAddr>) -> String {
+	client.map_or_else(|| "unknown".to_string(), |ip| ip.to_string())
+}
+
+/// Logs a denied request at info, at most once a minute per client. The
+/// path is attacker-controlled, so it is escaped and cut short; the query
+/// string is left out because it can carry secrets.
+fn note_denial(client: Option<IpAddr>, peer: IpAddr, path: &str) {
+	let peer = canonical(peer);
+	let now = Instant::now();
+	let (allowed, overflow) = {
+		let mut table = DENIAL_LOG.lock().unwrap_or_else(PoisonError::into_inner);
+		let allowed = table.allow(log_key(client.unwrap_or(peer)), now);
+		let overflow = if allowed.is_none() { table.summary(now) } else { None };
+		(allowed, overflow)
+	};
+	if let Some(n) = overflow {
+		info!("OIDC gate: {n} more denials from clients not itemised (log table full)");
+	}
+	if let Some(held) = allowed {
+		let path: String = path.chars().take(MAX_LOGGED_PATH).collect();
+		let held = if held > 0 {
+			format!(" ({held} more from this client in the last minute)")
+		} else {
+			String::new()
+		};
+		info!("OIDC gate: denied {path:?} from client {} (peer {peer}){held}", describe_client(client));
+	}
+}
+
+/// Logs the first request a client gets through without a session, as a
+/// `kind` of "bypass" (address allowlist) or "bearer" (MCP token).
+fn note_pass(kind: &'static str, client: Option<IpAddr>, peer: IpAddr) {
+	let peer = canonical(peer);
+	let now = Instant::now();
+	let (allowed, overflow) = {
+		let mut table = PASS_LOG.lock().unwrap_or_else(PoisonError::into_inner);
+		let allowed = table.allow((kind, log_key(client.unwrap_or(peer))), now);
+		let overflow = if allowed.is_none() { table.summary(now) } else { None };
+		(allowed, overflow)
+	};
+	if let Some(n) = overflow {
+		info!("OIDC gate: {n} more {kind} passes from clients not itemised (log table full)");
+	}
+	if allowed.is_some() {
+		info!("OIDC gate: first {kind} pass from client {} (peer {peer})", describe_client(client));
+	}
+}
+
+/// Percent-encodes a path (and query) for use as a query-string value.
 fn urlencoding_path(path: &str) -> String {
 	serde_urlencoded::to_string([("r", path)])
 		.map(|s| s.trim_start_matches("r=").to_string())
@@ -949,6 +1105,523 @@ fn urlencoding_path(path: &str) -> String {
 /// appropriate rejection.
 fn wants_html(headers: &HeaderMap) -> bool {
 	headers.get("accept").and_then(|v| v.to_str().ok()).is_some_and(|a| a.contains("text/html"))
+}
+
+#[cfg(test)]
+mod login_query_tests {
+	use super::*;
+	use hyper::header::HeaderValue;
+	use sealed_test::prelude::*;
+
+	fn browser() -> HeaderMap {
+		let mut map = HeaderMap::new();
+		map.insert("accept", HeaderValue::from_static("text/html,application/xhtml+xml,*/*;q=0.8"));
+		map
+	}
+
+	/// The `Location` the gate answers an anonymous browser with.
+	fn login_location(path: &str, query: Option<&str>) -> String {
+		let res = gate("203.0.113.9".parse().unwrap(), path, query, &browser()).expect("must be gated");
+		res.headers().get("location").unwrap().to_str().unwrap().to_string()
+	}
+
+	/// Where the login endpoint would send the user back to, given the gate's `Location`.
+	fn landing(location: &str) -> String {
+		redirect_target(location.split_once('?').map(|(_, q)| q))
+	}
+
+	// Audit info item: server.rs passed only the path to the gate, so a login
+	// started from `/search?q=x` came back as `/search`.
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn the_login_round_trip_keeps_the_query_string() {
+		let location = login_location("/search", Some("q=x&sort=new"));
+		assert_eq!(location, "/oidc/login?redirect=%2Fsearch%3Fq%3Dx%26sort%3Dnew");
+		assert_eq!(landing(&location), "/search?q=x&sort=new");
+
+		// Reserved characters survive both layers of encoding.
+		let location = login_location("/r/rust/search", Some("q=a+b%26c&restrict_sr=on"));
+		assert_eq!(landing(&location), "/r/rust/search?q=a+b%26c&restrict_sr=on");
+
+		// No query, no question mark.
+		assert_eq!(landing(&login_location("/r/rust", None)), "/r/rust");
+		assert_eq!(landing(&login_location("/r/rust", Some(""))), "/r/rust");
+	}
+
+	// The query rides through the same same-origin validation as the path.
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn the_query_cannot_point_the_redirect_off_site() {
+		// A query is just data after a local path, however URL-shaped.
+		for query in ["redirect=https://evil.example", "next=//evil.example", "u=http://evil.example/&x=1"] {
+			let target = landing(&login_location("/", Some(query)));
+			assert_eq!(target, format!("/?{query}"));
+			assert!(target.starts_with("/?"), "{target}");
+		}
+
+		// A path the validator refuses is refused whatever the query says.
+		assert_eq!(landing(&login_location("/\\evil.example", Some("q=x"))), "/");
+		assert_eq!(landing(&login_location("//evil.example", Some("q=x"))), "/");
+		// So is a query a browser would read differently from the server.
+		assert_eq!(landing(&login_location("/search", Some("q=a\tb"))), "/");
+		assert_eq!(landing(&login_location("/search", Some("q=a\\b"))), "/");
+	}
+
+	// The target lives in a cookie, and browsers drop cookies over 4 KiB, which
+	// would break the login altogether.
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn an_oversized_query_is_dropped_and_the_path_kept() {
+		let long = format!("q={}", "a".repeat(5000));
+		let location = login_location("/search", Some(&long));
+		assert_eq!(landing(&location), "/search");
+		assert!(location.len() < 200, "{}", location.len());
+
+		// A path that long has nowhere sensible to go back to.
+		let location = login_location(&format!("/{}", "a".repeat(5000)), Some("q=x"));
+		assert_eq!(landing(&location), "/");
+	}
+
+	// Programmatic clients still get the plain 401, with nothing of the URL in it.
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn programmatic_clients_still_get_a_401_with_a_query() {
+		let res = gate("203.0.113.9".parse().unwrap(), "/search", Some("q=x"), &HeaderMap::new()).expect("must be gated");
+		assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+	}
+}
+
+#[cfg(test)]
+mod log_throttle_tests {
+	use super::*;
+
+	const MINUTE: Duration = Duration::from_secs(60);
+
+	#[test]
+	fn one_line_per_key_per_interval_and_the_rest_are_counted() {
+		let mut t = LogThrottle::new(MINUTE, 8);
+		let start = Instant::now();
+		assert_eq!(t.allow("a", start), Some(0));
+		for n in 1..=5 {
+			assert_eq!(t.allow("a", start + Duration::from_secs(n)), None);
+		}
+		// Another key is its own story.
+		assert_eq!(t.allow("b", start + Duration::from_secs(6)), Some(0));
+		// After the interval the next line reports what was held back.
+		assert_eq!(t.allow("a", start + MINUTE), Some(5));
+		assert_eq!(t.allow("a", start + MINUTE + Duration::from_secs(1)), None);
+	}
+
+	#[test]
+	fn keys_the_full_table_turns_away_are_counted_and_summarised_once_per_interval() {
+		let mut t = LogThrottle::new(MINUTE, 2);
+		let start = Instant::now();
+		assert_eq!(t.summary(start), None, "nothing refused, nothing to say");
+		assert_eq!(t.allow(1, start), Some(0));
+		assert_eq!(t.allow(2, start), Some(0));
+		for key in 3..=7 {
+			assert_eq!(t.allow(key, start), None);
+		}
+		assert_eq!(t.summary(start), Some(5));
+		assert_eq!(t.summary(start), None);
+		// More turned away inside the interval wait for the next summary.
+		assert_eq!(t.allow(8, start + Duration::from_secs(1)), None);
+		assert_eq!(t.summary(start + Duration::from_secs(1)), None);
+		assert_eq!(t.allow(9, start + Duration::from_secs(2)), None);
+		assert_eq!(t.summary(start + MINUTE), Some(2));
+	}
+
+	#[test]
+	fn ipv6_clients_are_keyed_by_their_64_and_mapped_ipv4_by_the_v4_address() {
+		let key = |s: &str| log_key(s.parse().unwrap());
+		assert_eq!(key("2001:db8::1"), key("2001:db8::ffff:ffff:ffff:ffff"));
+		assert_ne!(key("2001:db8::1"), key("2001:db8:0:1::1"));
+		assert_eq!(key("::ffff:203.0.113.9"), key("203.0.113.9"));
+		assert_ne!(key("203.0.113.9"), key("203.0.113.10"));
+	}
+
+	#[test]
+	fn the_table_cannot_grow_past_its_cap() {
+		let mut t = LogThrottle::new(MINUTE, 4);
+		let start = Instant::now();
+		for key in 0..4 {
+			assert_eq!(t.allow(key, start), Some(0));
+		}
+		// Full of live entries: new keys are held back, not stored.
+		for key in 4..1000 {
+			assert_eq!(t.allow(key, start + Duration::from_secs(1)), None);
+		}
+		assert_eq!(t.seen.len(), 4);
+		// Once the old entries expire, new keys fit again.
+		assert_eq!(t.allow(1000, start + MINUTE), Some(0));
+		assert!(t.seen.len() <= 4);
+	}
+}
+
+#[cfg(test)]
+mod gate_log_tests {
+	use super::*;
+	use hyper::header::HeaderValue;
+	use sealed_test::prelude::*;
+	use std::sync::Mutex;
+
+	// Audit finding #13: denials and bypass or bearer passes left no trace at
+	// the info level the deployment runs at. Every test runs in its own
+	// process (`sealed_test`), so the global logger below is its own too.
+	struct Capture(Mutex<Vec<(log::Level, String)>>);
+
+	impl log::Log for Capture {
+		fn enabled(&self, _: &log::Metadata) -> bool {
+			true
+		}
+		fn log(&self, record: &log::Record) {
+			self.0.lock().unwrap().push((record.level(), record.args().to_string()));
+		}
+		fn flush(&self) {}
+	}
+
+	static CAPTURE: Capture = Capture(Mutex::new(Vec::new()));
+
+	fn capture_info_logs() {
+		log::set_logger(&CAPTURE).expect("one logger per test process");
+		// What the deployment runs at.
+		log::set_max_level(log::LevelFilter::Info);
+		// Loading the config logs its own summary; that is not what is under test.
+		let _ = enabled();
+		logged();
+	}
+
+	/// What was logged at info or above since the last call.
+	fn logged() -> Vec<String> {
+		std::mem::take(&mut *CAPTURE.0.lock().unwrap())
+			.into_iter()
+			.filter(|(level, _)| *level <= log::Level::Info)
+			.map(|(_, line)| line)
+			.collect()
+	}
+
+	fn ip(s: &str) -> IpAddr {
+		s.parse().unwrap()
+	}
+
+	fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+		let mut map = HeaderMap::new();
+		for (name, value) in pairs {
+			map.append(*name, HeaderValue::from_str(value).unwrap());
+		}
+		map
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_TRUSTED_PROXIES", "10.42.0.0/16"),
+	])]
+	fn a_denial_is_logged_at_info_with_the_resolved_client_ip() {
+		capture_info_logs();
+
+		let res = gate(ip("10.42.0.7"), "/r/rust", Some("token=hunter2"), &headers(&[("x-forwarded-for", "203.0.113.9")]));
+		assert!(res.is_some());
+
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{lines:?}");
+		assert!(lines[0].contains("203.0.113.9"), "{lines:?}");
+		assert!(lines[0].contains("/r/rust"), "{lines:?}");
+		// The proxy that forwarded it is worth knowing too, the query is not.
+		assert!(lines[0].contains("10.42.0.7"), "{lines:?}");
+		assert!(!lines[0].contains("hunter2"), "{lines:?}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn denials_are_sampled_per_client_so_a_flood_cannot_flood_the_log() {
+		capture_info_logs();
+
+		// One client trying paths: one line, whatever it asks for.
+		for n in 0..500 {
+			assert!(gate(ip("203.0.113.9"), &format!("/oidc/x{n}"), None, &HeaderMap::new()).is_some());
+		}
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{} lines", lines.len());
+		assert!(lines[0].contains("203.0.113.9"), "{lines:?}");
+
+		// Another client is a separate story and still gets its line.
+		assert!(gate(ip("203.0.113.10"), "/", None, &HeaderMap::new()).is_some());
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{lines:?}");
+		assert!(lines[0].contains("203.0.113.10"), "{lines:?}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn a_logged_path_cannot_forge_log_lines() {
+		capture_info_logs();
+
+		assert!(gate(ip("203.0.113.9"), "/x\n2026-01-01 INFO oidc: forged\r", None, &HeaderMap::new()).is_some());
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{lines:?}");
+		assert!(!lines[0].contains('\n') && !lines[0].contains('\r'), "{lines:?}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_AUTH_BYPASS_CIDRS", "192.168.0.0/16"),
+	])]
+	fn the_first_bypass_pass_per_client_is_logged_once() {
+		capture_info_logs();
+
+		for _ in 0..20 {
+			assert!(gate(ip("192.168.1.20"), "/", None, &HeaderMap::new()).is_none());
+		}
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{lines:?}");
+		assert!(lines[0].contains("bypass") && lines[0].contains("192.168.1.20"), "{lines:?}");
+
+		assert!(gate(ip("192.168.1.21"), "/", None, &HeaderMap::new()).is_none());
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{lines:?}");
+		assert!(lines[0].contains("192.168.1.21"), "{lines:?}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_MCP_TOKEN", "correct-horse-battery-staple"),
+	])]
+	fn the_first_bearer_pass_per_client_is_logged_once_without_the_token() {
+		capture_info_logs();
+
+		let bearer = headers(&[("authorization", "Bearer correct-horse-battery-staple")]);
+		for _ in 0..20 {
+			assert!(gate(ip("203.0.113.9"), "/mcp", None, &bearer).is_none());
+		}
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{lines:?}");
+		assert!(lines[0].contains("bearer") && lines[0].contains("203.0.113.9"), "{lines:?}");
+		assert!(!lines[0].contains("correct-horse"), "{lines:?}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn ordinary_traffic_is_not_logged() {
+		capture_info_logs();
+
+		// The probe and the login endpoints are open by design, and a signed-in
+		// user is not news.
+		for path in ["/healthz", "/oidc/login", "/oidc/callback"] {
+			assert!(gate(ip("203.0.113.9"), path, None, &HeaderMap::new()).is_none());
+		}
+		let token = sign(&Session {
+			sub: "user-1".into(),
+			username: "user".into(),
+			email: String::new(),
+			groups: vec![],
+			exp: now() + 3600,
+			iat: now(),
+		})
+		.unwrap();
+		let cookie = headers(&[("cookie", &format!("{SESSION_COOKIE}={token}"))]);
+		assert!(gate(ip("203.0.113.9"), "/", None, &cookie).is_none());
+		assert_eq!(logged(), Vec::<String>::new());
+	}
+}
+
+#[cfg(test)]
+mod gate_log_flood_tests {
+	use super::*;
+	use sealed_test::prelude::*;
+	use std::sync::Mutex;
+
+	// Review of the observability branch: the throttle tables are capped, but
+	// once full they dropped new clients without a trace, so an attacker with
+	// a /64 (or a proxy pool) could switch denial logging off for everyone
+	// else. Each test runs in its own process (`sealed_test`).
+	struct Capture(Mutex<Vec<(log::Level, String)>>);
+
+	impl log::Log for Capture {
+		fn enabled(&self, _: &log::Metadata) -> bool {
+			true
+		}
+		fn log(&self, record: &log::Record) {
+			self.0.lock().unwrap().push((record.level(), record.args().to_string()));
+		}
+		fn flush(&self) {}
+	}
+
+	static CAPTURE: Capture = Capture(Mutex::new(Vec::new()));
+
+	fn capture_info_logs() {
+		log::set_logger(&CAPTURE).expect("one logger per test process");
+		log::set_max_level(log::LevelFilter::Info);
+		// Loading the config logs its own summary; that is not what is under test.
+		let _ = enabled();
+		logged();
+	}
+
+	fn logged() -> Vec<String> {
+		std::mem::take(&mut *CAPTURE.0.lock().unwrap())
+			.into_iter()
+			.filter(|(level, _)| *level <= log::Level::Info)
+			.map(|(_, line)| line)
+			.collect()
+	}
+
+	fn ip(s: &str) -> IpAddr {
+		s.parse().unwrap()
+	}
+
+	/// The n-th distinct IPv4 client, none of them in the test's trusted or bypass ranges.
+	fn v4_client(n: u32) -> IpAddr {
+		IpAddr::from([100, 64 + (n >> 16) as u8, (n >> 8) as u8, n as u8])
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn one_ipv6_prefix_is_one_client_for_the_log() {
+		capture_info_logs();
+
+		// A single /64 hands out 2^64 addresses; they are one subscriber.
+		for n in 0..1100u32 {
+			let client = ip(&format!("2001:db8::{n:x}"));
+			assert!(gate(client, "/secret-probe", None, &HeaderMap::new()).is_some());
+		}
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{} lines", lines.len());
+
+		// The next /64 is somebody else.
+		assert!(gate(ip("2001:db8:0:1::1"), "/", None, &HeaderMap::new()).is_some());
+		assert_eq!(logged().len(), 1);
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn a_full_denial_table_still_leaves_a_trace_for_new_clients() {
+		capture_info_logs();
+
+		// Fill the table with distinct clients; each gets its own line.
+		let mut itemised = 0;
+		for n in 0..1024 {
+			assert!(gate(v4_client(n), "/filler", None, &HeaderMap::new()).is_some());
+			itemised += logged().len();
+		}
+		assert_eq!(itemised, 1024);
+
+		// Now a fresh client probes. It cannot get a line of its own, but the
+		// denials must not vanish: a summary line has to say they happened.
+		for n in 0..50 {
+			assert!(gate(v4_client(5000 + n), "/secret-probe", None, &HeaderMap::new()).is_some());
+		}
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "one summary line per interval, got {lines:?}");
+		assert!(lines[0].contains("not itemised"), "{lines:?}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_AUTH_BYPASS_CIDRS", "100.64.0.0/10"),
+	])]
+	fn a_full_pass_table_still_leaves_a_trace_for_new_clients() {
+		capture_info_logs();
+
+		let mut itemised = 0;
+		for n in 0..1024 {
+			assert!(gate(v4_client(n), "/", None, &HeaderMap::new()).is_none());
+			itemised += logged().len();
+		}
+		assert_eq!(itemised, 1024);
+
+		for n in 0..50 {
+			assert!(gate(v4_client(5000 + n), "/", None, &HeaderMap::new()).is_none());
+		}
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{lines:?}");
+		assert!(lines[0].contains("not itemised"), "{lines:?}");
+	}
 }
 
 #[cfg(test)]
@@ -1515,7 +2188,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 	#[test]
 	#[sealed_test]
 	fn gate_is_open_when_disabled() {
-		assert!(gate(ip(OUTSIDE), "/", &headers(&[BROWSER])).is_none());
+		assert!(gate(ip(OUTSIDE), "/", None, &headers(&[BROWSER])).is_none());
 	}
 
 	#[test]
@@ -1528,7 +2201,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_redirects_browsers_to_login() {
-		let res = gate(ip(OUTSIDE), "/r/rust/comments/abc", &headers(&[BROWSER])).expect("must be gated");
+		let res = gate(ip(OUTSIDE), "/r/rust/comments/abc", None, &headers(&[BROWSER])).expect("must be gated");
 		assert_eq!(res.status(), StatusCode::FOUND);
 		assert_eq!(location(&res), "/oidc/login?redirect=%2Fr%2Frust%2Fcomments%2Fabc");
 	}
@@ -1543,7 +2216,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_answers_programmatic_clients_with_401_json() {
-		let res = gate(ip(OUTSIDE), "/r/rust", &headers(&[("accept", "application/json")])).expect("must be gated");
+		let res = gate(ip(OUTSIDE), "/r/rust", None, &headers(&[("accept", "application/json")])).expect("must be gated");
 		assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 		assert_eq!(res.headers()["www-authenticate"], "Bearer realm=\"https://idp.example/application/o/redlib\"");
 		assert_eq!(res.headers()["content-type"], "application/json");
@@ -1565,7 +2238,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		// bridge address: a trusted-proxy address that sends no
 		// X-Forwarded-For, so it gets no bypass.
 		for path in ["/oidc/login", "/oidc/callback", "/oidc/logout", "/healthz"] {
-			assert!(gate(ip(OUTSIDE), path, &headers(&[BROWSER])).is_none(), "{path}");
+			assert!(gate(ip(OUTSIDE), path, None, &headers(&[BROWSER])).is_none(), "{path}");
 		}
 	}
 
@@ -1597,7 +2270,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 			"/oidc/loginx",
 			"/healthzx",
 		] {
-			let res = gate(ip(OUTSIDE), path, &HeaderMap::new()).unwrap_or_else(|| panic!("{path} must be gated"));
+			let res = gate(ip(OUTSIDE), path, None, &HeaderMap::new()).unwrap_or_else(|| panic!("{path} must be gated"));
 			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
 		}
 	}
@@ -1614,14 +2287,14 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		("REDLIB_TRUSTED_PROXIES", "10.42.0.0/16"),
 	])]
 	fn gate_lets_bypass_addresses_through() {
-		assert!(gate(ip("192.168.1.20"), "/", &headers(&[BROWSER])).is_none());
+		assert!(gate(ip("192.168.1.20"), "/", None, &headers(&[BROWSER])).is_none());
 		// Dual-stack sockets report IPv4 clients as mapped IPv6.
-		assert!(gate(ip("::ffff:127.0.0.1"), "/", &headers(&[BROWSER])).is_none());
+		assert!(gate(ip("::ffff:127.0.0.1"), "/", None, &headers(&[BROWSER])).is_none());
 		// Through the trusted proxy, the forwarded address decides.
-		assert!(gate(ip("10.42.0.7"), "/", &xff("192.168.1.20")).is_none());
-		assert!(gate(ip("10.42.0.7"), "/", &xff(OUTSIDE)).is_some());
+		assert!(gate(ip("10.42.0.7"), "/", None, &xff("192.168.1.20")).is_none());
+		assert!(gate(ip("10.42.0.7"), "/", None, &xff(OUTSIDE)).is_some());
 		// The proxy itself is not a bypass address.
-		assert!(gate(ip("10.42.0.7"), "/", &HeaderMap::new()).is_some());
+		assert!(gate(ip("10.42.0.7"), "/", None, &HeaderMap::new()).is_some());
 	}
 
 	#[test]
@@ -1635,7 +2308,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		("REDLIB_AUTH_BYPASS_CIDRS", "192.168.0.0/16"),
 	])]
 	fn gate_ignores_forged_forwarded_for_without_trusted_proxies() {
-		let res = gate(ip(OUTSIDE), "/", &xff("192.168.1.20"));
+		let res = gate(ip(OUTSIDE), "/", None, &xff("192.168.1.20"));
 		assert_eq!(res.expect("forged XFF must not bypass").status(), StatusCode::UNAUTHORIZED);
 	}
 
@@ -1661,17 +2334,17 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 			("only trusted hops, several", xff("10.42.0.3, 10.42.0.4")),
 			("nothing parseable", xff("unknown")),
 		] {
-			let res = gate(proxy, "/", &h).unwrap_or_else(|| panic!("{label}: must not bypass"));
+			let res = gate(proxy, "/", None, &h).unwrap_or_else(|| panic!("{label}: must not bypass"));
 			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{label}");
 		}
 
 		// A forwarded bypass address still gets through the proxy.
-		assert!(gate(proxy, "/", &xff("192.168.1.20")).is_none());
+		assert!(gate(proxy, "/", None, &xff("192.168.1.20")).is_none());
 		// A peer that is not a proxy is the client, e.g. a kubelet probe from a node.
-		assert!(gate(ip("192.168.1.20"), "/", &HeaderMap::new()).is_none());
+		assert!(gate(ip("192.168.1.20"), "/", None, &HeaderMap::new()).is_none());
 		// An unknown client can still log in.
 		let token = sign(&session(now() + 3600)).unwrap();
-		assert!(gate(proxy, "/", &session_cookie(&token)).is_none());
+		assert!(gate(proxy, "/", None, &session_cookie(&token)).is_none());
 	}
 
 	fn session(exp: u64) -> Session {
@@ -1700,7 +2373,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 	])]
 	fn gate_accepts_a_valid_session_cookie() {
 		let token = sign(&session(now() + 3600)).unwrap();
-		assert!(gate(ip(OUTSIDE), "/", &session_cookie(&token)).is_none());
+		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&token)).is_none());
 		assert_eq!(session_from(&session_cookie(&token)).unwrap().sub, "user-1");
 	}
 
@@ -1716,7 +2389,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 	fn gate_rejects_expired_tampered_and_foreign_sessions() {
 		// Expired beyond jsonwebtoken's default 60 s leeway.
 		let expired = sign(&session(now() - 3600)).unwrap();
-		assert!(gate(ip(OUTSIDE), "/", &session_cookie(&expired)).is_some(), "expired");
+		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&expired)).is_some(), "expired");
 
 		// Payload swapped under an existing signature.
 		let valid = sign(&session(now() + 3600)).unwrap();
@@ -1729,16 +2402,16 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 			.unwrap(),
 		);
 		parts[1] = &forged_claims;
-		assert!(gate(ip(OUTSIDE), "/", &session_cookie(&parts.join("."))).is_some(), "tampered");
+		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&parts.join("."))).is_some(), "tampered");
 
 		// Signed with a different key.
 		let foreign = encode(&Header::new(Algorithm::HS256), &session(now() + 3600), &EncodingKey::from_secret(b"other")).unwrap();
-		assert!(gate(ip(OUTSIDE), "/", &session_cookie(&foreign)).is_some(), "foreign key");
+		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&foreign)).is_some(), "foreign key");
 
 		// `alg: none` must never be accepted.
 		let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
 		let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&session(now() + 3600)).unwrap());
-		assert!(gate(ip(OUTSIDE), "/", &session_cookie(&format!("{header}.{claims}."))).is_some(), "alg none");
+		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&format!("{header}.{claims}."))).is_some(), "alg none");
 	}
 
 	#[test]
@@ -1760,7 +2433,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 			exp: now() + TX_TTL,
 		})
 		.unwrap();
-		assert!(gate(ip(OUTSIDE), "/", &session_cookie(&tx)).is_some());
+		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&tx)).is_some());
 	}
 
 	#[test]
@@ -1773,7 +2446,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 	])]
 	fn sessions_still_work_with_an_ephemeral_key() {
 		let token = sign(&session(now() + 3600)).unwrap();
-		assert!(gate(ip(OUTSIDE), "/", &session_cookie(&token)).is_none());
+		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&token)).is_none());
 	}
 
 	fn bearer(value: &str) -> HeaderMap {
@@ -1794,13 +2467,13 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		// The scheme is case-insensitive (RFC 9110 11.1).
 		for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
 			let value = format!("{scheme} correct-horse-battery-staple");
-			assert!(gate(ip(OUTSIDE), "/mcp", &bearer(&value)).is_none(), "{scheme}");
+			assert!(gate(ip(OUTSIDE), "/mcp", None, &bearer(&value)).is_none(), "{scheme}");
 		}
 
 		// The token is for the MCP endpoint. A leaked one must not open the
 		// rest of the instance.
 		for path in ["/", "/r/rust", "/info.json", "/mcp/other", "/mcpx"] {
-			let res = gate(ip(OUTSIDE), path, &bearer("Bearer correct-horse-battery-staple")).unwrap_or_else(|| panic!("{path} must be gated"));
+			let res = gate(ip(OUTSIDE), path, None, &bearer("Bearer correct-horse-battery-staple")).unwrap_or_else(|| panic!("{path} must be gated"));
 			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
 		}
 	}
@@ -1823,7 +2496,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 			"Basic correct-horse-battery-staple",
 			"correct-horse-battery-staple",
 		] {
-			let res = gate(ip(OUTSIDE), "/mcp", &bearer(value)).unwrap_or_else(|| panic!("{value:?} must not pass"));
+			let res = gate(ip(OUTSIDE), "/mcp", None, &bearer(value)).unwrap_or_else(|| panic!("{value:?} must not pass"));
 			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{value:?}");
 		}
 	}
@@ -1840,7 +2513,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 	])]
 	fn an_unset_or_blank_token_authorises_nothing() {
 		for value in ["Bearer ", "Bearer    ", "Bearer x"] {
-			assert!(gate(ip(OUTSIDE), "/mcp", &bearer(value)).is_some(), "{value:?}");
+			assert!(gate(ip(OUTSIDE), "/mcp", None, &bearer(value)).is_some(), "{value:?}");
 		}
 	}
 }

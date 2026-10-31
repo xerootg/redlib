@@ -15,3 +15,6 @@ pub mod settings;
 pub mod subreddit;
 pub mod user;
 pub mod utils;
+
+#[cfg(test)]
+mod pref_validation_tests;

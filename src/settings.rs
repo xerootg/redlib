@@ -719,16 +719,17 @@ mod origin_tests {
 	}
 }
 
-/// GET /settings/restore and /settings/update change cookies, so a link on another site must not
-/// be able to trigger them (audit finding #7)
+/// /settings/restore and /settings/update change cookies, so a GET (a link, which anyone can put
+/// on a page, in a Reddit comment or in a chat message) must not be able to trigger them
+/// (audit finding #7). Only a same-origin POST does.
 #[cfg(test)]
 mod navigation_tests {
 	use super::*;
 	use futures_lite::future::block_on;
 
-	fn get_with(uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+	fn request(method: &str, uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
 		let mut builder = Request::builder()
-			.method("GET")
+			.method(method)
 			.uri(uri)
 			.header("host", "redlib.example")
 			.header("cookie", "theme=dark; subscriptions=rust+news; filters=memes");
@@ -738,24 +739,38 @@ mod navigation_tests {
 		builder.body(Body::empty()).unwrap()
 	}
 
-	const LINKED_FROM_ELSEWHERE: [&[(&str, &str)]; 2] = [&[("sec-fetch-site", "cross-site")], &[("sec-fetch-site", "same-site")]];
-
-	// Typed in, bookmarked, clicked inside Redlib (or the redirect after encoded-restore), or sent by something that is not a browser
-	const FROM_THE_USER: [&[(&str, &str)]; 4] = [
+	// Every way a GET can arrive: from another site, from a Reddit comment rendered by this
+	// instance, from an email or chat app, typed in, or from something that is not a browser
+	const ANY_GET: [&[(&str, &str)]; 6] = [
 		&[],
-		&[("sec-fetch-site", "none")],
+		&[("sec-fetch-site", "cross-site")],
+		&[("sec-fetch-site", "same-site")],
 		&[("sec-fetch-site", "same-origin")],
+		&[("sec-fetch-site", "none")],
 		&[("sec-fetch-user", "?1"), ("sec-fetch-site", "none")],
+	];
+
+	const SAME_ORIGIN: [&[(&str, &str)]; 3] = [&[("sec-fetch-site", "same-origin")], &[("origin", "https://redlib.example")], &[]];
+
+	const CROSS_SITE: [&[(&str, &str)]; 4] = [
+		&[("sec-fetch-site", "cross-site")],
+		&[("sec-fetch-site", "same-site")],
+		&[("sec-fetch-site", "none")],
+		&[("origin", "https://evil.example")],
 	];
 
 	fn body_of(res: Response<Body>) -> String {
 		String::from_utf8(block_on(res.into_body().collect_bytes()).unwrap().to_vec()).unwrap()
 	}
 
+	fn cookies_of(res: &Response<Body>) -> Vec<String> {
+		res.headers().get_all("set-cookie").iter().map(|c| c.to_str().unwrap().to_string()).collect()
+	}
+
 	#[test]
-	fn restore_from_another_site_does_not_touch_cookies() {
-		for headers in LINKED_FROM_ELSEWHERE {
-			let res = block_on(restore(get_with("/settings/restore?redirect=/", headers))).unwrap();
+	fn restore_by_get_does_not_touch_cookies() {
+		for headers in ANY_GET {
+			let res = block_on(restore(request("GET", "/settings/restore?redirect=/", headers))).unwrap();
 			assert_eq!(res.status(), 200, "{headers:?}");
 			assert!(res.headers().get("set-cookie").is_none(), "{headers:?}: wiped or changed cookies");
 			assert!(res.headers().get("location").is_none(), "{headers:?}");
@@ -763,33 +778,38 @@ mod navigation_tests {
 	}
 
 	#[test]
-	fn update_from_another_site_does_not_touch_cookies() {
-		for headers in LINKED_FROM_ELSEWHERE {
-			let res = block_on(update(get_with("/settings/update?theme=light&redirect=/", headers))).unwrap();
+	fn update_by_get_does_not_touch_cookies() {
+		for headers in ANY_GET {
+			let res = block_on(update(request("GET", "/settings/update?theme=light&redirect=/", headers))).unwrap();
 			assert_eq!(res.status(), 200, "{headers:?}");
 			assert!(res.headers().get("set-cookie").is_none(), "{headers:?}: changed cookies");
+			assert!(res.headers().get("location").is_none(), "{headers:?}");
 		}
 	}
 
 	#[test]
-	fn link_from_another_site_gets_a_page_that_continues_from_this_site() {
+	fn link_gets_a_page_that_continues_with_a_post() {
 		// Restore links are meant to be shared, so they still work: one click on the page continues
-		let res = block_on(restore(get_with(
+		let res = block_on(restore(request(
+			"GET",
 			"/settings/restore/?theme=light&subscriptions=a+b&redirect=/r/a",
 			&[("sec-fetch-site", "cross-site")],
 		)))
 		.unwrap();
 		let body = body_of(res);
-		assert!(body.contains("href=\"/settings/restore/?theme=light&#38;subscriptions=a+b&#38;redirect=/r/a\""), "{body}");
+		assert!(
+			body.contains("method=\"post\" action=\"/settings/restore/?theme=light&#38;subscriptions=a+b&#38;redirect=/r/a\""),
+			"{body}"
+		);
 	}
 
 	#[test]
-	fn restore_by_the_user_still_works() {
-		for headers in FROM_THE_USER {
-			let res = block_on(restore(get_with("/settings/restore?theme=light&redirect=/r/rust", headers))).unwrap();
+	fn restore_by_post_works() {
+		for headers in SAME_ORIGIN {
+			let res = block_on(restore(request("POST", "/settings/restore?theme=light&redirect=/r/rust", headers))).unwrap();
 			assert_eq!(res.status(), 302, "{headers:?}");
 			assert_eq!(res.headers()["location"], "/r/rust", "{headers:?}");
-			let cookies: Vec<_> = res.headers().get_all("set-cookie").iter().map(|c| c.to_str().unwrap().to_string()).collect();
+			let cookies = cookies_of(&res);
 			assert!(cookies.iter().any(|c| c.starts_with("theme=light")), "{headers:?}: {cookies:?}");
 			assert!(
 				cookies.iter().any(|c| c.starts_with("subscriptions=;")),
@@ -799,14 +819,58 @@ mod navigation_tests {
 	}
 
 	#[test]
-	fn update_by_the_user_still_works() {
-		for headers in FROM_THE_USER {
-			let res = block_on(update(get_with("/settings/update?use_hls=on&redirect=/r/rust", headers))).unwrap();
+	fn update_by_post_works() {
+		for headers in SAME_ORIGIN {
+			let res = block_on(update(request("POST", "/settings/update?use_hls=on&redirect=/r/rust", headers))).unwrap();
 			assert_eq!(res.status(), 302, "{headers:?}");
 			assert_eq!(res.headers()["location"], "/r/rust", "{headers:?}");
-			let cookies: Vec<_> = res.headers().get_all("set-cookie").iter().map(|c| c.to_str().unwrap().to_string()).collect();
+			let cookies = cookies_of(&res);
 			assert!(cookies.iter().any(|c| c.starts_with("use_hls=on")), "{headers:?}: {cookies:?}");
 			assert!(!cookies.iter().any(|c| c.starts_with("subscriptions=;")), "{headers:?}: update keeps the rest: {cookies:?}");
+		}
+	}
+
+	#[test]
+	fn restore_and_update_by_cross_site_post_are_refused() {
+		for headers in CROSS_SITE {
+			let res = block_on(restore(request("POST", "/settings/restore?redirect=/", headers))).unwrap();
+			assert_eq!(res.status(), 403, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_none(), "{headers:?}");
+			let res = block_on(update(request("POST", "/settings/update?theme=light", headers))).unwrap();
+			assert_eq!(res.status(), 403, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_none(), "{headers:?}");
+		}
+	}
+
+	#[tokio::test]
+	async fn encoded_restore_applies_the_settings_without_another_click() {
+		let prefs = Preferences {
+			theme: "light".to_string(),
+			..Preferences::default()
+		};
+		let form = form_urlencoded::Serializer::new(String::new())
+			.append_pair("encoded_prefs", &prefs.to_bincode_str().unwrap())
+			.finish();
+		let mut req = request("POST", "/settings/encoded-restore", &[("sec-fetch-site", "same-origin")]);
+		*req.body_mut() = Body::from(form);
+		let res = encoded_restore(req).await.unwrap();
+		assert_eq!(res.status(), 302);
+		assert_eq!(res.headers()["location"], "/");
+		let cookies = cookies_of(&res);
+		assert!(cookies.iter().any(|c| c.starts_with("theme=light")), "{cookies:?}");
+		assert!(cookies.iter().any(|c| c.starts_with("subscriptions=;")), "{cookies:?}");
+	}
+
+	/// Links in Redlib's own pages must not be GETs to the settings routes: those only show a
+	/// confirmation page.
+	#[test]
+	fn templates_do_not_link_to_the_settings_routes() {
+		for (name, template) in [
+			("utils.html", include_str!("../templates/utils.html")),
+			("nsfwlanding.html", include_str!("../templates/nsfwlanding.html")),
+		] {
+			assert!(!template.contains("href=\"/settings/update"), "{name} links to /settings/update");
+			assert!(!template.contains("href=\"/settings/restore"), "{name} links to /settings/restore");
 		}
 	}
 }

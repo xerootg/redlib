@@ -1549,6 +1549,10 @@ fn fetch_site(req: &Request<Body>) -> Option<&str> {
 /// Browsers label requests with `Sec-Fetch-Site`; older ones send `Origin` on a POST instead,
 /// which has to match `Host` (or `X-Forwarded-Host` behind a proxy that rewrites it). A request
 /// with neither header does not come from a browser, so it cannot be a cross-site form post.
+///
+/// `X-Forwarded-Host` is taken as sent. A cross-site page cannot add request headers to a form
+/// POST (and a CORS preflight for a custom header gets no approval from Redlib), so only a
+/// non-browser client could forge it, and such a client has no victim's cookies to abuse.
 pub fn is_same_origin_post(req: &Request<Body>) -> bool {
 	if let Some(site) = fetch_site(req) {
 		return site == "same-origin";

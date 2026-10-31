@@ -29,6 +29,7 @@ struct SettingsTemplate {
 struct ConfirmSettingsTemplate {
 	prefs: Preferences,
 	url: String,
+	restore: bool,
 }
 
 // CONSTANTS
@@ -378,9 +379,17 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 	// A link (on another site, in a Reddit comment, in a chat message) must not wipe or change
 	// settings, so a GET only shows what would change and a button that POSTs the same URL back.
 	if req.method() != Method::POST {
+		// The action is a fixed route, not the request URI: routing normalises the path (`//`,
+		// `%2F`) but the handler sees it raw, and `//settings//restore` would be a protocol-relative URL
+		let route = if remove_cookies { "/settings/restore" } else { "/settings/update" };
+		let url = match req.uri().query() {
+			Some(query) => format!("{route}?{query}"),
+			None => route.to_string(),
+		};
 		return template(&ConfirmSettingsTemplate {
 			prefs: Preferences::new(&req),
-			url: req.uri().to_string(),
+			url,
+			restore: remove_cookies,
 		});
 	}
 	if let Some(res) = reject_cross_site_post(&req) {

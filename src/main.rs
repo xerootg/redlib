@@ -232,7 +232,10 @@ async fn main() {
 
 	// Define default headers (added to all responses)
 	app.default_headers = headers! {
-		"Referrer-Policy" => "no-referrer",
+		// Not `no-referrer`: that makes browsers send `Origin: null` on same-origin form POSTs, which
+		// the cross-site POST check (utils::is_same_origin_post) has to refuse for browsers without
+		// `Sec-Fetch-Site`. Other sites still get no Referer.
+		"Referrer-Policy" => "same-origin",
 		"X-Content-Type-Options" => "nosniff",
 		"X-Frame-Options" => "DENY",
 		"Content-Security-Policy" => "default-src 'none'; font-src 'self'; script-src 'self' blob:; manifest-src 'self'; media-src 'self' data: blob: about:; style-src 'self' 'unsafe-inline'; base-uri 'none'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; connect-src 'self'; worker-src blob:;"

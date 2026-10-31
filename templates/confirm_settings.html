@@ -5,7 +5,11 @@
     <div id="wall">
         <h1>Change your settings?</h1>
         <br>
+        {% if restore %}
         <p>A link is asking Redlib to change the settings stored in your browser. Restoring replaces all of your settings, subscriptions and filters. Nothing has changed yet.</p>
+        {% else %}
+        <p>A link is asking Redlib to change some of the settings stored in your browser. Nothing has changed yet.</p>
+        {% endif %}
         <form method="post" action="{{ url }}">
             <button id="save" class="link-button" type="submit">Continue</button> or <a href="/">cancel</a>.
         </form>

@@ -59,7 +59,13 @@ pub(crate) fn block_on_shared<F: std::future::Future>(future: F) -> F::Output {
 }
 
 pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
-	let client = block_on(Oauth::new());
+	// A token endpoint that is down at the start is no reason to refuse to
+	// serve settings, login and static pages: start without a token, and
+	// token_daemon fetches one.
+	let client = block_on(Oauth::try_new()).unwrap_or_else(|| {
+		log::error!("[⛔] Starting without an OAuth token; will keep trying");
+		Oauth::without_token()
+	});
 	tokio::spawn(token_daemon());
 	ArcSwap::new(client.into())
 });

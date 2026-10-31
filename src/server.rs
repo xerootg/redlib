@@ -15,12 +15,15 @@ use libflate::gzip;
 use route_recognizer::{Params, Router};
 use std::{
 	cmp::Ordering,
+	collections::hash_map::RandomState,
 	fmt::Display,
+	hash::BuildHasher,
 	io,
 	pin::Pin,
 	result::Result,
 	str::{from_utf8, Split},
 	string::ToString,
+	sync::LazyLock,
 };
 use time::OffsetDateTime;
 
@@ -716,6 +719,12 @@ async fn compress_response(req_headers: &HeaderMap<header::HeaderValue>, res: &m
 	Ok(())
 }
 
+/// Keyed digest of a response body, used as the `compress_body` cache key.
+fn body_digest(body: &[u8]) -> u64 {
+	static HASHER: LazyLock<RandomState> = LazyLock::new(RandomState::new);
+	HASHER.hash_one(body)
+}
+
 /// Compresses a `Vec<u8>` given a [`CompressionType`].
 ///
 /// This is a helper function for [`compress_response`] and should not be
@@ -726,7 +735,17 @@ async fn compress_response(req_headers: &HeaderMap<header::HeaderValue>, res: &m
 // larger than backends::json's TTL, but that's okay, because if backends::json
 // returns a new serde_json::Value, body_bytes changes, so this function will
 // execute again.
-#[cached(max_size = 100, ttl_secs = 600)]
+//
+// The cache key is a digest of the body, not the body itself, so an entry
+// doesn't keep a second copy of the page alive. The digest is SipHash with
+// per-process random keys, so a client can't forge a collision to get another
+// page's compressed bytes served.
+#[cached(
+	max_size = 100,
+	ttl_secs = 600,
+	key = "(CompressionType, usize, u64)",
+	convert = r#"{ (compressor, body_bytes.len(), body_digest(&body_bytes)) }"#
+)]
 fn compress_body(compressor: CompressionType, body_bytes: Vec<u8>) -> Result<Vec<u8>, String> {
 	// io::Cursor implements io::Read, required for our encoders.
 	let mut reader = io::Cursor::new(body_bytes);

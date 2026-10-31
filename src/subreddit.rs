@@ -2,8 +2,8 @@
 
 use crate::body::Body;
 use crate::utils::{
-	build_rss_items, catch_random, clean_url, enable_rss, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls,
-	rss_page_link, rss_page_path, rss_response, setting, setting_or_default, should_be_nsfw_gated, template, val, Post, Preferences, Subreddit, RSS_LISTING_SORTS,
+	build_rss_items, catch_random, clean_url, enable_rss, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, numbered_cookie_names, param, redirect,
+	rewrite_urls, rss_page_link, rss_page_path, rss_response, setting, setting_or_default, should_be_nsfw_gated, template, val, Post, Preferences, Subreddit, RSS_LISTING_SORTS,
 };
 use crate::{backends::json, server::RequestExt, server::ResponseExt};
 use askama::Template;
@@ -265,11 +265,10 @@ pub fn join_until_size_limit<T: std::fmt::Display>(vec: &[T]) -> Vec<std::string
 
 // Sub, filter, unfilter, or unsub by setting subscription cookie using response "Set-Cookie" header
 /// Adds a removal for `{base}{start}`, `{base}{start + 1}`, ... for as long as the request carries them
+/// (at most up to `MAX_NUMBERED_COOKIES`, the most that `setting()` reads)
 fn remove_numbered_cookies(req: &Request<Body>, response: &mut Response<Body>, base: &str, start: usize) {
-	let mut number = start;
-	while req.cookie(&format!("{base}{number}")).is_some() {
-		response.remove_cookie(format!("{base}{number}"));
-		number += 1;
+	for name in numbered_cookie_names(req.cookies().iter().map(Cookie::name), base, start) {
+		response.remove_cookie(name);
 	}
 }
 

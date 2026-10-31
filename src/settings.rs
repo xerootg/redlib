@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::body::Body;
 use crate::server::ResponseExt;
 use crate::subreddit::join_until_size_limit;
-use crate::utils::{deflate_decompress, redirect, template, Preferences};
+use crate::utils::{deflate_decompress, numbered_cookie_names, redirect, template, Preferences};
 use askama::Template;
 use cookie::Cookie;
 use hyper::{Request, Response};
@@ -423,6 +423,9 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 		.map(|hv| hv.to_str().unwrap_or("").to_string()) // Return String
 		.unwrap_or_else(String::new); // Return an empty string if None
 
+	// The names of those cookies, so each numbered cookie is looked up in a set instead of by searching the whole string
+	let cookie_names: Vec<&str> = cookies_string.split(';').map(|cookie| cookie.trim().split('=').next().unwrap_or_default()).collect();
+
 	// If there are subscriptions to restore set them and delete any old subscriptions cookies, otherwise delete them all
 	if let Some(subscriptions) = subscriptions {
 		let sub_list: Vec<String> = subscriptions.split('+').map(str::to_string).collect();
@@ -449,28 +452,20 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 			subscriptions_number_to_delete_from += 1;
 		}
 
-		// While subscriptionsNUMBER= is in the string of cookies add a response removing that cookie
-		while cookies_string.contains(&format!("subscriptions{subscriptions_number_to_delete_from}=")) {
-			// Remove that subscriptions cookie
-			response.remove_cookie(format!("subscriptions{subscriptions_number_to_delete_from}"));
-
-			// Increment subscriptions cookie number
-			subscriptions_number_to_delete_from += 1;
+		// Remove the numbered subscriptions cookies that are in the string of cookies
+		for name in numbered_cookie_names(cookie_names.iter().copied(), "subscriptions", subscriptions_number_to_delete_from) {
+			response.remove_cookie(name);
 		}
 	} else if remove_cookies {
 		// Remove unnumbered subscriptions cookie
 		response.remove_cookie("subscriptions".to_string());
 
 		// Starts at one to deal with the first numbered subscription cookie and onwards
-		let mut subscriptions_number_to_delete_from = 1;
+		let subscriptions_number_to_delete_from = 1;
 
-		// While subscriptionsNUMBER= is in the string of cookies add a response removing that cookie
-		while cookies_string.contains(&format!("subscriptions{subscriptions_number_to_delete_from}=")) {
-			// Remove that subscriptions cookie
-			response.remove_cookie(format!("subscriptions{subscriptions_number_to_delete_from}"));
-
-			// Increment subscriptions cookie number
-			subscriptions_number_to_delete_from += 1;
+		// Remove the numbered subscriptions cookies that are in the string of cookies
+		for name in numbered_cookie_names(cookie_names.iter().copied(), "subscriptions", subscriptions_number_to_delete_from) {
+			response.remove_cookie(name);
 		}
 	}
 
@@ -500,28 +495,20 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 			filters_number_to_delete_from += 1;
 		}
 
-		// While filtersNUMBER= is in the string of cookies add a response removing that cookie
-		while cookies_string.contains(&format!("filters{filters_number_to_delete_from}=")) {
-			// Remove that filters cookie
-			response.remove_cookie(format!("filters{filters_number_to_delete_from}"));
-
-			// Increment filters cookie number
-			filters_number_to_delete_from += 1;
+		// Remove the numbered filters cookies that are in the string of cookies
+		for name in numbered_cookie_names(cookie_names.iter().copied(), "filters", filters_number_to_delete_from) {
+			response.remove_cookie(name);
 		}
 	} else if remove_cookies {
 		// Remove unnumbered filters cookie
 		response.remove_cookie("filters".to_string());
 
 		// Starts at one to deal with the first numbered subscription cookie and onwards
-		let mut filters_number_to_delete_from = 1;
+		let filters_number_to_delete_from = 1;
 
-		// While filtersNUMBER= is in the string of cookies add a response removing that cookie
-		while cookies_string.contains(&format!("filters{filters_number_to_delete_from}=")) {
-			// Remove that sfilters cookie
-			response.remove_cookie(format!("filters{filters_number_to_delete_from}"));
-
-			// Increment filters cookie number
-			filters_number_to_delete_from += 1;
+		// Remove the numbered filters cookies that are in the string of cookies
+		for name in numbered_cookie_names(cookie_names.iter().copied(), "filters", filters_number_to_delete_from) {
+			response.remove_cookie(name);
 		}
 	}
 

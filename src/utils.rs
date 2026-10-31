@@ -1048,7 +1048,7 @@ pub fn param(path: &str, value: &str) -> Option<String> {
 
 /// The most numbered cookies (`subscriptions1`, `subscriptions2`, ...) read per setting.
 /// A real cookie jar needs a handful; the cap keeps a forged Cookie header cheap.
-const MAX_NUMBERED_COOKIES: usize = 64;
+pub(crate) const MAX_NUMBERED_COOKIES: usize = 64;
 
 /// Joins the `name` cookie and the `nameN` cookies that follow it (`name1`, `name2`, ...,
 /// stopping at the first missing number) into one string. The Cookie header is parsed once.
@@ -1069,6 +1069,17 @@ fn joined_numbered_cookies(req: &Request<Body>, name: &str) -> String {
 		}
 	}
 	joined
+}
+
+/// Names `{base}{start}`, `{base}{start + 1}`, ... for as long as `cookie_names` contains them,
+/// at most up to `{base}{MAX_NUMBERED_COOKIES}`. `cookie_names` is searched through a set, so
+/// a forged Cookie header cannot make this quadratic.
+pub(crate) fn numbered_cookie_names<'a>(cookie_names: impl IntoIterator<Item = &'a str>, base: &str, start: usize) -> Vec<String> {
+	let cookie_names: HashSet<&str> = cookie_names.into_iter().collect();
+	(start..=MAX_NUMBERED_COOKIES)
+		.map(|number| format!("{base}{number}"))
+		.take_while(|name| cookie_names.contains(name.as_str()))
+		.collect()
 }
 
 /// Retrieve the value of a setting by name

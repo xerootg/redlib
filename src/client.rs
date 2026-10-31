@@ -746,6 +746,72 @@ impl IntoHyperResponse for WreqResponse {
 }
 
 #[cfg(test)]
+mod redirect_limit_tests {
+	use super::*;
+	use std::sync::atomic::AtomicUsize;
+	use std::time::Duration;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	/// A local HTTP server: `/loop` redirects to itself forever, `/a` redirects
+	/// to `/b` once, everything else is a 200. Returns its address and a hit counter.
+	async fn redirect_server() -> (SocketAddr, Arc<AtomicUsize>) {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		let hits = Arc::new(AtomicUsize::new(0));
+		let counter = hits.clone();
+		tokio::spawn(async move {
+			loop {
+				let Ok((mut stream, _)) = listener.accept().await else { return };
+				counter.fetch_add(1, Ordering::SeqCst);
+				tokio::spawn(async move {
+					let mut buf = vec![0u8; 4096];
+					let n = stream.read(&mut buf).await.unwrap_or(0);
+					let request = String::from_utf8_lossy(&buf[..n]).to_string();
+					let target = request.split_whitespace().nth(1).unwrap_or_default().to_string();
+					let reply = if target.starts_with("/loop") {
+						"HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+					} else if target.starts_with("/a") {
+						"HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+					} else {
+						"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+					};
+					let _ = stream.write_all(reply.as_bytes()).await;
+				});
+			}
+		});
+		(addr, hits)
+	}
+
+	fn follow(addr: SocketAddr, path: &str) -> impl std::future::Future<Output = Result<WreqResponse, String>> {
+		let client = WreqClient::builder().redirect(Policy::none()).build().unwrap();
+		follow_redirects(path.to_string(), true, move |path| {
+			let request = client.get(format!("http://{addr}{path}")).send();
+			async move { request.await.map_err(|e| e.to_string()) }
+		})
+	}
+
+	#[test]
+	fn test_redirect_loop_is_cut_off() {
+		block_on_shared(async {
+			let (addr, hits) = redirect_server().await;
+			let result = tokio::time::timeout(Duration::from_secs(10), follow(addr, "/loop")).await;
+			assert!(result.is_ok(), "a redirect loop must end instead of running forever");
+			assert!(result.unwrap().is_err(), "a redirect loop must be an error");
+			assert!(hits.load(Ordering::SeqCst) <= 20, "too many hops: {}", hits.load(Ordering::SeqCst));
+		});
+	}
+
+	#[test]
+	fn test_single_redirect_is_followed() {
+		block_on_shared(async {
+			let (addr, _) = redirect_server().await;
+			let response = tokio::time::timeout(Duration::from_secs(10), follow(addr, "/a")).await.unwrap().unwrap();
+			assert_eq!(response.status().as_u16(), 200);
+		});
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use {crate::config::get_setting, sealed_test::prelude::*};

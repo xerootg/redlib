@@ -693,11 +693,21 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 	// This is needed or Reddit will redirect us to a /media landing page that just renders the image.
 	builder = builder.header(wreq_header::ACCEPT, "*/*");
 
-	builder.send().await.map(|res| restrict_proxy_response(res.into_hyper_response())).or_else(|e| {
-		// Not `e`: wreq puts the upstream URL in its errors.
-		dbg_msg!("proxy request failed: {}", e);
-		Ok(proxy_error(502, "Bad gateway"))
-	})
+	Ok(send_proxied(builder, READ_IDLE_TIMEOUT).await)
+}
+
+/// Sends the upstream request of the media proxy and turns the answer into
+/// the response for the browser. `_idle` is how long the upstream may stay
+/// silent.
+async fn send_proxied(builder: wreq::RequestBuilder, _idle: Duration) -> HyperResponse<Body> {
+	match builder.send().await {
+		Ok(res) => restrict_proxy_response(res.into_hyper_response()),
+		Err(e) => {
+			// Not `e`: wreq puts the upstream URL in its errors.
+			dbg_msg!("proxy request failed: {}", e);
+			proxy_error(502, "Bad gateway")
+		}
+	}
 }
 
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP

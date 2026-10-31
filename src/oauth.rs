@@ -644,6 +644,44 @@ mod retry_tests {
 mod hardening_tests {
 	use super::*;
 
+	/// Collects what the current thread logs.
+	struct Capture(std::sync::Mutex<Vec<(std::thread::ThreadId, log::Level, String)>>);
+
+	impl log::Log for Capture {
+		fn enabled(&self, _: &log::Metadata) -> bool {
+			true
+		}
+
+		fn log(&self, record: &log::Record) {
+			self.0.lock().unwrap().push((std::thread::current().id(), record.level(), record.args().to_string()));
+		}
+
+		fn flush(&self) {}
+	}
+
+	// Audit info item (oauth.rs:469): the spoofed device id and uuid went to
+	// the log at info level, which is the level the deployment runs at.
+	#[test]
+	fn test_device_headers_are_not_logged_at_info() {
+		static CAPTURE: Capture = Capture(std::sync::Mutex::new(Vec::new()));
+		log::set_logger(&CAPTURE).expect("no other test installs a logger");
+		log::set_max_level(log::LevelFilter::Trace);
+
+		let device = Device::android();
+
+		let me = std::thread::current().id();
+		let uuid = &device.headers["X-Reddit-Device-Id"];
+		let records = CAPTURE.0.lock().unwrap();
+		let mine: Vec<_> = records.iter().filter(|(thread, ..)| *thread == me).collect();
+		assert!(
+			mine.iter().any(|(_, _, message)| message.contains(uuid.as_str())),
+			"the device is no longer logged at all: {mine:?}"
+		);
+		for (_, level, message) in mine {
+			assert!(*level > log::Level::Info || !message.contains(uuid.as_str()), "{level}: {message}");
+		}
+	}
+
 	// Audit info item (oauth.rs:297): `&token[..32]` panics on a token that is
 	// shorter than 32 bytes, or one with a multibyte character at byte 32.
 	#[test]

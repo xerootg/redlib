@@ -15,12 +15,15 @@ use libflate::gzip;
 use route_recognizer::{Params, Router};
 use std::{
 	cmp::Ordering,
+	collections::hash_map::RandomState,
 	fmt::Display,
+	hash::BuildHasher,
 	io,
 	pin::Pin,
 	result::Result,
 	str::{from_utf8, Split},
 	string::ToString,
+	sync::LazyLock,
 };
 use time::OffsetDateTime;
 
@@ -131,6 +134,10 @@ enum CompressionType {
 /// Brotli would be nice universally, but Safari (iOS, iPhone, macOS) reportedly
 /// doesn't support it yet.
 const DEFAULT_COMPRESSOR: CompressionType = CompressionType::Gzip;
+
+/// Longest Accept-Encoding header we will parse. Real clients send well under
+/// 100 bytes.
+const MAX_ACCEPT_ENCODING_LEN: usize = 256;
 
 impl CompressionType {
 	/// Returns a `CompressionType` given a content coding
@@ -482,9 +489,12 @@ async fn new_boilerplate(
 /// Accept-Encoding: gzip, compress, br
 /// Accept-Encoding: br;q=1.0, gzip;q=0.8, *;q=0.1
 /// ```
-#[cached]
+///
+/// The result is deliberately not memoised: the header is attacker-controlled,
+/// so a cache keyed on it grows without bound, while parsing it is cheap.
+/// Headers longer than [`MAX_ACCEPT_ENCODING_LEN`] are not compressed for.
 fn determine_compressor(accept_encoding: String) -> Option<CompressionType> {
-	if accept_encoding.is_empty() {
+	if accept_encoding.is_empty() || accept_encoding.len() > MAX_ACCEPT_ENCODING_LEN {
 		return None;
 	};
 
@@ -704,8 +714,14 @@ async fn compress_response(req_headers: &HeaderMap<header::HeaderValue>, res: &m
 		}
 	};
 
-	// Compress!
-	match compress_body(compressor, body_bytes) {
+	// Compress! This is CPU-bound and takes long enough on a big page to stall
+	// every other request on this worker (including /healthz), so run it on the
+	// blocking pool.
+	let compressed = tokio::task::spawn_blocking(move || compress_body(compressor, body_bytes))
+		.await
+		.map_err(|e| e.to_string())
+		.and_then(|result| result);
+	match compressed {
 		Ok(compressed) => {
 			// We get here iff the compression was successful. Replace the body
 			// with the compressed payload, and add the appropriate
@@ -724,6 +740,12 @@ async fn compress_response(req_headers: &HeaderMap<header::HeaderValue>, res: &m
 	Ok(())
 }
 
+/// Keyed digest of a response body, used as the `compress_body` cache key.
+fn body_digest(body: &[u8]) -> u64 {
+	static HASHER: LazyLock<RandomState> = LazyLock::new(RandomState::new);
+	HASHER.hash_one(body)
+}
+
 /// Compresses a `Vec<u8>` given a [`CompressionType`].
 ///
 /// This is a helper function for [`compress_response`] and should not be
@@ -734,7 +756,17 @@ async fn compress_response(req_headers: &HeaderMap<header::HeaderValue>, res: &m
 // larger than backends::json's TTL, but that's okay, because if backends::json
 // returns a new serde_json::Value, body_bytes changes, so this function will
 // execute again.
-#[cached(max_size = 100, ttl_secs = 600)]
+//
+// The cache key is a digest of the body, not the body itself, so an entry
+// doesn't keep a second copy of the page alive. The digest is SipHash with
+// per-process random keys, so a client can't forge a collision to get another
+// page's compressed bytes served.
+#[cached(
+	max_size = 100,
+	ttl_secs = 600,
+	key = "(CompressionType, usize, u64)",
+	convert = r#"{ (compressor, body_bytes.len(), body_digest(&body_bytes)) }"#
+)]
 fn compress_body(compressor: CompressionType, body_bytes: Vec<u8>) -> Result<Vec<u8>, String> {
 	// io::Cursor implements io::Read, required for our encoders.
 	let mut reader = io::Cursor::new(body_bytes);
@@ -765,9 +797,13 @@ fn compress_body(compressor: CompressionType, body_bytes: Vec<u8>) -> Result<Vec
 		}
 
 		CompressionType::Brotli => {
-			// We may want to make the compression parameters configurable
-			// in the future. For now, the defaults are sufficient.
-			let brotli_params = BrotliEncoderParams::default();
+			// The library default is quality 11, which took 3.8 s for a 426 KB
+			// thread page. Quality 5 is a common choice for dynamic content; on
+			// the pages we measured it made the output about 15% larger.
+			let brotli_params = BrotliEncoderParams {
+				quality: 5,
+				..BrotliEncoderParams::default()
+			};
 
 			let mut compressed = Vec::<u8>::new();
 			match BrotliCompress(&mut reader, &mut compressed, &brotli_params) {
@@ -788,6 +824,79 @@ fn compress_body(compressor: CompressionType, body_bytes: Vec<u8>) -> Result<Vec
 	};
 
 	Ok(compressed)
+}
+
+/// Regression tests for the compression denial of service (audit findings 2,
+/// 6 and the compress_body half of 17).
+#[cfg(test)]
+mod compress_dos_tests {
+	use super::*;
+	use lipsum::lipsum;
+	use std::sync::{Arc, Mutex};
+
+	/// Finding 2: `determine_compressor` was memoised on the raw header, so every
+	/// distinct huge Accept-Encoding stayed in memory forever. No browser sends
+	/// more than a few dozen bytes, so an oversized header is simply not
+	/// compressed for (and must not be remembered).
+	#[test]
+	fn oversized_accept_encoding_is_ignored() {
+		for i in 0..50 {
+			let header = format!("gzip, x{i}{}", "a".repeat(300_000));
+			assert_eq!(determine_compressor(header), None);
+		}
+		// Ordinary headers still work.
+		assert_eq!(determine_compressor("gzip, deflate, br, zstd".to_string()), Some(CompressionType::Brotli));
+	}
+
+	/// Finding 17: the `compress_body` cache used the whole body as its key, so
+	/// each entry held the page twice. The key must be a small digest.
+	#[test]
+	fn compress_body_cache_key_does_not_hold_the_body() {
+		let body = lipsum(40_000).into_bytes();
+		assert!(body.len() > 100_000);
+		compress_body(CompressionType::Gzip, body).unwrap();
+
+		let keys = COMPRESS_BODY.read().key_order();
+		assert!(!keys.is_empty());
+		for key in keys {
+			let shown = format!("{key:?}");
+			assert!(shown.len() < 256, "cache key is {} bytes long", shown.len());
+		}
+	}
+
+	/// Finding 6: Brotli quality 11 ran on the async worker for seconds. On a
+	/// single-threaded runtime, a task that is already queued must get to run
+	/// while a large body is being compressed, so compression has to be moved
+	/// off the runtime thread. This is ordering-based, not timing-based.
+	#[tokio::test(flavor = "current_thread")]
+	async fn compressing_a_large_page_does_not_block_the_runtime() {
+		let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+		let mut req_headers = HeaderMap::new();
+		req_headers.insert(header::ACCEPT_ENCODING, header::HeaderValue::from_static("br"));
+		let mut res = Response::builder()
+			.status(200)
+			.header(header::CONTENT_TYPE, "text/html")
+			.body(Body::from(lipsum(20_000)))
+			.unwrap();
+
+		let compress_order = order.clone();
+		let compress = tokio::spawn(async move {
+			compress_response(&req_headers, &mut res).await.unwrap();
+			compress_order.lock().unwrap().push("compressed");
+			res
+		});
+		let other_order = order.clone();
+		let other = tokio::spawn(async move {
+			other_order.lock().unwrap().push("other task ran");
+		});
+
+		let res = compress.await.unwrap();
+		other.await.unwrap();
+
+		assert_eq!(res.headers().get(header::CONTENT_ENCODING).unwrap(), "br");
+		assert_eq!(*order.lock().unwrap(), vec!["other task ran", "compressed"]);
+	}
 }
 
 #[cfg(test)]
@@ -817,6 +926,11 @@ mod tests {
 
 	#[test]
 	fn test_compress_response() {
+		// compress_response runs the compressor on tokio's blocking pool, so a
+		// runtime has to be entered even though the future is driven by block_on.
+		let rt = tokio::runtime::Runtime::new().unwrap();
+		let _guard = rt.enter();
+
 		// This macro generates an Accept-Encoding header value given any number of
 		// compressors.
 		macro_rules! ae_gen {

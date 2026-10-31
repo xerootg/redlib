@@ -775,6 +775,79 @@ fn compress_body(compressor: CompressionType, body_bytes: Vec<u8>) -> Result<Vec
 	Ok(compressed)
 }
 
+/// Regression tests for the compression denial of service (audit findings 2,
+/// 6 and the compress_body half of 17).
+#[cfg(test)]
+mod compress_dos_tests {
+	use super::*;
+	use lipsum::lipsum;
+	use std::sync::{Arc, Mutex};
+
+	/// Finding 2: `determine_compressor` was memoised on the raw header, so every
+	/// distinct huge Accept-Encoding stayed in memory forever. No browser sends
+	/// more than a few dozen bytes, so an oversized header is simply not
+	/// compressed for (and must not be remembered).
+	#[test]
+	fn oversized_accept_encoding_is_ignored() {
+		for i in 0..50 {
+			let header = format!("gzip, x{i}{}", "a".repeat(300_000));
+			assert_eq!(determine_compressor(header), None);
+		}
+		// Ordinary headers still work.
+		assert_eq!(determine_compressor("gzip, deflate, br, zstd".to_string()), Some(CompressionType::Brotli));
+	}
+
+	/// Finding 17: the `compress_body` cache used the whole body as its key, so
+	/// each entry held the page twice. The key must be a small digest.
+	#[test]
+	fn compress_body_cache_key_does_not_hold_the_body() {
+		let body = lipsum(40_000).into_bytes();
+		assert!(body.len() > 100_000);
+		compress_body(CompressionType::Gzip, body).unwrap();
+
+		let keys = COMPRESS_BODY.read().key_order();
+		assert!(!keys.is_empty());
+		for key in keys {
+			let shown = format!("{key:?}");
+			assert!(shown.len() < 256, "cache key is {} bytes long", shown.len());
+		}
+	}
+
+	/// Finding 6: Brotli quality 11 ran on the async worker for seconds. On a
+	/// single-threaded runtime, a task that is already queued must get to run
+	/// while a large body is being compressed, so compression has to be moved
+	/// off the runtime thread. This is ordering-based, not timing-based.
+	#[tokio::test(flavor = "current_thread")]
+	async fn compressing_a_large_page_does_not_block_the_runtime() {
+		let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+		let mut req_headers = HeaderMap::new();
+		req_headers.insert(header::ACCEPT_ENCODING, header::HeaderValue::from_static("br"));
+		let mut res = Response::builder()
+			.status(200)
+			.header(header::CONTENT_TYPE, "text/html")
+			.body(Body::from(lipsum(20_000)))
+			.unwrap();
+
+		let compress_order = order.clone();
+		let compress = tokio::spawn(async move {
+			compress_response(&req_headers, &mut res).await.unwrap();
+			compress_order.lock().unwrap().push("compressed");
+			res
+		});
+		let other_order = order.clone();
+		let other = tokio::spawn(async move {
+			other_order.lock().unwrap().push("other task ran");
+		});
+
+		let res = compress.await.unwrap();
+		other.await.unwrap();
+
+		assert_eq!(res.headers().get(header::CONTENT_ENCODING).unwrap(), "br");
+		assert_eq!(*order.lock().unwrap(), vec!["other task ran", "compressed"]);
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

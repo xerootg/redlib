@@ -591,8 +591,59 @@ fn proxy_url(req: &HyperRequest<Body>, format: &str) -> Result<wreq::Uri, String
 	}
 }
 
-/// Not restricting anything yet.
-fn restrict_proxy_response(res: HyperResponse<Body>) -> HyperResponse<Body> {
+/// The upstream headers the media proxy passes on. Anything else, such as
+/// `Set-Cookie`, `Location` or `Content-Security-Policy`, stays behind.
+const PROXY_RESPONSE_HEADERS: &[&str] = &[
+	"content-type",
+	"content-length",
+	"content-range",
+	"content-encoding",
+	"accept-ranges",
+	"cache-control",
+	"expires",
+	"last-modified",
+];
+
+/// Whether `content_type` is something the media proxy serves: images, video,
+/// audio, fonts and the streaming playlists. Pages, scripts and SVG are not,
+/// since the proxy serves from redlib's own origin.
+fn proxy_content_type_allowed(content_type: Option<&header::HeaderValue>) -> bool {
+	let Some(content_type) = content_type.and_then(|value| value.to_str().ok()) else {
+		return false;
+	};
+	let media_type = content_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+	media_type != "image/svg+xml"
+		&& (["image/", "video/", "audio/", "font/"].iter().any(|prefix| media_type.starts_with(prefix))
+			|| [
+				"application/vnd.apple.mpegurl",
+				"application/x-mpegurl",
+				"application/dash+xml",
+				"application/octet-stream",
+				"binary/octet-stream",
+			]
+			.contains(&media_type.as_str()))
+}
+
+/// Limits what the media proxy hands to the browser: media types only, with
+/// the headers in `PROXY_RESPONSE_HEADERS`. Redirects are not passed on (the
+/// browser would follow them straight to Reddit) and an upstream error page is
+/// swapped for a plain text one with the same status.
+fn restrict_proxy_response(mut res: HyperResponse<Body>) -> HyperResponse<Body> {
+	let status = res.status();
+	// A 304 answers a conditional request and has no body or type.
+	let not_modified = status == hyper::StatusCode::NOT_MODIFIED;
+	if !not_modified && (status.is_redirection() || !proxy_content_type_allowed(res.headers().get(header::CONTENT_TYPE))) {
+		return if status.is_client_error() || status.is_server_error() {
+			proxy_error(status.as_u16(), "Upstream error")
+		} else {
+			proxy_error(502, "Bad gateway")
+		};
+	}
+
+	let unwanted: Vec<_> = res.headers().keys().filter(|name| !PROXY_RESPONSE_HEADERS.contains(&name.as_str())).cloned().collect();
+	for name in unwanted {
+		res.headers_mut().remove(name);
+	}
 	res
 }
 
@@ -629,34 +680,11 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 	// This is needed or Reddit will redirect us to a /media landing page that just renders the image.
 	builder = builder.header(wreq_header::ACCEPT, "*/*");
 
-	builder
-		.send()
-		.await
-		.map(|mut res| {
-			let headers = res.headers_mut();
-
-			let mut rm = |key: &str| headers.remove(key);
-
-			rm("access-control-expose-headers");
-			rm("server");
-			rm("vary");
-			rm("etag");
-			rm("x-cdn");
-			rm("x-cdn-client-region");
-			rm("x-cdn-name");
-			rm("x-cdn-server-region");
-			rm("x-reddit-cdn");
-			rm("x-reddit-video-features");
-			rm("Nel");
-			rm("Report-To");
-
-			restrict_proxy_response(res.into_hyper_response())
-		})
-		.or_else(|e| {
-			// Not `e`: wreq puts the upstream URL in its errors.
-			dbg_msg!("proxy request failed: {}", e);
-			Ok(proxy_error(502, "Bad gateway"))
-		})
+	builder.send().await.map(|res| restrict_proxy_response(res.into_hyper_response())).or_else(|e| {
+		// Not `e`: wreq puts the upstream URL in its errors.
+		dbg_msg!("proxy request failed: {}", e);
+		Ok(proxy_error(502, "Bad gateway"))
+	})
 }
 
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP

@@ -202,9 +202,12 @@ impl From<serde_json::Error> for AuthError {
 	}
 }
 
+/// The shortest wait before `token_daemon` refreshes the token again.
+const MIN_REFRESH_DELAY: Duration = Duration::from_secs(60);
+
 /// How long to wait before refreshing a token that is valid for `expires_in` seconds.
 fn refresh_delay(expires_in: u64) -> Duration {
-	Duration::from_secs(expires_in - 120)
+	Duration::from_secs(expires_in.saturating_sub(120)).max(MIN_REFRESH_DELAY)
 }
 
 pub async fn token_daemon() {
@@ -646,9 +649,8 @@ mod hardening_tests {
 	#[test]
 	fn test_refresh_delay_with_a_short_expiry() {
 		assert_eq!(refresh_delay(86400), Duration::from_secs(86280));
-		for expires_in in [0, 60, 119, 120, 121] {
-			assert!(refresh_delay(expires_in) <= Duration::from_secs(86400), "{expires_in}");
-			assert!(refresh_delay(expires_in) >= Duration::from_secs(1), "{expires_in}");
+		for expires_in in [0, 60, 119, 120, 121, u64::MAX] {
+			assert!(refresh_delay(expires_in) >= Duration::from_secs(60), "{expires_in}");
 		}
 	}
 }

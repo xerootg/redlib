@@ -26,6 +26,11 @@ enum Check {
 	Number(usize),
 }
 
+/// The parameters that a thread page (a path with a post id after `comments`)
+/// reads. Reddit ignores the others there, and each value of one would be
+/// another copy of the page.
+const THREAD_KEYS: &[&str] = &["context", "depth", "limit", "more_cursor", "more_query", "raw_json", "sort"];
+
 const FLAGS: &[&str] = &["on", "off", "1", "0", "true", "false"];
 
 /// Query parameters that change what Reddit sends, or what a backend makes of
@@ -58,6 +63,7 @@ const QUERY_KEYS: &[(&str, Check)] = &[
 			"controversial",
 			"qa",
 			"live",
+			"num_comments",
 			"relevance",
 			"comments",
 			"rising",
@@ -91,8 +97,12 @@ pub fn fetch_key(path: &str) -> Option<String> {
 		return None;
 	}
 
+	let thread = thread_at(&route.strip_suffix(".json").unwrap_or(route).split('/').collect::<Vec<_>>()).is_some();
 	let mut kept = BTreeMap::new();
 	for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+		if thread && !THREAD_KEYS.contains(&&*key) {
+			continue;
+		}
 		if let Some((name, kind)) = QUERY_KEYS.iter().find(|(name, _)| *name == key) {
 			if kind.accepts(&value) {
 				kept.insert(*name, value);
@@ -109,6 +119,18 @@ pub fn fetch_key(path: &str) -> Option<String> {
 	Some(format!("{route}?{query}"))
 }
 
+/// Where `comments` is in the segments of a thread's path, which is `/comments/<id>`
+/// or `/r/<sub>/comments/<id>` (or `/user/<name>/...`). A sub, user or wiki
+/// page can be named comments too.
+fn thread_at<S: AsRef<str>>(segments: &[S]) -> Option<usize> {
+	let at = match segments.get(1).map(AsRef::as_ref) {
+		Some("comments") => 1,
+		Some("r" | "user" | "u") if segments.get(3).is_some_and(|segment| segment.as_ref() == "comments") => 3,
+		_ => return None,
+	};
+	segments.get(at + 1).filter(|id| !id.as_ref().is_empty()).map(|_| at)
+}
+
 /// The key of the cache entry for `path`, which `fetch_key` made: the same
 /// thread or listing, as Reddit sends it, under any thread slug and any letter
 /// case of the sub.
@@ -122,7 +144,7 @@ pub fn entry_key(path: &str) -> String {
 		}
 	}
 	// .../comments/<id>/<slug>/<comment id>
-	if let Some(at) = segments.iter().position(|segment| segment == "comments") {
+	if let Some(at) = thread_at(&segments) {
 		let comment = segments.get(at + 3).filter(|comment| !comment.is_empty()).cloned();
 		segments.truncate(at + 2);
 		if let Some(comment) = comment {
@@ -270,7 +292,10 @@ mod normalize_tests {
 			"sort=",
 			"t=",
 		] {
-			let key = fetch_key(&format!("/r/rust/comments/abc.json?{query}&raw_json=1"));
+			// a thread reads only some of them
+			let path = if ["t=", "type=", "restrict_sr="].iter().any(|name| query.starts_with(name)) { "search" } else { "comments/abc" };
+			let key = fetch_key(&format!("/r/rust/{path}.json?{query}&raw_json=1"));
+			let bare = fetch_key(&format!("/r/rust/{path}.json?raw_json=1"));
 			assert_ne!(key, bare, "{query}");
 		}
 	}

@@ -622,6 +622,17 @@ fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, ho
 /// will recurse on the URL that Reddit provides in the Location HTTP header
 /// in its response.
 fn request(method: &'static Method, path: String, redirect: bool, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
+	follow_redirects(path, redirect, move |path| send_to_reddit(method, path, quarantine, base_path, host)).boxed()
+}
+
+/// Sends one request to Reddit, with the current OAuth headers.
+fn send_to_reddit(
+	method: &'static Method,
+	path: String,
+	quarantine: bool,
+	base_path: &'static str,
+	host: &'static str,
+) -> impl std::future::Future<Output = Result<WreqResponse, String>> {
 	// Build Reddit URL from path.
 	let url = format!("{base_path}{path}");
 
@@ -654,60 +665,55 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 	}
 
 	async move {
-		match builder.send().await {
-			Ok(response) => {
-				// Reddit may respond with a 3xx. Decide whether or not to
-				// redirect based on caller params.
-				if response.status().is_redirection() {
-					if !redirect {
-						return Ok(response);
-					};
-					let location_header = response.headers().get(wreq::header::LOCATION);
-					if location_header.and_then(|h| h.to_str().ok()) == Some(ALTERNATIVE_REDDIT_URL_BASE) {
-						return Err("Reddit response was invalid".to_string());
-					}
-					return request(
-						method,
-						location_header
-							.map(|val| {
-								// We need to make adjustments to the URI
-								// we get back from Reddit. Namely, we
-								// must:
-								//
-								//     1. Remove the authority (e.g.
-								//     https://www.reddit.com) that may be
-								//     present, so that we recurse on the
-								//     path (and query parameters) as
-								//     required.
-								//
-								//     2. Percent-encode the path.
-								let new_path = percent_encode(val.as_bytes(), CONTROLS)
-									.to_string()
-									.trim_start_matches(REDDIT_URL_BASE)
-									.trim_start_matches(ALTERNATIVE_REDDIT_URL_BASE)
-									.to_string();
-								format!("{new_path}{}raw_json=1", if new_path.contains('?') { "&" } else { "?" })
-							})
-							.unwrap_or_default()
-							.to_string(),
-						true,
-						quarantine,
-						base_path,
-						host,
-					)
-					.await;
-				};
+		builder.send().await.map_err(|e| {
+			dbg_msg!("{method} {REDDIT_URL_BASE}{path}: {}", e);
 
-				Ok(response)
-			}
-			Err(e) => {
-				dbg_msg!("{method} {REDDIT_URL_BASE}{path}: {}", e);
-
-				Err(e.to_string())
-			}
-		}
+			e.to_string()
+		})
 	}
-	.boxed()
+}
+
+/// Sends the request for `path` with `send` and, if `redirect` is `true`,
+/// follows the redirects Reddit answers with.
+async fn follow_redirects<F, Fut>(mut path: String, redirect: bool, send: F) -> Result<WreqResponse, String>
+where
+	F: Fn(String) -> Fut,
+	Fut: std::future::Future<Output = Result<WreqResponse, String>>,
+{
+	loop {
+		let response = send(path).await?;
+
+		// Reddit may respond with a 3xx. Decide whether or not to
+		// redirect based on caller params.
+		if !response.status().is_redirection() || !redirect {
+			return Ok(response);
+		}
+		let location_header = response.headers().get(wreq::header::LOCATION);
+		if location_header.and_then(|h| h.to_str().ok()) == Some(ALTERNATIVE_REDDIT_URL_BASE) {
+			return Err("Reddit response was invalid".to_string());
+		}
+		path = location_header
+			.map(|val| {
+				// We need to make adjustments to the URI
+				// we get back from Reddit. Namely, we
+				// must:
+				//
+				//     1. Remove the authority (e.g.
+				//     https://www.reddit.com) that may be
+				//     present, so that we recurse on the
+				//     path (and query parameters) as
+				//     required.
+				//
+				//     2. Percent-encode the path.
+				let new_path = percent_encode(val.as_bytes(), CONTROLS)
+					.to_string()
+					.trim_start_matches(REDDIT_URL_BASE)
+					.trim_start_matches(ALTERNATIVE_REDDIT_URL_BASE)
+					.to_string();
+				format!("{new_path}{}raw_json=1", if new_path.contains('?') { "&" } else { "?" })
+			})
+			.unwrap_or_default();
+	}
 }
 
 pub(crate) trait IntoHyperResponse {

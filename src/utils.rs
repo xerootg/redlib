@@ -1506,7 +1506,7 @@ pub fn redirect(path: &str) -> Response<Body> {
 		.status(302)
 		.header("content-type", "text/html")
 		.header("Location", path)
-		.body(format!("Redirecting to <a href=\"{path}\">{path}</a>...").into())
+		.body(format!("Redirecting to <a href=\"{0}\">{0}</a>...", htmlescape::encode_minimal(path)).into())
 		.unwrap_or_default()
 }
 

@@ -1,22 +1,27 @@
-use crate::body::Body;
+use crate::body::{Body, BoxError};
 use crate::config::get_setting;
 use crate::dbg_msg;
 use crate::oauth::{token_daemon, Oauth};
 use crate::server::RequestExt;
 use crate::utils::format_url;
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use cached::proc_macro::cached;
 use futures_lite::future::block_on;
 use futures_lite::{future::Boxed, FutureExt};
+use http_body::Body as _;
 use hyper::{header, Request as HyperRequest, Response as HyperResponse};
 use log::{info, warn};
 use percent_encoding::{percent_encode, CONTROLS};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::result::Result;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize};
 use std::sync::{Arc, LazyLock};
+use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wreq::dns::{Addrs, GaiResolver, Name, Resolve, Resolving};
 use wreq::redirect::Policy;
@@ -235,7 +240,9 @@ fn pick(weights: &[u32], current: usize) -> usize {
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the upstream may stay silent, before the response headers and
-/// between the chunks of a body. A steady stream is not cut off.
+/// between the chunks of a body. A steady stream is not cut off. The media
+/// proxy measures this itself (see `send_proxied`) so a paused browser does
+/// not count as upstream silence.
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn client_for(profile: Profile, platform: Platform) -> WreqClient {
@@ -704,18 +711,68 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 	Ok(send_proxied(builder, READ_IDLE_TIMEOUT).await)
 }
 
+/// wreq's read timeout restarts when it hands out a frame, and it fails the
+/// next read when the deadline passed meanwhile. A browser that stops reading
+/// (a paused video, a background tab) would lose its stream that way even though
+/// the upstream is fine. The proxy measures the silence itself, see
+/// `idle_limited`, and sets this instead to switch wreq's timer off.
+const WREQ_READ_TIMEOUT_OFF: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Sends the upstream request of the media proxy and turns the answer into
-/// the response for the browser. `_idle` is how long the upstream may stay
-/// silent.
-async fn send_proxied(builder: wreq::RequestBuilder, _idle: Duration) -> HyperResponse<Body> {
-	match builder.send().await {
-		Ok(res) => restrict_proxy_response(res.into_hyper_response()),
-		Err(e) => {
+/// the response for the browser. `idle` is how long the upstream may stay
+/// silent, before the headers and between the chunks of the body.
+async fn send_proxied(builder: wreq::RequestBuilder, idle: Duration) -> HyperResponse<Body> {
+	match tokio::time::timeout(idle, builder.read_timeout(WREQ_READ_TIMEOUT_OFF).send()).await {
+		Ok(Ok(res)) => {
+			let mut res = res.into_hyper_response();
+			let body = std::mem::take(res.body_mut());
+			*res.body_mut() = idle_limited(body, idle);
+			restrict_proxy_response(res)
+		}
+		Ok(Err(e)) => {
 			// Not `e`: wreq puts the upstream URL in its errors.
 			dbg_msg!("proxy request failed: {}", e);
 			proxy_error(502, "Bad gateway")
 		}
+		Err(_) => {
+			dbg_msg!("proxy request timed out");
+			proxy_error(502, "Bad gateway")
+		}
 	}
+}
+
+/// Ends `body` with an error when the upstream stays silent for `idle`. The
+/// clock only runs while the body is polled and has nothing to give, so time
+/// spent waiting for a slow browser to read does not count.
+fn idle_limited(mut body: Body, idle: Duration) -> Body {
+	let mut silence: Option<Pin<Box<tokio::time::Sleep>>> = None;
+	Body::from_stream(futures_lite::stream::poll_fn(move |cx| -> Poll<Option<Result<Bytes, BoxError>>> {
+		match Pin::new(&mut body).poll_frame(cx) {
+			Poll::Ready(frame) => {
+				silence = None;
+				match frame {
+					None => Poll::Ready(None),
+					Some(Err(e)) => Poll::Ready(Some(Err(e))),
+					Some(Ok(frame)) => match frame.into_data() {
+						Ok(data) => Poll::Ready(Some(Ok(data))),
+						// Trailers carry nothing to proxy: poll again.
+						Err(_) => {
+							cx.waker().wake_by_ref();
+							Poll::Pending
+						}
+					},
+				}
+			}
+			Poll::Pending => {
+				let sleep = silence.get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
+				if sleep.as_mut().poll(cx).is_ready() {
+					Poll::Ready(Some(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "upstream went quiet").into())))
+				} else {
+					Poll::Pending
+				}
+			}
+		}
+	}))
 }
 
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
@@ -1283,7 +1340,9 @@ mod proxy_stream_tests {
 		block_on_shared(async {
 			let addr = image_host().await;
 			let request = send_proxied(client().get(format!("http://{addr}/headers")), Duration::from_secs(1));
-			let res = tokio::time::timeout(Duration::from_secs(10), request).await.expect("the proxy waited for a peer that never answers");
+			let res = tokio::time::timeout(Duration::from_secs(10), request)
+				.await
+				.expect("the proxy waited for a peer that never answers");
 			assert_eq!(res.status().as_u16(), 502);
 		});
 	}

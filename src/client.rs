@@ -1,23 +1,28 @@
-use crate::body::Body;
+use crate::body::{Body, BoxError};
 use crate::config::get_setting;
 use crate::dbg_msg;
 use crate::oauth::{token_daemon, Oauth};
 use crate::server::RequestExt;
 use crate::utils::format_url;
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use cached::proc_macro::cached;
 use futures_lite::future::block_on;
 use futures_lite::{future::Boxed, FutureExt};
+use http_body::Body as _;
 use hyper::{header, Request as HyperRequest, Response as HyperResponse};
 use log::{info, warn};
 use percent_encoding::{percent_encode, CONTROLS};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::result::Result;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize};
 use std::sync::{Arc, LazyLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::task::Poll;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wreq::dns::{Addrs, GaiResolver, Name, Resolve, Resolving};
 use wreq::redirect::Policy;
 use wreq::{header as wreq_header, Client as WreqClient, Method, Response as WreqResponse};
@@ -231,10 +236,25 @@ fn pick(weights: &[u32], current: usize) -> usize {
 	unreachable!("the draw is below the total weight")
 }
 
+/// How long a connection (DNS, TCP and TLS) may take to come up.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the upstream may stay silent, before the response headers and
+/// between the chunks of a body. A steady stream is not cut off. The media
+/// proxy measures this itself (see `send_proxied`) so a paused browser does
+/// not count as upstream silence.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn client_for(profile: Profile, platform: Platform) -> WreqClient {
+	client_with_read_timeout(profile, platform, READ_IDLE_TIMEOUT)
+}
+
+fn client_with_read_timeout(profile: Profile, platform: Platform, read_timeout: Duration) -> WreqClient {
 	WreqClient::builder()
 		.emulation(Emulation::builder().profile(profile).platform(platform).build())
 		.redirect(Policy::none())
+		.connect_timeout(CONNECT_TIMEOUT)
+		.read_timeout(read_timeout)
 		.dns_resolver(RedgifsIpv4Resolver(GaiResolver::new()))
 		.build()
 		.expect("Should always be able to build a client")
@@ -545,7 +565,28 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 	}
 }
 
-pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperResponse<Body>, String> {
+/// Every host `proxy` may fetch from, one per media route (see `main.rs` and
+/// `redgifs.rs`). A new route needs its host added here.
+const PROXY_HOSTS: &[&str] = &[
+	"v.redd.it",
+	"packaged-media.redd.it",
+	"external-packaged-media.redd.it",
+	"i.redd.it",
+	"a.thumbs.redditmedia.com",
+	"b.thumbs.redditmedia.com",
+	"emoji.redditmedia.com",
+	"reddit-econ-prod-assets-permanent.s3.amazonaws.com",
+	"preview.redd.it",
+	"external-preview.redd.it",
+	"styles.redditmedia.com",
+	"www.redditstatic.com",
+	"media.giphy.com",
+	"media.redgifs.com",
+];
+
+/// Fills the route parameters of `req` into `format`, parses the result and
+/// checks it against `PROXY_HOSTS`.
+fn proxy_url(req: &HyperRequest<Body>, format: &str) -> Result<wreq::Uri, String> {
 	let mut url = format!("{format}?{}", req.uri().query().unwrap_or_default());
 
 	// For each parameter in request
@@ -555,7 +596,99 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 	}
 
 	// First parameter is target URL (mandatory).
-	let wreq_uri = wreq::Uri::try_from(url).map_err(|_| "Couldn't parse URL".to_string())?;
+	let uri = wreq::Uri::try_from(url).map_err(|_| "Couldn't parse URL".to_string())?;
+
+	// Route parameters can end up in the host (`{loc}view.redd.it`), so check
+	// the host that came out, not the one the route meant. Only whole, listed
+	// hosts pass: no IP literal, port or userinfo, and no other subdomain.
+	let host_allowed = uri.scheme_str() == Some("https")
+		&& uri.host().is_some_and(|host| PROXY_HOSTS.contains(&host))
+		&& uri.authority().is_some_and(|authority| Some(authority.as_str()) == uri.host());
+	if host_allowed {
+		Ok(uri)
+	} else {
+		Err("Host not allowed".to_string())
+	}
+}
+
+/// The upstream headers the media proxy passes on. Anything else, such as
+/// `Set-Cookie`, `Location` or `Content-Security-Policy`, stays behind.
+const PROXY_RESPONSE_HEADERS: &[&str] = &[
+	"content-type",
+	"content-length",
+	"content-range",
+	"content-encoding",
+	"accept-ranges",
+	"cache-control",
+	"expires",
+	"last-modified",
+];
+
+/// Whether `content_type` is something the media proxy serves: images, video,
+/// audio, fonts and the streaming playlists. Pages, scripts and SVG are not,
+/// since the proxy serves from redlib's own origin. There must be exactly one
+/// `Content-Type` and no list in it: browsers use the last valid entry.
+fn proxy_content_type_allowed(headers: &header::HeaderMap) -> bool {
+	let mut values = headers.get_all(header::CONTENT_TYPE).iter();
+	let (Some(content_type), None) = (values.next(), values.next()) else {
+		return false;
+	};
+	let Ok(content_type) = content_type.to_str() else {
+		return false;
+	};
+	if content_type.contains(',') {
+		return false;
+	}
+	let media_type = content_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
+	media_type != "image/svg+xml"
+		&& (["image/", "video/", "audio/", "font/"].iter().any(|prefix| media_type.starts_with(prefix))
+			|| [
+				"application/vnd.apple.mpegurl",
+				"application/x-mpegurl",
+				"application/dash+xml",
+				"application/octet-stream",
+				"binary/octet-stream",
+			]
+			.contains(&media_type.as_str()))
+}
+
+/// Limits what the media proxy hands to the browser: media types only, with
+/// the headers in `PROXY_RESPONSE_HEADERS`. Redirects are not passed on (the
+/// browser would follow them straight to Reddit) and an upstream error page is
+/// swapped for a plain text one with the same status.
+fn restrict_proxy_response(mut res: HyperResponse<Body>) -> HyperResponse<Body> {
+	let status = res.status();
+	// A 304 answers a conditional request and has no body or type.
+	let not_modified = status == hyper::StatusCode::NOT_MODIFIED;
+	if !not_modified && (status.is_redirection() || !proxy_content_type_allowed(res.headers())) {
+		return if status.is_client_error() || status.is_server_error() {
+			proxy_error(status.as_u16(), "Upstream error")
+		} else {
+			proxy_error(502, "Bad gateway")
+		};
+	}
+
+	let unwanted: Vec<_> = res.headers().keys().filter(|name| !PROXY_RESPONSE_HEADERS.contains(&name.as_str())).cloned().collect();
+	for name in unwanted {
+		res.headers_mut().remove(name);
+	}
+	res
+}
+
+/// A plain text error for a client of the media proxy. It says what went wrong
+/// in general terms and never repeats the URL it was asked to fetch.
+fn proxy_error(status: u16, message: &'static str) -> HyperResponse<Body> {
+	HyperResponse::builder()
+		.status(status)
+		.header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+		.body(Body::from(message))
+		.unwrap()
+}
+
+pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperResponse<Body>, String> {
+	let Ok(wreq_uri) = proxy_url(&req, format) else {
+		return Ok(proxy_error(400, "Bad request"));
+	};
 
 	let mut builder = CLIENT.load_full().get(wreq_uri);
 
@@ -575,30 +708,71 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 	// This is needed or Reddit will redirect us to a /media landing page that just renders the image.
 	builder = builder.header(wreq_header::ACCEPT, "*/*");
 
-	builder
-		.send()
-		.await
-		.map(|mut res| {
-			let headers = res.headers_mut();
+	Ok(send_proxied(builder, READ_IDLE_TIMEOUT).await)
+}
 
-			let mut rm = |key: &str| headers.remove(key);
+/// wreq's read timeout restarts when it hands out a frame, and it fails the
+/// next read when the deadline passed meanwhile. A browser that stops reading
+/// (a paused video, a background tab) would lose its stream that way even though
+/// the upstream is fine. The proxy measures the silence itself, see
+/// `idle_limited`, and sets this instead to switch wreq's timer off.
+const WREQ_READ_TIMEOUT_OFF: Duration = Duration::from_secs(24 * 60 * 60);
 
-			rm("access-control-expose-headers");
-			rm("server");
-			rm("vary");
-			rm("etag");
-			rm("x-cdn");
-			rm("x-cdn-client-region");
-			rm("x-cdn-name");
-			rm("x-cdn-server-region");
-			rm("x-reddit-cdn");
-			rm("x-reddit-video-features");
-			rm("Nel");
-			rm("Report-To");
+/// Sends the upstream request of the media proxy and turns the answer into
+/// the response for the browser. `idle` is how long the upstream may stay
+/// silent, before the headers and between the chunks of the body.
+async fn send_proxied(builder: wreq::RequestBuilder, idle: Duration) -> HyperResponse<Body> {
+	match tokio::time::timeout(idle, builder.read_timeout(WREQ_READ_TIMEOUT_OFF).send()).await {
+		Ok(Ok(res)) => {
+			let mut res = res.into_hyper_response();
+			let body = std::mem::take(res.body_mut());
+			*res.body_mut() = idle_limited(body, idle);
+			restrict_proxy_response(res)
+		}
+		Ok(Err(e)) => {
+			// Not `e`: wreq puts the upstream URL in its errors.
+			dbg_msg!("proxy request failed: {}", e);
+			proxy_error(502, "Bad gateway")
+		}
+		Err(_) => {
+			dbg_msg!("proxy request timed out");
+			proxy_error(502, "Bad gateway")
+		}
+	}
+}
 
-			res.into_hyper_response()
-		})
-		.map_err(|e| e.to_string())
+/// Ends `body` with an error when the upstream stays silent for `idle`. The
+/// clock only runs while the body is polled and has nothing to give, so time
+/// spent waiting for a slow browser to read does not count.
+fn idle_limited(mut body: Body, idle: Duration) -> Body {
+	let mut silence: Option<Pin<Box<tokio::time::Sleep>>> = None;
+	Body::from_stream(futures_lite::stream::poll_fn(move |cx| -> Poll<Option<Result<Bytes, BoxError>>> {
+		match Pin::new(&mut body).poll_frame(cx) {
+			Poll::Ready(frame) => {
+				silence = None;
+				match frame {
+					None => Poll::Ready(None),
+					Some(Err(e)) => Poll::Ready(Some(Err(e))),
+					Some(Ok(frame)) => match frame.into_data() {
+						Ok(data) => Poll::Ready(Some(Ok(data))),
+						// Trailers carry nothing to proxy: poll again.
+						Err(_) => {
+							cx.waker().wake_by_ref();
+							Poll::Pending
+						}
+					},
+				}
+			}
+			Poll::Pending => {
+				let sleep = silence.get_or_insert_with(|| Box::pin(tokio::time::sleep(idle)));
+				if sleep.as_mut().poll(cx).is_ready() {
+					Poll::Ready(Some(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "upstream went quiet").into())))
+				} else {
+					Poll::Pending
+				}
+			}
+		}
+	}))
 }
 
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
@@ -622,6 +796,17 @@ fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, ho
 /// will recurse on the URL that Reddit provides in the Location HTTP header
 /// in its response.
 fn request(method: &'static Method, path: String, redirect: bool, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
+	follow_redirects(path, redirect, move |path| send_to_reddit(method, path, quarantine, base_path, host)).boxed()
+}
+
+/// Sends one request to Reddit, with the current OAuth headers.
+fn send_to_reddit(
+	method: &'static Method,
+	path: String,
+	quarantine: bool,
+	base_path: &'static str,
+	host: &'static str,
+) -> impl std::future::Future<Output = Result<WreqResponse, String>> {
 	// Build Reddit URL from path.
 	let url = format!("{base_path}{path}");
 
@@ -654,60 +839,60 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 	}
 
 	async move {
-		match builder.send().await {
-			Ok(response) => {
-				// Reddit may respond with a 3xx. Decide whether or not to
-				// redirect based on caller params.
-				if response.status().is_redirection() {
-					if !redirect {
-						return Ok(response);
-					};
-					let location_header = response.headers().get(wreq::header::LOCATION);
-					if location_header.and_then(|h| h.to_str().ok()) == Some(ALTERNATIVE_REDDIT_URL_BASE) {
-						return Err("Reddit response was invalid".to_string());
-					}
-					return request(
-						method,
-						location_header
-							.map(|val| {
-								// We need to make adjustments to the URI
-								// we get back from Reddit. Namely, we
-								// must:
-								//
-								//     1. Remove the authority (e.g.
-								//     https://www.reddit.com) that may be
-								//     present, so that we recurse on the
-								//     path (and query parameters) as
-								//     required.
-								//
-								//     2. Percent-encode the path.
-								let new_path = percent_encode(val.as_bytes(), CONTROLS)
-									.to_string()
-									.trim_start_matches(REDDIT_URL_BASE)
-									.trim_start_matches(ALTERNATIVE_REDDIT_URL_BASE)
-									.to_string();
-								format!("{new_path}{}raw_json=1", if new_path.contains('?') { "&" } else { "?" })
-							})
-							.unwrap_or_default()
-							.to_string(),
-						true,
-						quarantine,
-						base_path,
-						host,
-					)
-					.await;
-				};
+		builder.send().await.map_err(|e| {
+			dbg_msg!("{method} {REDDIT_URL_BASE}{path}: {}", e);
 
-				Ok(response)
-			}
-			Err(e) => {
-				dbg_msg!("{method} {REDDIT_URL_BASE}{path}: {}", e);
-
-				Err(e.to_string())
-			}
-		}
+			e.to_string()
+		})
 	}
-	.boxed()
+}
+
+/// Most redirects `follow_redirects` follows before it gives up. Reddit sends
+/// a handful at most (a short link, then the canonical path).
+const MAX_REDIRECTS: usize = 10;
+
+/// Sends the request for `path` with `send` and, if `redirect` is `true`,
+/// follows the redirects Reddit answers with, up to `MAX_REDIRECTS`.
+async fn follow_redirects<F, Fut>(mut path: String, redirect: bool, send: F) -> Result<WreqResponse, String>
+where
+	F: Fn(String) -> Fut,
+	Fut: std::future::Future<Output = Result<WreqResponse, String>>,
+{
+	for _ in 0..=MAX_REDIRECTS {
+		let response = send(path).await?;
+
+		// Reddit may respond with a 3xx. Decide whether or not to
+		// redirect based on caller params.
+		if !response.status().is_redirection() || !redirect {
+			return Ok(response);
+		}
+		let location_header = response.headers().get(wreq::header::LOCATION);
+		if location_header.and_then(|h| h.to_str().ok()) == Some(ALTERNATIVE_REDDIT_URL_BASE) {
+			return Err("Reddit response was invalid".to_string());
+		}
+		path = location_header
+			.map(|val| {
+				// We need to make adjustments to the URI
+				// we get back from Reddit. Namely, we
+				// must:
+				//
+				//     1. Remove the authority (e.g.
+				//     https://www.reddit.com) that may be
+				//     present, so that we recurse on the
+				//     path (and query parameters) as
+				//     required.
+				//
+				//     2. Percent-encode the path.
+				let new_path = percent_encode(val.as_bytes(), CONTROLS)
+					.to_string()
+					.trim_start_matches(REDDIT_URL_BASE)
+					.trim_start_matches(ALTERNATIVE_REDDIT_URL_BASE)
+					.to_string();
+				format!("{new_path}{}raw_json=1", if new_path.contains('?') { "&" } else { "?" })
+			})
+			.unwrap_or_default();
+	}
+	Err("Too many redirects".to_string())
 }
 
 pub(crate) trait IntoHyperResponse {
@@ -736,6 +921,442 @@ impl IntoHyperResponse for WreqResponse {
 		}
 
 		builder.body(Body::from_stream(self.bytes_stream())).unwrap()
+	}
+}
+
+#[cfg(test)]
+mod redirect_limit_tests {
+	use super::*;
+	use std::sync::atomic::AtomicUsize;
+	use std::time::Duration;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	/// A local HTTP server: `/loop` redirects to itself forever, `/a` redirects
+	/// to `/b` once, everything else is a 200. Returns its address and a hit counter.
+	async fn redirect_server() -> (SocketAddr, Arc<AtomicUsize>) {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		let hits = Arc::new(AtomicUsize::new(0));
+		let counter = hits.clone();
+		tokio::spawn(async move {
+			loop {
+				let Ok((mut stream, _)) = listener.accept().await else { return };
+				counter.fetch_add(1, Ordering::SeqCst);
+				tokio::spawn(async move {
+					let mut buf = vec![0u8; 4096];
+					let n = stream.read(&mut buf).await.unwrap_or(0);
+					let request = String::from_utf8_lossy(&buf[..n]).to_string();
+					let target = request.split_whitespace().nth(1).unwrap_or_default().to_string();
+					let reply = if target.starts_with("/loop") {
+						"HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+					} else if target.starts_with("/a") {
+						"HTTP/1.1 302 Found\r\nLocation: /b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+					} else {
+						"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+					};
+					let _ = stream.write_all(reply.as_bytes()).await;
+				});
+			}
+		});
+		(addr, hits)
+	}
+
+	fn follow(addr: SocketAddr, path: &str) -> impl std::future::Future<Output = Result<WreqResponse, String>> {
+		let client = WreqClient::builder().redirect(Policy::none()).build().unwrap();
+		follow_redirects(path.to_string(), true, move |path| {
+			let request = client.get(format!("http://{addr}{path}")).send();
+			async move { request.await.map_err(|e| e.to_string()) }
+		})
+	}
+
+	#[test]
+	fn test_redirect_loop_is_cut_off() {
+		block_on_shared(async {
+			let (addr, hits) = redirect_server().await;
+			let result = tokio::time::timeout(Duration::from_secs(10), follow(addr, "/loop")).await;
+			assert!(result.is_ok(), "a redirect loop must end instead of running forever");
+			assert!(result.unwrap().is_err(), "a redirect loop must be an error");
+			assert!(hits.load(Ordering::SeqCst) <= 20, "too many hops: {}", hits.load(Ordering::SeqCst));
+		});
+	}
+
+	#[test]
+	fn test_single_redirect_is_followed() {
+		block_on_shared(async {
+			let (addr, _) = redirect_server().await;
+			let response = tokio::time::timeout(Duration::from_secs(10), follow(addr, "/a")).await.unwrap().unwrap();
+			assert_eq!(response.status().as_u16(), 200);
+		});
+	}
+}
+
+#[cfg(test)]
+mod proxy_target_tests {
+	use super::*;
+	use route_recognizer::Params;
+
+	fn target(format: &str, params: &[(&str, &str)], query: &str) -> Result<wreq::Uri, String> {
+		let mut req = HyperRequest::builder().uri(format!("/x?{query}")).body(Body::empty()).unwrap();
+		let mut route_params = Params::new();
+		for (name, value) in params {
+			route_params.insert((*name).to_string(), (*value).to_string());
+		}
+		req.set_params(route_params);
+		proxy_url(&req, format)
+	}
+
+	const PREVIEW: &str = "https://{loc}view.redd.it/{id}";
+	const AWARD: &str = "https://{loc}view.redd.it/award_images/{fullname}/{id}";
+	const THUMB: &str = "https://{point}.thumbs.redditmedia.com/{id}";
+
+	#[test]
+	fn test_the_routes_still_reach_their_hosts() {
+		type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
+		let cases: &[Case] = &[
+			(PREVIEW, &[("loc", "pre"), ("id", "a.jpg")], "preview.redd.it"),
+			(PREVIEW, &[("loc", "external-pre"), ("id", "a.jpg")], "external-preview.redd.it"),
+			(AWARD, &[("loc", "pre"), ("fullname", "t5_1"), ("id", "a.png")], "preview.redd.it"),
+			(THUMB, &[("point", "a"), ("id", "a.jpg")], "a.thumbs.redditmedia.com"),
+			(THUMB, &[("point", "b"), ("id", "a.jpg")], "b.thumbs.redditmedia.com"),
+			(
+				"https://v.redd.it/{id}/{prefix}_{size}",
+				&[("id", "abc"), ("prefix", "DASH"), ("size", "720.mp4")],
+				"v.redd.it",
+			),
+			("https://v.redd.it/{id}/{path}", &[("id", "abc"), ("path", "HLSPlaylist.m3u8")], "v.redd.it"),
+			("https://packaged-media.redd.it/{path}", &[("path", "abc/pb/m2-res_1080p.mp4")], "packaged-media.redd.it"),
+			(
+				"https://external-packaged-media.redd.it/{path}",
+				&[("path", "abc/pb/m2-res_1080p.mp4")],
+				"external-packaged-media.redd.it",
+			),
+			("https://i.redd.it/{path}", &[("path", "abc.jpg")], "i.redd.it"),
+			("https://emoji.redditmedia.com/{id}/{name}", &[("id", "abc"), ("name", "Emoji")], "emoji.redditmedia.com"),
+			(
+				"https://reddit-econ-prod-assets-permanent.s3.amazonaws.com/asset-manager/{subreddit_id}/{filename}",
+				&[("subreddit_id", "t5_1"), ("filename", "a.png")],
+				"reddit-econ-prod-assets-permanent.s3.amazonaws.com",
+			),
+			("https://styles.redditmedia.com/{path}", &[("path", "t5_1/styles/a.png")], "styles.redditmedia.com"),
+			("https://www.redditstatic.com/{path}", &[("path", "desktop2x/img/a.png")], "www.redditstatic.com"),
+			("https://media.giphy.com/media/{id}/giphy.{ext}", &[("id", "abc"), ("ext", "gif")], "media.giphy.com"),
+			("https://media.redgifs.com/Some.mp4", &[], "media.redgifs.com"),
+		];
+		for (format, params, host) in cases {
+			let uri = target(format, params, "a=b").unwrap_or_else(|e| panic!("{format} {params:?}: {e}"));
+			assert_eq!(uri.host(), Some(*host), "{format} {params:?}");
+			assert_eq!(uri.scheme_str(), Some("https"));
+			assert_eq!(uri.query(), Some("a=b"));
+		}
+	}
+
+	#[test]
+	fn test_ip_literal_in_the_host_slot_is_rejected() {
+		// The audit's payloads: /preview/[::ffff:10.x.x.x]/x and /thumb/[::1]/x.
+		for loc in ["[::ffff:10.0.0.1]", "[::1]", "[2001:db8::1]", "[::ffff:10.0.0.1]:8443", "10.0.0.1"] {
+			assert!(target(PREVIEW, &[("loc", loc), ("id", "x")], "").is_err(), "preview loc {loc}");
+			assert!(target(AWARD, &[("loc", loc), ("fullname", "f"), ("id", "x")], "").is_err(), "award loc {loc}");
+			assert!(target(THUMB, &[("point", loc), ("id", "x")], "").is_err(), "thumb point {loc}");
+		}
+	}
+
+	#[test]
+	fn test_other_hosts_in_the_host_slot_are_rejected() {
+		for loc in ["evil", "x.evil.example/", "pre.", "i", "PRE", "pre@evil.example/", "pre:8443@evil.example/", ""] {
+			assert!(target(PREVIEW, &[("loc", loc), ("id", "x")], "").is_err(), "preview loc {loc}");
+		}
+		for point in ["evil", "c", "a.evil", "", "A", "a@evil.example/#"] {
+			assert!(target(THUMB, &[("point", point), ("id", "x")], "").is_err(), "thumb point {point}");
+		}
+	}
+
+	#[test]
+	fn test_a_rejected_target_gets_a_generic_text_error() {
+		let mut req = HyperRequest::builder().uri("/preview/[::1]/x.jpg").body(Body::empty()).unwrap();
+		let mut params = Params::new();
+		params.insert("loc".to_string(), "[::1]".to_string());
+		params.insert("id".to_string(), "x.jpg".to_string());
+		req.set_params(params);
+		block_on_shared(async {
+			let res = proxy(req, PREVIEW).await.expect("a rejected target is an answer, not an error");
+			assert_eq!(res.status().as_u16(), 400);
+			assert_eq!(res.headers().get(header::CONTENT_TYPE).unwrap(), "text/plain; charset=utf-8");
+			let body = String::from_utf8(res.into_body().collect_bytes().await.unwrap().to_vec()).unwrap();
+			assert!(!body.contains("::1") && !body.contains("redd.it"), "the error repeats the target: {body}");
+		});
+	}
+}
+
+#[cfg(test)]
+mod proxy_response_tests {
+	use super::*;
+
+	fn upstream(status: u16, headers: &[(&str, &str)]) -> HyperResponse<Body> {
+		let mut builder = HyperResponse::builder().status(status);
+		for (name, value) in headers {
+			builder = builder.header(*name, *value);
+		}
+		builder.body(Body::from("body")).unwrap()
+	}
+
+	fn header<'a>(res: &'a HyperResponse<Body>, name: &str) -> Option<&'a str> {
+		res.headers().get(name).map(|v| v.to_str().unwrap())
+	}
+
+	#[test]
+	fn test_media_passes_with_only_its_own_headers() {
+		let res = restrict_proxy_response(upstream(
+			200,
+			&[
+				("Content-Type", "image/jpeg"),
+				("Content-Length", "4"),
+				("Cache-Control", "max-age=60"),
+				("Last-Modified", "Wed, 21 Oct 2026 07:28:00 GMT"),
+				("Accept-Ranges", "bytes"),
+				("Set-Cookie", "session=attacker; Path=/"),
+				("Location", "https://example.com/"),
+				("Content-Security-Policy", "default-src *"),
+				("Access-Control-Allow-Origin", "*"),
+				("Content-Disposition", "attachment"),
+				("X-Reddit-Cache", "HIT"),
+				("Server", "snooserv"),
+			],
+		));
+		assert_eq!(res.status().as_u16(), 200);
+		for kept in ["Content-Type", "Content-Length", "Cache-Control", "Last-Modified", "Accept-Ranges"] {
+			assert!(header(&res, kept).is_some(), "{kept} was dropped");
+		}
+		for dropped in [
+			"Set-Cookie",
+			"Location",
+			"Content-Security-Policy",
+			"Access-Control-Allow-Origin",
+			"Content-Disposition",
+			"X-Reddit-Cache",
+			"Server",
+		] {
+			assert!(header(&res, dropped).is_none(), "{dropped} was passed through");
+		}
+	}
+
+	#[test]
+	fn test_media_types_pass() {
+		for content_type in [
+			"image/png",
+			"image/webp",
+			"IMAGE/GIF",
+			"video/mp4",
+			"audio/mp4",
+			"application/vnd.apple.mpegurl",
+			"application/x-mpegURL; charset=utf-8",
+			"application/dash+xml",
+			"application/octet-stream",
+			"binary/octet-stream",
+		] {
+			let res = restrict_proxy_response(upstream(200, &[("Content-Type", content_type)]));
+			assert_eq!(res.status().as_u16(), 200, "{content_type}");
+			assert_eq!(header(&res, "Content-Type"), Some(content_type));
+		}
+		let partial = restrict_proxy_response(upstream(206, &[("Content-Type", "video/mp4"), ("Content-Range", "bytes 0-3/10")]));
+		assert_eq!(partial.status().as_u16(), 206);
+		assert_eq!(header(&partial, "Content-Range"), Some("bytes 0-3/10"));
+		let unchanged = restrict_proxy_response(upstream(304, &[("Cache-Control", "max-age=60")]));
+		assert_eq!(unchanged.status().as_u16(), 304);
+	}
+
+	#[test]
+	fn test_active_content_types_are_refused() {
+		for content_type in [
+			"text/html",
+			"text/html; charset=utf-8",
+			"text/javascript",
+			"application/javascript",
+			"image/svg+xml",
+			"application/xhtml+xml",
+			"text/xml",
+		] {
+			let res = restrict_proxy_response(upstream(200, &[("Content-Type", content_type)]));
+			assert_eq!(res.status().as_u16(), 502, "{content_type}");
+			assert_eq!(header(&res, "Content-Type"), Some("text/plain; charset=utf-8"), "{content_type}");
+		}
+		let untyped = restrict_proxy_response(upstream(200, &[]));
+		assert_eq!(untyped.status().as_u16(), 502);
+	}
+
+	/// Browsers take the last valid type of a comma separated list, so a list
+	/// that starts with a media type can still end as a page or a script.
+	#[test]
+	fn test_a_list_or_repeat_of_content_types_is_refused() {
+		for content_type in ["image/png, text/html", "image/png,text/javascript", "image/png; x=1, text/html"] {
+			let res = restrict_proxy_response(upstream(200, &[("Content-Type", content_type)]));
+			assert_eq!(res.status().as_u16(), 502, "{content_type}");
+		}
+		let res = restrict_proxy_response(upstream(200, &[("Content-Type", "image/png"), ("Content-Type", "text/html")]));
+		assert_eq!(res.status().as_u16(), 502, "two Content-Type headers");
+	}
+
+	#[test]
+	fn test_upstream_errors_keep_their_status_but_not_their_page() {
+		let res = restrict_proxy_response(upstream(404, &[("Content-Type", "text/html")]));
+		assert_eq!(res.status().as_u16(), 404);
+		assert_eq!(header(&res, "Content-Type"), Some("text/plain; charset=utf-8"));
+	}
+
+	#[test]
+	fn test_redirects_are_not_passed_to_the_browser() {
+		let res = restrict_proxy_response(upstream(302, &[("Location", "https://example.com/"), ("Content-Type", "image/png")]));
+		assert_eq!(res.status().as_u16(), 502);
+		assert!(header(&res, "Location").is_none());
+	}
+}
+
+#[cfg(test)]
+mod outbound_timeout_tests {
+	use super::*;
+	use std::time::Duration;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	/// A local HTTP server that accepts connections and then goes quiet:
+	/// `/headers` never answers, anything else sends headers and half of
+	/// its body, then stalls.
+	async fn stalling_server() -> SocketAddr {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		tokio::spawn(async move {
+			loop {
+				let Ok((mut stream, _)) = listener.accept().await else { return };
+				tokio::spawn(async move {
+					let mut buf = vec![0u8; 4096];
+					let n = stream.read(&mut buf).await.unwrap_or(0);
+					if !String::from_utf8_lossy(&buf[..n]).starts_with("GET /headers") {
+						let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhalf").await;
+					}
+					// Hold the connection open without another byte.
+					tokio::time::sleep(Duration::from_secs(3600)).await;
+				});
+			}
+		});
+		addr
+	}
+
+	fn client() -> WreqClient {
+		client_with_read_timeout(Profile::Chrome131, Platform::Linux, Duration::from_secs(1))
+	}
+
+	#[test]
+	fn test_the_timeouts_are_short_enough_to_matter() {
+		assert!(CONNECT_TIMEOUT <= Duration::from_secs(10));
+		assert!(READ_IDLE_TIMEOUT <= Duration::from_secs(60));
+	}
+
+	#[test]
+	fn test_a_peer_that_never_answers_times_out() {
+		block_on_shared(async {
+			let addr = stalling_server().await;
+			let request = client().get(format!("http://{addr}/headers")).send();
+			let result = tokio::time::timeout(Duration::from_secs(10), request).await;
+			assert!(result.is_ok(), "the request waited for a peer that never answers");
+			assert!(result.unwrap().is_err());
+		});
+	}
+
+	#[test]
+	fn test_a_body_that_stalls_times_out() {
+		block_on_shared(async {
+			let addr = stalling_server().await;
+			let response = client().get(format!("http://{addr}/body")).send().await.unwrap();
+			let result = tokio::time::timeout(Duration::from_secs(10), response.bytes()).await;
+			assert!(result.is_ok(), "the body read waited for a peer that went quiet");
+			assert!(result.unwrap().is_err());
+		});
+	}
+}
+
+#[cfg(test)]
+mod proxy_stream_tests {
+	use super::*;
+	use http_body_util::BodyExt;
+	use std::time::Duration;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	const BODY_LEN: usize = 1_000_000;
+
+	/// A local image host. `/headers` never answers, `/stall` sends headers
+	/// and half a body and then goes quiet, anything else sends the whole
+	/// body at once.
+	async fn image_host() -> SocketAddr {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		tokio::spawn(async move {
+			loop {
+				let Ok((mut stream, _)) = listener.accept().await else { return };
+				tokio::spawn(async move {
+					let mut buf = vec![0u8; 4096];
+					let n = stream.read(&mut buf).await.unwrap_or(0);
+					let request = String::from_utf8_lossy(&buf[..n]).to_string();
+					if request.starts_with("GET /headers") {
+						// Never answer.
+					} else if request.starts_with("GET /stall") {
+						let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 10\r\n\r\nhalf").await;
+					} else {
+						let head = format!("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {BODY_LEN}\r\n\r\n");
+						let _ = stream.write_all(head.as_bytes()).await;
+						let _ = stream.write_all(&vec![7u8; BODY_LEN]).await;
+					}
+					tokio::time::sleep(Duration::from_secs(3600)).await;
+				});
+			}
+		});
+		addr
+	}
+
+	fn client() -> WreqClient {
+		client_with_read_timeout(Profile::Chrome131, Platform::Linux, Duration::from_secs(1))
+	}
+
+	/// A browser that stops reading for longer than the idle timeout (a paused
+	/// video, a background tab) while the upstream has data ready must still
+	/// get the whole file.
+	#[test]
+	fn test_a_paused_consumer_still_gets_the_whole_body() {
+		block_on_shared(async {
+			let addr = image_host().await;
+			let res = send_proxied(client().get(format!("http://{addr}/video")), Duration::from_secs(1)).await;
+			assert_eq!(res.status().as_u16(), 200);
+			let mut body = res.into_body();
+			let mut received = 0;
+			let first = body.frame().await.expect("a first frame").unwrap();
+			received += first.into_data().map_or(0, |data| data.len());
+			tokio::time::sleep(Duration::from_millis(2500)).await;
+			while let Some(frame) = body.frame().await {
+				received += frame.expect("the body was cut off after the pause").into_data().map_or(0, |data| data.len());
+			}
+			assert_eq!(received, BODY_LEN);
+		});
+	}
+
+	#[test]
+	fn test_an_upstream_that_never_answers_gets_a_bad_gateway() {
+		block_on_shared(async {
+			let addr = image_host().await;
+			let request = send_proxied(client().get(format!("http://{addr}/headers")), Duration::from_secs(1));
+			let res = tokio::time::timeout(Duration::from_secs(10), request)
+				.await
+				.expect("the proxy waited for a peer that never answers");
+			assert_eq!(res.status().as_u16(), 502);
+		});
+	}
+
+	#[test]
+	fn test_an_upstream_that_goes_quiet_mid_body_is_cut_off() {
+		block_on_shared(async {
+			let addr = image_host().await;
+			let res = send_proxied(client().get(format!("http://{addr}/stall")), Duration::from_secs(1)).await;
+			assert_eq!(res.status().as_u16(), 200);
+			let read = tokio::time::timeout(Duration::from_secs(10), res.into_body().collect_bytes());
+			let result = read.await.expect("the body read waited for a peer that went quiet");
+			assert!(result.is_err());
+		});
 	}
 }
 

@@ -463,7 +463,8 @@ async fn new_boilerplate(
 	status: u16,
 	body: Body,
 ) -> Result<Response<Body>, String> {
-	match Response::builder().status(status).body(body) {
+	// The bodies are plain error messages.
+	match Response::builder().status(status).header(header::CONTENT_TYPE, "text/plain; charset=utf-8").body(body) {
 		Ok(mut res) => {
 			let _ = compress_response(&req_headers, &mut res).await;
 
@@ -896,6 +897,20 @@ mod compress_dos_tests {
 
 		assert_eq!(res.headers().get(header::CONTENT_ENCODING).unwrap(), "br");
 		assert_eq!(*order.lock().unwrap(), vec!["other task ran", "compressed"]);
+	}
+}
+
+#[cfg(test)]
+mod boilerplate_tests {
+	use super::*;
+
+	#[test]
+	fn test_error_boilerplate_is_declared_plain_text() {
+		for status in [403, 404, 500] {
+			let res = futures_lite::future::block_on(new_boilerplate(HeaderMap::new(), HeaderMap::new(), status, Body::from("<script>alert(1)</script>"))).unwrap();
+			assert_eq!(res.status().as_u16(), status);
+			assert_eq!(res.headers().get(header::CONTENT_TYPE).map(|v| v.to_str().unwrap()), Some("text/plain; charset=utf-8"));
+		}
 	}
 }
 

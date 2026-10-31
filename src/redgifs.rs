@@ -83,7 +83,9 @@ async fn get_json(url: &str, token: Option<&str>) -> Result<Value, String> {
 		.load_full()
 		.get(url)
 		.header("referer", "https://www.redgifs.com/")
-		.header("origin", "https://www.redgifs.com");
+		.header("origin", "https://www.redgifs.com")
+		// A small JSON document: don't wait on it as long as a video stream.
+		.timeout(std::time::Duration::from_secs(10));
 	if let Some(t) = token {
 		builder = builder.header("Authorization", format!("Bearer {t}"));
 	}

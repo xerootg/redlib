@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 // CRATES
-use crate::body::Body;
+use crate::body::{Body, CollectError};
 use crate::server::ResponseExt;
 use crate::subreddit::join_until_size_limit;
 use crate::utils::{deflate_decompress, redirect, template, Preferences};
@@ -11,7 +11,6 @@ use askama::Template;
 use cookie::Cookie;
 use hyper::{Request, Response};
 use time::{Duration, OffsetDateTime};
-use tokio::time::timeout;
 use url::form_urlencoded;
 
 // STRUCTS
@@ -24,6 +23,12 @@ struct SettingsTemplate {
 }
 
 // CONSTANTS
+
+/// Largest `POST /settings` form accepted: a few dozen short values.
+const MAX_SETTINGS_BODY_LEN: usize = 64 * 1024;
+/// Largest `POST /settings/encoded-restore` body accepted. A settings code is
+/// base2048 text, which form-encoding turns into about six bytes per character.
+const MAX_ENCODED_RESTORE_BODY_LEN: usize = 256 * 1024;
 
 const PREFS: [&str; 23] = [
 	"theme",
@@ -306,6 +311,15 @@ pub static GEO_FILTERS: [(&str, &str); 250] = [
 
 // FUNCTIONS
 
+/// The answer to a request body that exceeds its limit.
+fn payload_too_large() -> Response<Body> {
+	Response::builder()
+		.status(413)
+		.header("content-type", "text/plain")
+		.body("Request body too large".into())
+		.unwrap_or_default()
+}
+
 /// Retrieve cookies from request "Cookie" header
 pub async fn get(req: Request<Body>) -> Result<Response<Body>, String> {
 	let url = req.uri().to_string();
@@ -334,7 +348,11 @@ pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 		.collect();
 
 	// Aggregate the body...
-	let body_bytes = body.collect_bytes().await.map_err(|e| e.to_string())?;
+	let body_bytes = match body.collect_bytes_limited(MAX_SETTINGS_BODY_LEN).await {
+		Ok(bytes) => bytes,
+		Err(CollectError::TooLarge) => return Ok(payload_too_large()),
+		Err(e) => return Err(e.to_string()),
+	};
 
 	let form = url::form_urlencoded::parse(&body_bytes).collect::<HashMap<_, _>>();
 
@@ -538,11 +556,11 @@ pub async fn update(req: Request<Body>) -> Result<Response<Body>, String> {
 }
 
 pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, String> {
-	let body = req.into_body().collect_bytes().await.map_err(|e| format!("Failed to get bytes from request body: {e}"))?;
-
-	if body.len() > 1024 * 1024 {
-		return Err("Request body too large".to_string());
-	}
+	let body = match req.into_body().collect_bytes_limited(MAX_ENCODED_RESTORE_BODY_LEN).await {
+		Ok(bytes) => bytes,
+		Err(CollectError::TooLarge) => return Ok(payload_too_large()),
+		Err(e) => return Err(e.to_string()),
+	};
 
 	let encoded_prefs = form_urlencoded::parse(&body)
 		.find(|(key, _)| key == "encoded_prefs")
@@ -551,18 +569,85 @@ pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, Strin
 
 	let bytes = base2048::decode(&encoded_prefs).ok_or_else(|| "Failed to decode base2048 encoded preferences".to_string())?;
 
-	let out = timeout(std::time::Duration::from_secs(1), async { deflate_decompress(bytes) })
-		.await
-		.map_err(|e| format!("Failed to decompress bytes: {e}"))??;
+	let out = deflate_decompress(bytes)?;
 
-	let mut prefs: Preferences = timeout(std::time::Duration::from_secs(1), async { Preferences::from_bincode(&out) })
-		.await
-		.map_err(|e| format!("Failed to deserialize preferences: {e}"))?
-		.map_err(|e| format!("Failed to deserialize bytes into Preferences struct: {e}"))?;
+	let mut prefs: Preferences = Preferences::from_bincode(&out).map_err(|e| format!("Failed to deserialize bytes into Preferences struct: {e}"))?;
 
 	prefs.available_themes = vec![];
 
 	let url = format!("/settings/restore/?{}", prefs.to_urlencoded()?);
 
 	Ok(redirect(&url))
+}
+
+/// Hostile settings codes and request bodies (audit findings 3, 4, 5).
+#[cfg(test)]
+mod bounds_tests {
+	use super::*;
+	use crate::utils::deflate_compress;
+
+	fn post(body: impl Into<Body>) -> Request<Body> {
+		Request::builder().method("POST").body(body.into()).unwrap()
+	}
+
+	/// Form body carrying `bytes` as a base2048(deflate(..)) settings code.
+	fn code_body(bytes: Vec<u8>) -> String {
+		let code = base2048::encode(&deflate_compress(bytes).unwrap());
+		form_urlencoded::Serializer::new(String::new()).append_pair("encoded_prefs", &code).finish()
+	}
+
+	/// The process must survive and answer with an error.
+	async fn assert_rejected(body: impl Into<Body>) {
+		let res = encoded_restore(post(body)).await;
+		assert!(res.is_err(), "hostile code was accepted: {:?}", res.map(|r| r.status()));
+	}
+
+	/// The audit's 12-byte payload: base2048(deflate(u64le(2^50))). Legacy bincode
+	/// takes the 2^50 as a String length and allocates it.
+	#[tokio::test]
+	async fn legacy_code_with_huge_length_prefix_is_rejected() {
+		assert_rejected("encoded_prefs=%D2%B4%C3%98%C2%BA%C8%A0%D2%99%E0%BC%8D").await;
+		assert_rejected(code_body((1u64 << 46).to_le_bytes().iter().copied().chain([b'x'; 16]).collect())).await;
+	}
+
+	/// 0xFF, revision 2, empty `available_themes`, then a `theme` length of 2^46
+	/// (revision varint: 0xFD marker + u64le). Allocated before any byte is read.
+	#[tokio::test]
+	async fn revisioned_code_with_huge_length_prefix_is_rejected() {
+		let mut bytes = vec![0xFF, 0x02, 0x00, 0xFD];
+		bytes.extend((1u64 << 46).to_le_bytes());
+		assert_rejected(code_body(bytes)).await;
+		// The same for the Vec length of available_themes.
+		let mut bytes = vec![0xFF, 0x02, 0xFD];
+		bytes.extend((1u64 << 46).to_le_bytes());
+		assert_rejected(code_body(bytes)).await;
+	}
+
+	/// A code that inflates far past anything a real settings code needs.
+	#[tokio::test]
+	async fn decompression_bomb_is_rejected() {
+		let bomb = deflate_compress(vec![0u8; 8 * 1024 * 1024]).unwrap();
+		assert!(bomb.len() < 64 * 1024, "the bomb must fit the body limit to reach the inflater");
+		assert!(deflate_decompress(bomb).is_err());
+		assert_rejected(code_body(vec![0u8; 8 * 1024 * 1024])).await;
+	}
+
+	#[tokio::test]
+	async fn oversize_bodies_get_413() {
+		let res = set(post(vec![b'a'; 300 * 1024])).await.unwrap();
+		assert_eq!(res.status(), 413);
+		let res = encoded_restore(post(vec![b'a'; 2 * 1024 * 1024])).await.unwrap();
+		assert_eq!(res.status(), 413);
+	}
+
+	#[tokio::test]
+	async fn a_normal_code_still_restores() {
+		let body = form_urlencoded::Serializer::new(String::new())
+			.append_pair("encoded_prefs", &Preferences::default().to_bincode_str().unwrap())
+			.finish();
+		let res = encoded_restore(post(body)).await.unwrap();
+		assert_eq!(res.status(), 302);
+		let res = set(post("theme=dark&layout=compact")).await.unwrap();
+		assert_eq!(res.status(), 302);
+	}
 }

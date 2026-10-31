@@ -686,12 +686,16 @@ struct LegacyPreferences {
 impl LegacyPreferences {
 	fn decode(bytes: &[u8]) -> Result<Preferences, String> {
 		let mut rest = bytes;
-		let old: Self = bincode::deserialize_from(&mut rest).map_err(|e| e.to_string())?;
+		// Same encoding as `bincode::deserialize_from`, but a length prefix claiming more than the
+		// input holds is an error instead of an allocation of that size.
+		use bincode::Options as _;
+		let options = |input: &[u8]| bincode::options().with_fixint_encoding().allow_trailing_bytes().with_limit(input.len() as u64);
+		let old: Self = options(bytes).deserialize_from(&mut rest).map_err(|e| e.to_string())?;
 		// Codes exported by this fork before the revisioned format carry geo_filter next.
 		let geo_filter = if rest.is_empty() {
 			None
 		} else {
-			bincode::deserialize_from::<_, String>(&mut rest).ok()
+			options(rest).deserialize_from::<_, String>(&mut rest).ok()
 		};
 		let defaults = |f: fn(u16) -> Result<String, Error>| f(1).unwrap_or_default();
 		Ok(Preferences {
@@ -866,7 +870,12 @@ impl Preferences {
 	/// Decode a settings code: the revisioned format, or the original plain-bincode one.
 	pub fn from_bincode(bytes: &[u8]) -> Result<Self, String> {
 		match bytes.split_first() {
-			Some((&REVISIONED_PREFS_MARKER, rest)) => revision::from_slice(rest).map_err(|e| e.to_string()),
+			Some((&REVISIONED_PREFS_MARKER, rest)) => {
+				// The decoder allocates every length prefix before reading it. Walking the
+				// code first rejects any length beyond the remaining bytes without allocating.
+				revision::skip_slice::<Self>(rest).map_err(|e| e.to_string())?;
+				revision::from_slice(rest).map_err(|e| e.to_string())
+			}
 			_ => LegacyPreferences::decode(bytes),
 		}
 	}
@@ -894,10 +903,21 @@ pub fn deflate_compress(i: Vec<u8>) -> Result<Vec<u8>, String> {
 	e.finish().into_result().map_err(|e| e.to_string())
 }
 
+/// Most a settings code may inflate to. Real codes are a few KB; the cap stops a
+/// small body from expanding into hundreds of MB.
+const MAX_INFLATED_PREFS_LEN: u64 = 64 * 1024;
+
 pub fn deflate_decompress(i: Vec<u8>) -> Result<Vec<u8>, String> {
-	let mut decoder = Decoder::new(&i[..]);
+	let decoder = Decoder::new(&i[..]);
 	let mut out = Vec::new();
-	decoder.read_to_end(&mut out).map_err(|e| format!("Failed to read from gzip decoder: {e}"))?;
+	// Read one byte past the cap so overflow is told apart from an exact fit.
+	decoder
+		.take(MAX_INFLATED_PREFS_LEN + 1)
+		.read_to_end(&mut out)
+		.map_err(|e| format!("Failed to read from gzip decoder: {e}"))?;
+	if out.len() as u64 > MAX_INFLATED_PREFS_LEN {
+		return Err(format!("Decompressed data exceeds {MAX_INFLATED_PREFS_LEN} bytes"));
+	}
 	Ok(out)
 }
 

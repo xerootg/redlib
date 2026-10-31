@@ -591,6 +591,11 @@ fn proxy_url(req: &HyperRequest<Body>, format: &str) -> Result<wreq::Uri, String
 	}
 }
 
+/// Not restricting anything yet.
+fn restrict_proxy_response(res: HyperResponse<Body>) -> HyperResponse<Body> {
+	res
+}
+
 /// A plain text error for a client of the media proxy. It says what went wrong
 /// in general terms and never repeats the URL it was asked to fetch.
 fn proxy_error(status: u16, message: &'static str) -> HyperResponse<Body> {
@@ -645,7 +650,7 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 			rm("Nel");
 			rm("Report-To");
 
-			res.into_hyper_response()
+			restrict_proxy_response(res.into_hyper_response())
 		})
 		.or_else(|e| {
 			// Not `e`: wreq puts the upstream URL in its errors.
@@ -963,6 +968,117 @@ mod proxy_target_tests {
 			let body = String::from_utf8(res.into_body().collect_bytes().await.unwrap().to_vec()).unwrap();
 			assert!(!body.contains("::1") && !body.contains("redd.it"), "the error repeats the target: {body}");
 		});
+	}
+}
+
+#[cfg(test)]
+mod proxy_response_tests {
+	use super::*;
+
+	fn upstream(status: u16, headers: &[(&str, &str)]) -> HyperResponse<Body> {
+		let mut builder = HyperResponse::builder().status(status);
+		for (name, value) in headers {
+			builder = builder.header(*name, *value);
+		}
+		builder.body(Body::from("body")).unwrap()
+	}
+
+	fn header<'a>(res: &'a HyperResponse<Body>, name: &str) -> Option<&'a str> {
+		res.headers().get(name).map(|v| v.to_str().unwrap())
+	}
+
+	#[test]
+	fn test_media_passes_with_only_its_own_headers() {
+		let res = restrict_proxy_response(upstream(
+			200,
+			&[
+				("Content-Type", "image/jpeg"),
+				("Content-Length", "4"),
+				("Cache-Control", "max-age=60"),
+				("Last-Modified", "Wed, 21 Oct 2026 07:28:00 GMT"),
+				("Accept-Ranges", "bytes"),
+				("Set-Cookie", "session=attacker; Path=/"),
+				("Location", "https://example.com/"),
+				("Content-Security-Policy", "default-src *"),
+				("Access-Control-Allow-Origin", "*"),
+				("Content-Disposition", "attachment"),
+				("X-Reddit-Cache", "HIT"),
+				("Server", "snooserv"),
+			],
+		));
+		assert_eq!(res.status().as_u16(), 200);
+		for kept in ["Content-Type", "Content-Length", "Cache-Control", "Last-Modified", "Accept-Ranges"] {
+			assert!(header(&res, kept).is_some(), "{kept} was dropped");
+		}
+		for dropped in [
+			"Set-Cookie",
+			"Location",
+			"Content-Security-Policy",
+			"Access-Control-Allow-Origin",
+			"Content-Disposition",
+			"X-Reddit-Cache",
+			"Server",
+		] {
+			assert!(header(&res, dropped).is_none(), "{dropped} was passed through");
+		}
+	}
+
+	#[test]
+	fn test_media_types_pass() {
+		for content_type in [
+			"image/png",
+			"image/webp",
+			"IMAGE/GIF",
+			"video/mp4",
+			"audio/mp4",
+			"application/vnd.apple.mpegurl",
+			"application/x-mpegURL; charset=utf-8",
+			"application/dash+xml",
+			"application/octet-stream",
+			"binary/octet-stream",
+		] {
+			let res = restrict_proxy_response(upstream(200, &[("Content-Type", content_type)]));
+			assert_eq!(res.status().as_u16(), 200, "{content_type}");
+			assert_eq!(header(&res, "Content-Type"), Some(content_type));
+		}
+		let partial = restrict_proxy_response(upstream(206, &[("Content-Type", "video/mp4"), ("Content-Range", "bytes 0-3/10")]));
+		assert_eq!(partial.status().as_u16(), 206);
+		assert_eq!(header(&partial, "Content-Range"), Some("bytes 0-3/10"));
+		let unchanged = restrict_proxy_response(upstream(304, &[("Cache-Control", "max-age=60")]));
+		assert_eq!(unchanged.status().as_u16(), 304);
+	}
+
+	#[test]
+	fn test_active_content_types_are_refused() {
+		for content_type in [
+			"text/html",
+			"text/html; charset=utf-8",
+			"text/javascript",
+			"application/javascript",
+			"image/svg+xml",
+			"application/xhtml+xml",
+			"text/xml",
+		] {
+			let res = restrict_proxy_response(upstream(200, &[("Content-Type", content_type)]));
+			assert_eq!(res.status().as_u16(), 502, "{content_type}");
+			assert_eq!(header(&res, "Content-Type"), Some("text/plain; charset=utf-8"), "{content_type}");
+		}
+		let untyped = restrict_proxy_response(upstream(200, &[]));
+		assert_eq!(untyped.status().as_u16(), 502);
+	}
+
+	#[test]
+	fn test_upstream_errors_keep_their_status_but_not_their_page() {
+		let res = restrict_proxy_response(upstream(404, &[("Content-Type", "text/html")]));
+		assert_eq!(res.status().as_u16(), 404);
+		assert_eq!(header(&res, "Content-Type"), Some("text/plain; charset=utf-8"));
+	}
+
+	#[test]
+	fn test_redirects_are_not_passed_to_the_browser() {
+		let res = restrict_proxy_response(upstream(302, &[("Location", "https://example.com/"), ("Content-Type", "image/png")]));
+		assert_eq!(res.status().as_u16(), 502);
+		assert!(header(&res, "Location").is_none());
 	}
 }
 

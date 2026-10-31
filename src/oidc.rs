@@ -1080,6 +1080,211 @@ mod login_query_tests {
 }
 
 #[cfg(test)]
+mod gate_log_tests {
+	use super::*;
+	use hyper::header::HeaderValue;
+	use sealed_test::prelude::*;
+	use std::sync::Mutex;
+
+	// Audit finding #13: denials and bypass or bearer passes left no trace at
+	// the info level the deployment runs at. Every test runs in its own
+	// process (`sealed_test`), so the global logger below is its own too.
+	struct Capture(Mutex<Vec<(log::Level, String)>>);
+
+	impl log::Log for Capture {
+		fn enabled(&self, _: &log::Metadata) -> bool {
+			true
+		}
+		fn log(&self, record: &log::Record) {
+			self.0.lock().unwrap().push((record.level(), record.args().to_string()));
+		}
+		fn flush(&self) {}
+	}
+
+	static CAPTURE: Capture = Capture(Mutex::new(Vec::new()));
+
+	fn capture_info_logs() {
+		log::set_logger(&CAPTURE).expect("one logger per test process");
+		// What the deployment runs at.
+		log::set_max_level(log::LevelFilter::Info);
+		// Loading the config logs its own summary; that is not what is under test.
+		let _ = enabled();
+		logged();
+	}
+
+	/// What was logged at info or above since the last call.
+	fn logged() -> Vec<String> {
+		std::mem::take(&mut *CAPTURE.0.lock().unwrap())
+			.into_iter()
+			.filter(|(level, _)| *level <= log::Level::Info)
+			.map(|(_, line)| line)
+			.collect()
+	}
+
+	fn ip(s: &str) -> IpAddr {
+		s.parse().unwrap()
+	}
+
+	fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+		let mut map = HeaderMap::new();
+		for (name, value) in pairs {
+			map.append(*name, HeaderValue::from_str(value).unwrap());
+		}
+		map
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_TRUSTED_PROXIES", "10.42.0.0/16"),
+	])]
+	fn a_denial_is_logged_at_info_with_the_resolved_client_ip() {
+		capture_info_logs();
+
+		let res = gate(ip("10.42.0.7"), "/r/rust", Some("token=hunter2"), &headers(&[("x-forwarded-for", "203.0.113.9")]));
+		assert!(res.is_some());
+
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{lines:?}");
+		assert!(lines[0].contains("203.0.113.9"), "{lines:?}");
+		assert!(lines[0].contains("/r/rust"), "{lines:?}");
+		// The proxy that forwarded it is worth knowing too, the query is not.
+		assert!(lines[0].contains("10.42.0.7"), "{lines:?}");
+		assert!(!lines[0].contains("hunter2"), "{lines:?}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn denials_are_sampled_per_client_so_a_flood_cannot_flood_the_log() {
+		capture_info_logs();
+
+		// One client trying paths: one line, whatever it asks for.
+		for n in 0..500 {
+			assert!(gate(ip("203.0.113.9"), &format!("/oidc/x{n}"), None, &HeaderMap::new()).is_some());
+		}
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{} lines", lines.len());
+		assert!(lines[0].contains("203.0.113.9"), "{lines:?}");
+
+		// Another client is a separate story and still gets its line.
+		assert!(gate(ip("203.0.113.10"), "/", None, &HeaderMap::new()).is_some());
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{lines:?}");
+		assert!(lines[0].contains("203.0.113.10"), "{lines:?}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn a_logged_path_cannot_forge_log_lines() {
+		capture_info_logs();
+
+		assert!(gate(ip("203.0.113.9"), "/x\n2026-01-01 INFO oidc: forged\r", None, &HeaderMap::new()).is_some());
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{lines:?}");
+		assert!(!lines[0].contains('\n') && !lines[0].contains('\r'), "{lines:?}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_AUTH_BYPASS_CIDRS", "192.168.0.0/16"),
+	])]
+	fn the_first_bypass_pass_per_client_is_logged_once() {
+		capture_info_logs();
+
+		for _ in 0..20 {
+			assert!(gate(ip("192.168.1.20"), "/", None, &HeaderMap::new()).is_none());
+		}
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{lines:?}");
+		assert!(lines[0].contains("bypass") && lines[0].contains("192.168.1.20"), "{lines:?}");
+
+		assert!(gate(ip("192.168.1.21"), "/", None, &HeaderMap::new()).is_none());
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{lines:?}");
+		assert!(lines[0].contains("192.168.1.21"), "{lines:?}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_MCP_TOKEN", "correct-horse-battery-staple"),
+	])]
+	fn the_first_bearer_pass_per_client_is_logged_once_without_the_token() {
+		capture_info_logs();
+
+		let bearer = headers(&[("authorization", "Bearer correct-horse-battery-staple")]);
+		for _ in 0..20 {
+			assert!(gate(ip("203.0.113.9"), "/mcp", None, &bearer).is_none());
+		}
+		let lines = logged();
+		assert_eq!(lines.len(), 1, "{lines:?}");
+		assert!(lines[0].contains("bearer") && lines[0].contains("203.0.113.9"), "{lines:?}");
+		assert!(!lines[0].contains("correct-horse"), "{lines:?}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn ordinary_traffic_is_not_logged() {
+		capture_info_logs();
+
+		// The probe and the login endpoints are open by design, and a signed-in
+		// user is not news.
+		for path in ["/healthz", "/oidc/login", "/oidc/callback"] {
+			assert!(gate(ip("203.0.113.9"), path, None, &HeaderMap::new()).is_none());
+		}
+		let token = sign(&Session {
+			sub: "user-1".into(),
+			username: "user".into(),
+			email: String::new(),
+			groups: vec![],
+			exp: now() + 3600,
+			iat: now(),
+		})
+		.unwrap();
+		let cookie = headers(&[("cookie", &format!("{SESSION_COOKIE}={token}"))]);
+		assert!(gate(ip("203.0.113.9"), "/", None, &cookie).is_none());
+		assert_eq!(logged(), Vec::<String>::new());
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use hyper::header::HeaderValue;

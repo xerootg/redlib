@@ -290,7 +290,7 @@ pub fn quarantine(req: &Request<Body>, sub: String, restriction: &str) -> Respon
 
 	Response::builder()
 		.status(403)
-		.header("content-type", "text/html")
+		.header("content-type", "text/html; charset=utf-8")
 		.body(wall.render().unwrap_or_default().into())
 		.unwrap_or_default()
 }
@@ -765,6 +765,21 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 		.build();
 
 	Ok(rss_response(&channel))
+}
+
+/// Audit finding #16: the quarantine wall is HTML and must declare its charset.
+#[cfg(test)]
+mod quarantine_charset_tests {
+	use super::quarantine;
+	use crate::body::Body;
+	use hyper::Request;
+
+	#[test]
+	fn quarantine_wall_declares_charset() {
+		let req = Request::builder().uri("/r/test").body(Body::empty()).unwrap();
+		let res = quarantine(&req, "test".to_string(), "quarantined");
+		assert_eq!(res.headers().get("content-type").and_then(|v| v.to_str().ok()), Some("text/html; charset=utf-8"));
+	}
 }
 
 #[cfg(test)]

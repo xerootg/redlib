@@ -143,8 +143,9 @@ pub struct Config {
 	/// A logged-in Reddit web session, sent as the `Cookie` header on requests
 	/// Reddit refuses to serve to logged-out clients.
 	///
-	/// This is a credential, so it must never be serialized: `/info.json`
-	/// serializes the whole config.
+	/// This is a credential, so it must never be serialized. `/info.json`
+	/// publishes an allowlist (`PUBLIC_CONFIG_KEYS`), and this is not on it;
+	/// `skip_serializing` is the second line of defense.
 	#[serde(rename = "REDLIB_REDDIT_COOKIE")]
 	#[serde(skip_serializing)]
 	pub(crate) reddit_cookie: Option<String>,

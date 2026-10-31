@@ -10,6 +10,10 @@ use url::form_urlencoded;
 /// The longest path segment (between two slashes) that is looked up.
 pub const MAX_SEGMENT_LEN: usize = 256;
 
+/// The longest path of a fetch (without its query). A visitor's subscriptions
+/// are one segment of 24 bytes each, so this is well above any real list.
+pub const MAX_ROUTE_LEN: usize = 16 * 1024;
+
 /// How a query parameter's value is checked. A value that fails is left out,
 /// as Reddit ignores one it does not know, and so only the values it can tell
 /// apart make entries.
@@ -205,20 +209,15 @@ mod tests {
 	fn test_long_path_segments_are_refused() {
 		let ok = "a".repeat(MAX_SEGMENT_LEN);
 		let long = "a".repeat(MAX_SEGMENT_LEN + 1);
-		assert!(fetch_key(&format!("/r/{ok}/hot.json")).is_some());
-		assert_eq!(fetch_key(&format!("/r/{long}/hot.json")), None);
-		assert_eq!(fetch_key(&format!("/user/{long}/about.json?raw_json=1")), None);
 		assert!(segments_within_limit(&format!("/r/{ok}/s/abcdefgh")));
 		assert!(!segments_within_limit(&format!("/r/{long}/s/abcdefgh")));
 		assert!(!segments_within_limit(&format!("/u/{long}/s/abcdefgh")));
 	}
 
-	// The callers of the two caches must go through the keys above.
+	// The caller of the canonical-path cache must go through the key above.
 	#[test]
-	fn test_fetch_and_canonical_path_refuse_long_segments_without_asking_reddit() {
+	fn test_canonical_path_refuses_long_segments_without_asking_reddit() {
 		let long = "a".repeat(MAX_SEGMENT_LEN + 1);
-		let fetched = crate::client::block_on_shared(crate::backends::fetch(format!("/r/{long}/hot.json?raw_json=1"), false));
-		assert!(fetched.is_err_and(|e| e.contains("too long")));
 		let canonical = crate::client::block_on_shared(crate::client::canonical_path(format!("/r/{long}/s/abcdefgh"), 3));
 		assert_eq!(canonical, Ok(None));
 	}
@@ -280,8 +279,8 @@ mod normalize_tests {
 	#[test]
 	fn test_the_limit_on_a_segment_leaves_out_the_json_suffix() {
 		let ok = "a".repeat(MAX_SEGMENT_LEN);
-		assert!(fetch_key(&format!("/r/rust/comments/abc/{ok}.json?raw_json=1")).is_some());
-		assert!(fetch_key(&format!("/r/rust/comments/abc/{ok}a.json?raw_json=1")).is_none());
+		assert!(segments_within_limit(&format!("/r/rust/comments/abc/{ok}.json?raw_json=1")));
+		assert!(!segments_within_limit(&format!("/r/rust/comments/abc/{ok}a.json?raw_json=1")));
 	}
 
 	#[test]
@@ -317,5 +316,30 @@ mod normalize_tests {
 		assert_ne!(entry_key("/r/rust/search.json?q=Rust"), entry_key("/r/rust/search.json?q=rust"));
 		assert_ne!(entry_key("/r/rust/hot.json"), entry_key("/r/rust/new.json"));
 		assert_ne!(entry_key("/r/rust/hot.json"), entry_key("/r/golang/hot.json"));
+	}
+}
+
+// Second review of the fix for audit finding #17.
+#[cfg(test)]
+mod review_tests {
+	use super::*;
+
+	// The front page asks for /r/<sub1>%2B<sub2>%2B.../hot.json as one path
+	// segment, which is over 256 bytes for about 18 subscriptions.
+	#[test]
+	fn test_a_long_list_of_subs_is_fetched() {
+		let subs: Vec<String> = (0..40).map(|n| format!("subreddit{n:02}")).collect();
+		let path = format!("/r/{}/hot.json?raw_json=1", subs.join("%2B"));
+		assert!(path.split('/').nth(2).unwrap().len() > MAX_SEGMENT_LEN);
+		assert_eq!(fetch_key(&path), Some(path));
+	}
+
+	// ... but the whole path of a fetch is still limited
+	#[test]
+	fn test_a_path_far_longer_than_any_list_of_subs_is_refused() {
+		let long = "a".repeat(MAX_ROUTE_LEN);
+		assert_eq!(fetch_key(&format!("/r/{long}/hot.json?raw_json=1")), None);
+		let fetched = crate::client::block_on_shared(crate::backends::fetch(format!("/r/{long}/hot.json?raw_json=1"), false));
+		assert!(fetched.is_err_and(|e| e.contains("too long")));
 	}
 }

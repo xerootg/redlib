@@ -302,9 +302,88 @@ fn cursor_owner(path: &str) -> Option<&'static str> {
 	})
 }
 
+/// What `fetch` answers for a page that only exists for a logged-in account.
+pub const ACCOUNT_ONLY_ERROR: &str = "Reddit only shows this page to the account it belongs to, and Redlib never signs in as a visitor.";
+
+/// The user pages Reddit shows to everyone.
+const PUBLIC_USER_LISTINGS: [&str; 5] = ["about", "overview", "submitted", "comments", "gilded"];
+
+/// The decoded, lowercased segments of the route of a JSON API path, as the
+/// servers behind the backends see them.
+fn route_segments(path: &str) -> Vec<String> {
+	let route = path.split('?').next().unwrap_or_default().trim_end_matches(".json");
+	route
+		.split('/')
+		.filter(|segment| !segment.is_empty())
+		.map(|segment| percent_encoding::percent_decode_str(segment).decode_utf8_lossy().to_lowercase())
+		.collect()
+}
+
+/// A subreddit or user name without the extension Reddit strips from it
+/// (`.api`, `.json-html`, ...), since their names never contain a `.`.
+fn name_of(segment: &str) -> &str {
+	segment.split('.').next().unwrap_or_default()
+}
+
+/// Whether a client or server may rewrite the path around `c`, so the path
+/// can't be judged by how it reads.
+fn is_rewritable(c: char) -> bool {
+	c == '#' || c == '\\' || c.is_whitespace() || c.is_control()
+}
+
+/// Whether `path` is a page that belongs to a logged-in account, so no backend may be asked for it.
+///
+/// Reddit answers the saved, upvoted, downvoted and hidden listings of a user,
+/// `/user/me` and the `mod` and `friends` feeds with the data of whichever
+/// account asks, and a visitor can ask for any path. Anonymous requests get
+/// nothing for them, but a session backend would answer as its account. User
+/// pages are therefore an allowlist, so spellings Reddit decodes or
+/// normalizes (`%73aved`, `comments/../saved`) can't slip past.
+///
+/// The HTTP client rewrites a path before it sends it: it drops everything
+/// from a `#`, strips tabs and newlines, and resolves `..` segments. Visitors
+/// control raw characters of a path through cookies, so a route with a `#`, a
+/// backslash, whitespace or a control character is refused instead of judged,
+/// because what is sent is not what was checked.
+fn is_account_only(path: &str) -> bool {
+	let route = path.split('?').next().unwrap_or_default();
+	if route.chars().any(is_rewritable) {
+		return true;
+	}
+	let segments = route_segments(path);
+	if segments
+		.iter()
+		.any(|segment| segment == "." || segment == ".." || segment.contains('/') || segment.contains(is_rewritable))
+	{
+		return true;
+	}
+	match segments.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+		["user" | "u", name, rest @ ..] => {
+			name_of(name) == "me"
+				|| !match rest {
+					[] | ["comments", ..] | ["m", _, ..] => true,
+					[listing] => PUBLIC_USER_LISTINGS.contains(listing),
+					_ => false,
+				}
+		}
+		["r", sub, ..] => sub.split('+').any(|part| matches!(name_of(part), "mod" | "friends")),
+		_ => false,
+	}
+}
+
+/// Whether a logged-in session must not be asked for `path`: everything
+/// `is_account_only` refuses, plus multireddits, which show the private ones
+/// of the account when it owns them.
+pub(crate) fn session_refuses(path: &str) -> bool {
+	is_account_only(path) || matches!(route_segments(path).iter().map(String::as_str).collect::<Vec<_>>().as_slice(), ["user" | "u", _, "m", ..])
+}
+
 /// Fetches `path` from the first backend that serves it, and names that backend.
 #[cached(max_size = 100, ttl_secs = 30)]
 pub async fn fetch(path: String, quarantine: bool) -> Result<(Value, &'static str), String> {
+	if is_account_only(&path) {
+		return Err(ACCOUNT_ONLY_ERROR.to_string());
+	}
 	let kind = Kind::of(&path);
 	let mut blocked = false;
 	let mut last_error = None;
@@ -425,6 +504,265 @@ fn blocked_error(path: &str) -> String {
 /// Whether `json()` failed because Reddit only serves the page to logged-in sessions.
 pub fn is_blocked_error(msg: &str) -> bool {
 	msg.starts_with(BLOCKED_ERROR_PREFIX)
+}
+
+#[cfg(test)]
+mod account_only_tests {
+	use super::*;
+
+	#[test]
+	fn test_private_user_listings_are_account_only() {
+		for listing in [
+			"saved",
+			"upvoted",
+			"downvoted",
+			"hidden",
+			"SAVED",
+			"%73aved",
+			"saved.json",
+			"watching",
+			"preferences",
+			"overview/../saved",
+			"overview/saved",
+		] {
+			let path = format!("/user/spez/{listing}.json?raw_json=1");
+			assert!(is_account_only(&path), "{path}");
+			assert!(is_account_only(&path.replace("/user/", "/u/")), "{path}");
+		}
+		assert!(is_account_only("/user/spez/saved.json?raw_json=1&sort=new"));
+		assert!(is_account_only("/user/spez/upvoted?raw_json=1"));
+	}
+
+	#[test]
+	fn test_dot_segments_cannot_reach_account_only_pages() {
+		for path in [
+			"/user/spez/comments/../saved.json?raw_json=1",
+			"/user/spez/comments/%2e%2e/saved.json",
+			"/user/spez/comments/abc/../../me/about.json",
+			"/r/rust/../mod/hot.json",
+			"/r/rust/%2E%2E/friends/hot.json",
+			"/user/spez/./saved.json",
+		] {
+			assert!(is_account_only(path), "{path}");
+		}
+	}
+
+	#[test]
+	fn test_user_me_is_account_only() {
+		for path in [
+			"/user/me/about.json?raw_json=1",
+			"/user/me/overview.json",
+			"/user/ME/submitted.json",
+			"/u/me.json",
+			"/user/%6De/about.json",
+		] {
+			assert!(is_account_only(path), "{path}");
+		}
+		assert!(!is_account_only("/user/meme/about.json?raw_json=1"));
+		assert!(!is_account_only("/user/me_irl/overview.json"));
+	}
+
+	#[test]
+	fn test_mod_and_friends_feeds_are_account_only() {
+		for path in [
+			"/r/mod/hot.json?raw_json=1",
+			"/r/friends/new.json?raw_json=1",
+			"/r/Mod/about.json?raw_json=1",
+			"/r/mod.json",
+			"/r/rust%2Bmod/hot.json?raw_json=1",
+			"/r/friends%2Brust/hot.json",
+			"/r/rust+friends/hot.json",
+			"/r/%6Dod/hot.json",
+			"/r/mod/search.json?q=a&restrict_sr=on",
+		] {
+			assert!(is_account_only(path), "{path}");
+		}
+		for path in [
+			"/r/modest/hot.json",
+			"/r/friendsofrust/hot.json",
+			"/r/rust%2Bprogramming/hot.json",
+			"/r/rust/comments/abc/mod.json",
+		] {
+			assert!(!is_account_only(path), "{path}");
+		}
+	}
+
+	#[test]
+	fn test_public_user_pages_are_not_account_only() {
+		for path in [
+			"/user/spez/about.json?raw_json=1",
+			"/user/spez.json",
+			"/user/spez/overview.json?raw_json=1",
+			"/user/spez/submitted.json?sort=top&t=all&raw_json=1",
+			"/user/spez/comments.json?raw_json=1",
+			"/user/spez/gilded.json?raw_json=1",
+			"/user/spez/Comments.json",
+			"/u/spez/comments.json",
+			"/user/spez/comments/abc123/a_title.json?raw_json=1",
+			"/user/kjoneslol/m/sfwpornnetwork/hot.json?raw_json=1",
+			"/r/rust/hot.json?raw_json=1",
+			"/r/all/new.json",
+			"/r/popular/hot.json?geo_filter=GLOBAL",
+			"/by_id/t3_abc.json",
+			"/search.json?q=saved",
+			"/r/rust/search.json?q=user/me/saved&restrict_sr=on",
+			"/user/spez/overview.json?x=/user/me/saved",
+		] {
+			assert!(!is_account_only(path), "{path}");
+		}
+	}
+
+	#[test]
+	fn test_sessions_refuse_account_only_pages_and_multireddits() {
+		for path in [
+			"/user/spez/saved.json",
+			"/user/me/about.json",
+			"/r/mod/hot.json",
+			"/user/spez/m/private_multi/hot.json?raw_json=1",
+		] {
+			assert!(session_refuses(path), "{path}");
+		}
+		for path in [
+			"/user/spez/about.json",
+			"/user/spez/gilded.json",
+			"/user/spez/comments/abc/t.json",
+			"/r/rust/hot.json",
+			"/r/rust/comments/abc.json",
+		] {
+			assert!(!session_refuses(path), "{path}");
+		}
+	}
+
+	#[test]
+	fn test_fetch_refuses_account_only_pages_before_any_backend() {
+		crate::client::block_on_shared(async {
+			for path in [
+				"/user/spez/saved.json?raw_json=1",
+				"/user/spez/hidden.json",
+				"/user/me/about.json",
+				"/r/mod/hot.json",
+				"/r/friends/hot.json?raw_json=1",
+			] {
+				assert_eq!(
+					fetch(path.to_string(), false).await.map(|(_, backend)| backend),
+					Err(ACCOUNT_ONLY_ERROR.to_string()),
+					"{path}"
+				);
+				assert_eq!(json(path.to_string(), true).await, Err(ACCOUNT_ONLY_ERROR.to_string()), "{path}");
+			}
+		});
+	}
+
+	/// Paths a visitor can build through the `front_page` and `subscriptions`
+	/// cookies, which `wreq` rewrites before sending: it drops everything from a
+	/// `#`, strips tabs and newlines, and resolves `..` segments.
+	const REWRITTEN_PATHS: [&str; 12] = [
+		"/r/x/.\t./.\t./user/me/about.json?/hot.json?&raw_json=1",
+		"/r/x/.\t./.\t./user/spez/saved.json?/hot.json?&raw_json=1",
+		"/r/x/\t../\t../user/spez/upvoted.json#/hot.json?&raw_json=1",
+		"/r/mod.json#/hot.json?&raw_json=1",
+		"/r/friends.json#/hot.json?&raw_json=1",
+		"/r/mo\td/hot.json?&raw_json=1",
+		"/r/mo\nd/hot.json?&raw_json=1",
+		"/r/rust+fr\tiends/hot.json?&raw_json=1",
+		"/r/rust\\..\\..\\user\\spez\\saved.json?/hot.json?&raw_json=1",
+		"/r/rust%5C..%5C..%5Cuser%5Cspez%5Csaved.json?&raw_json=1",
+		"/user/spez/comments/%09../saved.json",
+		"/user/spez/saved.json#.json",
+	];
+
+	#[test]
+	fn test_paths_wreq_rewrites_are_account_only() {
+		for path in REWRITTEN_PATHS {
+			assert!(is_account_only(path), "{path:?}");
+			assert!(session_refuses(path), "{path:?}");
+		}
+	}
+
+	/// Reddit also strips `.api`, `.json-html`, `.json-compact` and `.json/`
+	/// from the name of a subreddit or user, so `/r/mod.api` is `/r/mod`.
+	const EXTENDED_NAMES: [&str; 11] = [
+		"/r/mod.api?/hot.json?&raw_json=1",
+		"/r/friends.api?/hot.json?&raw_json=1",
+		"/r/mod.json-html?/hot.json?&raw_json=1",
+		"/r/mod.json-compact?/hot.json?&raw_json=1",
+		"/r/MOD.api?/hot.json?&raw_json=1",
+		"/r/mod%2Eapi?/hot.json?&raw_json=1",
+		"/r/mod%2ejson-html?/hot.json?&raw_json=1",
+		"/r/mod.json/?/hot.json?&raw_json=1",
+		"/r/rust+mod.api?/hot.json?&raw_json=1",
+		"/user/me.api/about.json",
+		"/user/me.json-html/about.json",
+	];
+
+	#[test]
+	fn test_extended_names_are_account_only() {
+		for path in EXTENDED_NAMES {
+			assert!(is_account_only(path), "{path:?}");
+			assert!(session_refuses(path), "{path:?}");
+		}
+		for path in ["/r/rust.api/hot.json", "/user/spez.api/about.json", "/r/modern/hot.json"] {
+			assert!(!is_account_only(path), "{path:?}");
+		}
+	}
+
+	#[test]
+	fn test_session_backends_refuse_extended_names() {
+		crate::client::block_on_shared(async {
+			for path in EXTENDED_NAMES {
+				let result = cookied_json::CookiedJson.fetch(path, false).await;
+				assert!(matches!(result, Err(Failure::Unsupported)), "{path:?}: {result:?}");
+				assert_eq!(
+					fetch(path.to_string(), false).await.map(|(_, backend)| backend),
+					Err(ACCOUNT_ONLY_ERROR.to_string()),
+					"{path:?}"
+				);
+			}
+		});
+	}
+
+	#[test]
+	fn test_encoded_queries_are_not_account_only() {
+		for path in [
+			"/search.json?q=a%20b%23c&after=&raw_json=1",
+			"/r/rust/search.json?q=a%09b&restrict_sr=on",
+			"/r/rust/hot.json?after=t3_abc&raw_json=1",
+			"/user/spez/overview.json?x=a b#c\\d",
+		] {
+			assert!(!is_account_only(path), "{path:?}");
+		}
+	}
+
+	#[test]
+	fn test_session_backends_refuse_paths_wreq_rewrites() {
+		crate::client::block_on_shared(async {
+			for path in REWRITTEN_PATHS {
+				let result = cookied_json::CookiedJson.fetch(path, false).await;
+				assert!(matches!(result, Err(Failure::Unsupported)), "{path:?}: {result:?}");
+				assert_eq!(
+					fetch(path.to_string(), false).await.map(|(_, backend)| backend),
+					Err(ACCOUNT_ONLY_ERROR.to_string()),
+					"{path:?}"
+				);
+			}
+		});
+	}
+
+	#[test]
+	fn test_session_backends_refuse_account_only_pages() {
+		crate::client::block_on_shared(async {
+			for path in [
+				"/user/spez/saved.json?raw_json=1",
+				"/user/spez/upvoted.json",
+				"/user/me/about.json",
+				"/r/mod/hot.json",
+				"/user/spez/m/multi/hot.json",
+			] {
+				let result = cookied_json::CookiedJson.fetch(path, false).await;
+				assert!(matches!(result, Err(Failure::Unsupported)), "{path}: {result:?}");
+			}
+		});
+	}
 }
 
 #[cfg(test)]

@@ -663,6 +663,50 @@ pub async fn rss(req: Request<Body>) -> Result<Response<Body>, String> {
 }
 
 #[cfg(test)]
+mod redirect_tests {
+	use super::*;
+	use crate::utils::redirect_test_support::{assert_local_redirect, OFFSITE_PAYLOADS};
+	use futures_lite::future::block_on;
+
+	#[test]
+	fn subscription_redirect_stays_on_the_instance() {
+		for payload in OFFSITE_PAYLOADS {
+			let path = subscription_redirect("rust", &format!("redirect={payload}"));
+			assert_local_redirect(&redirect(&path), payload);
+		}
+	}
+
+	#[test]
+	fn subscription_redirect_keeps_the_in_app_forms() {
+		assert_eq!(subscription_redirect("rust", ""), "/r/rust");
+		assert_eq!(subscription_redirect("rust", "redirect=settings"), "/settings");
+		assert_eq!(subscription_redirect("rust", "redirect=r/news%3Fsort%3Dtop"), "/r/news?sort=top");
+	}
+
+	fn quarantine_request(query: &str) -> Request<Body> {
+		let mut req = Request::builder().method("POST").uri(format!("/r/foo?{query}")).body(Body::empty()).unwrap();
+		let mut params = route_recognizer::Params::new();
+		params.insert("sub".to_string(), "foo".to_string());
+		req.set_params(params);
+		req
+	}
+
+	#[test]
+	fn quarantine_opt_in_redirect_stays_on_the_instance() {
+		for payload in OFFSITE_PAYLOADS {
+			let res = block_on(add_quarantine_exception(quarantine_request(&format!("redir={payload}")))).unwrap();
+			assert_local_redirect(&res, payload);
+		}
+	}
+
+	#[test]
+	fn quarantine_opt_in_keeps_a_local_path() {
+		let res = block_on(add_quarantine_exception(quarantine_request("redir=/r/foo/hot"))).unwrap();
+		assert_eq!(res.headers()["location"], "/r/foo/hot");
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 

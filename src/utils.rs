@@ -1942,6 +1942,41 @@ fn get_mime_type(url: &str) -> &'static str {
 	}
 }
 
+/// Shared by the redirect tests in `utils`, `settings` and `subreddit`
+#[cfg(test)]
+pub(crate) mod redirect_test_support {
+	use hyper::Response;
+
+	use crate::body::Body;
+
+	/// Percent-encoded values for a `redirect` / `return_to` / `redir` parameter. Each one
+	/// decodes (once) to something that would leave the instance, or inject a header.
+	pub const OFFSITE_PAYLOADS: [&str; 8] = [
+		"//evil.example",
+		"///evil.example",
+		"/%5Cevil.example",
+		"%2F%2Fevil.example",
+		"%2F%5Cevil.example",
+		"https://evil.example/",
+		"%5C%5Cevil.example",
+		"/ok%0D%0ASet-Cookie:%20pwned=1",
+	];
+
+	/// The response is a redirect to a path on this instance and sets no attacker cookie
+	pub fn assert_local_redirect(res: &Response<Body>, payload: &str) {
+		assert_eq!(res.status(), 302, "{payload}: not a redirect");
+		let location = res.headers().get("location").unwrap_or_else(|| panic!("{payload}: no Location header")).to_str().unwrap();
+		assert!(location.starts_with('/'), "{payload}: Location {location:?} is not a path");
+		assert!(!location.starts_with("//"), "{payload}: Location {location:?} is protocol-relative");
+		assert!(!location.contains('\\'), "{payload}: Location {location:?} has a backslash");
+		assert!(!location.chars().any(char::is_control), "{payload}: Location {location:?} has control characters");
+		assert!(
+			res.headers().get_all("set-cookie").iter().all(|c| !c.to_str().unwrap_or_default().contains("pwned")),
+			"{payload}: injected a header"
+		);
+	}
+}
+
 #[cfg(test)]
 mod redirect_escape_tests {
 	use super::redirect;

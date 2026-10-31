@@ -566,3 +566,77 @@ pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, Strin
 
 	Ok(redirect(&url))
 }
+
+#[cfg(test)]
+mod redirect_tests {
+	use super::*;
+	use crate::utils::redirect_test_support::{assert_local_redirect, OFFSITE_PAYLOADS};
+	use futures_lite::future::block_on;
+
+	fn post(path: &str, body: String) -> Request<Body> {
+		Request::builder().method("POST").uri(path).body(Body::from(body)).unwrap()
+	}
+
+	fn get_request(uri: String) -> Request<Body> {
+		Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
+	}
+
+	#[test]
+	fn settings_post_return_to_stays_on_the_instance() {
+		for payload in OFFSITE_PAYLOADS {
+			let res = block_on(set(post("/settings", format!("theme=dark&return_to={payload}")))).unwrap();
+			assert_local_redirect(&res, payload);
+		}
+	}
+
+	#[test]
+	fn settings_post_return_to_keeps_a_local_path() {
+		let res = block_on(set(post("/settings", "return_to=%2Fr%2Frust%3Fsort%3Dtop".to_string()))).unwrap();
+		assert_eq!(res.headers()["location"], "/r/rust?sort=top");
+	}
+
+	/// The `return_to` value the settings form would send back
+	fn prefilled_return_to(uri: String) -> String {
+		let res = block_on(get(get_request(uri))).unwrap();
+		let body = String::from_utf8(block_on(res.into_body().collect_bytes()).unwrap().to_vec()).unwrap();
+		let field = regex::Regex::new(r#"value="([^"]*)" name="return_to""#).unwrap();
+		field.captures(&body).expect("settings form has a return_to field")[1].to_string()
+	}
+
+	#[test]
+	fn settings_get_does_not_prefill_an_offsite_return_to() {
+		for payload in OFFSITE_PAYLOADS {
+			assert_eq!(prefilled_return_to(format!("/settings?return_to={payload}")), "", "{payload}: prefilled the form");
+		}
+	}
+
+	#[test]
+	fn settings_get_prefills_a_local_return_to() {
+		assert_eq!(prefilled_return_to("/settings?return_to=/r/rust".to_string()), "/r/rust");
+	}
+
+	#[test]
+	fn settings_restore_redirect_stays_on_the_instance() {
+		for payload in OFFSITE_PAYLOADS {
+			let res = block_on(restore(get_request(format!("/settings/restore?redirect={payload}")))).unwrap();
+			assert_local_redirect(&res, payload);
+		}
+	}
+
+	#[test]
+	fn settings_update_redirect_stays_on_the_instance() {
+		for payload in OFFSITE_PAYLOADS {
+			let res = block_on(update(get_request(format!("/settings/update?theme=dark&redirect={payload}")))).unwrap();
+			assert_local_redirect(&res, payload);
+		}
+	}
+
+	#[test]
+	fn settings_update_redirect_keeps_a_local_path() {
+		// The in-app links pass the current path, with or without the leading slash
+		let res = block_on(update(get_request("/settings/update?use_hls=on&redirect=/r/rust/comments/abc".to_string()))).unwrap();
+		assert_eq!(res.headers()["location"], "/r/rust/comments/abc");
+		let res = block_on(update(get_request("/settings/update?use_hls=on&redirect=r/rust".to_string()))).unwrap();
+		assert_eq!(res.headers()["location"], "/r/rust");
+	}
+}

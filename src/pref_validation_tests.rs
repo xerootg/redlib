@@ -29,13 +29,25 @@ fn get(uri: &str) -> Request<Body> {
 	Request::builder().uri(uri).body(Body::empty()).unwrap()
 }
 
+/// A same-origin POST: /settings/update and /settings/restore only apply
+/// changes for these (a GET just shows a confirmation page), so the cookie
+/// validation must be exercised through them.
+fn same_origin_post(uri: &str) -> Request<Body> {
+	Request::builder()
+		.method("POST")
+		.uri(uri)
+		.header("sec-fetch-site", "same-origin")
+		.body(Body::empty())
+		.unwrap()
+}
+
 #[test]
 fn update_does_not_inject_cookie_attributes() {
 	for name in ["theme", "layout", "post_sort", "front_page", "posts_per_page", "wide", "geo_filter"] {
-		let response = crate::client::block_on_shared(settings::update(get(&format!("/settings/update?{name}={THEME_INJECTION}")))).unwrap();
+		let response = crate::client::block_on_shared(settings::update(same_origin_post(&format!("/settings/update?{name}={THEME_INJECTION}")))).unwrap();
 		assert_no_injection(&response);
 	}
-	let response = crate::client::block_on_shared(settings::update(get(
+	let response = crate::client::block_on_shared(settings::update(same_origin_post(
 		"/settings/update?subscriptions=rust%2Bx%3BDomain%3Dthemissing.xyz&filters=a%3BDomain%3Dthemissing.xyz",
 	)))
 	.unwrap();
@@ -44,7 +56,7 @@ fn update_does_not_inject_cookie_attributes() {
 
 #[test]
 fn restore_does_not_inject_cookie_attributes() {
-	let response = crate::client::block_on_shared(settings::restore(get(&format!(
+	let response = crate::client::block_on_shared(settings::restore(same_origin_post(&format!(
 		"/settings/restore?theme={THEME_INJECTION}&subscriptions=rust%2Bx%3BDomain%3Dthemissing.xyz&filters=a%3BDomain%3Dthemissing.xyz"
 	))))
 	.unwrap();
@@ -66,7 +78,7 @@ fn settings_form_does_not_inject_cookie_attributes() {
 
 #[test]
 fn update_still_sets_valid_values() {
-	let response = crate::client::block_on_shared(settings::update(get(
+	let response = crate::client::block_on_shared(settings::update(same_origin_post(
 		"/settings/update?theme=dark&layout=compact&front_page=rust%2Blinux&post_sort=top&posts_per_page=50&wide=on&geo_filter=DE&subscriptions=rust%2Blinux",
 	)))
 	.unwrap();

@@ -298,8 +298,11 @@ fn cursor_owner(path: &str) -> Option<&'static str> {
 }
 
 /// The memory the fetch cache may hold, as `value_size` counts it. Parsed
-/// pages are megabytes each, and the pod has 256Mi for everything.
-const FETCH_CACHE_BYTES: usize = 32 * 1024 * 1024;
+/// pages are megabytes each, and the pod has 256Mi for everything. Measured on
+/// a release build, the process holds about three times what `value_size`
+/// counts (allocator overhead and fragmentation), and the scraped comment
+/// cache holds the same pages again, so 32 MiB filled the pod.
+const FETCH_CACHE_BYTES: usize = 12 * 1024 * 1024;
 
 type Fetched = Result<(Value, &'static str), String>;
 

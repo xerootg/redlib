@@ -139,8 +139,9 @@ pub async fn comments(subreddit: String, post_id: String, comment_id: Option<Str
 	result
 }
 
-/// The memory the comment cache may hold, as `value_size` counts it.
-const COMMENTS_CACHE_BYTES: usize = 16 * 1024 * 1024;
+/// The memory the comment cache may hold, as `value_size` counts it, which is
+/// about a third of what it takes (see `FETCH_CACHE_BYTES`).
+const COMMENTS_CACHE_BYTES: usize = 6 * 1024 * 1024;
 
 static COMMENTS_CACHE: LazyLock<ByteCache<Result<Value, String>>> = LazyLock::new(|| ByteCache::new(COMMENTS_CACHE_BYTES, 100, Duration::from_secs(30)));
 

@@ -706,6 +706,62 @@ mod redirect_tests {
 	}
 }
 
+/// POSTs that change subscriptions, filters or quarantine opt-ins must come from a page on
+/// this instance (audit finding #9)
+#[cfg(test)]
+mod origin_tests {
+	use super::*;
+	use futures_lite::future::block_on;
+
+	fn post(uri: &str, sub: &str, headers: &[(&str, &str)]) -> Request<Body> {
+		let mut builder = Request::builder().method("POST").uri(uri).header("host", "redlib.example");
+		for (name, value) in headers {
+			builder = builder.header(*name, *value);
+		}
+		let mut req = builder.body(Body::empty()).unwrap();
+		let mut params = route_recognizer::Params::new();
+		params.insert("sub".to_string(), sub.to_string());
+		req.set_params(params);
+		req
+	}
+
+	const CROSS_SITE: [&[(&str, &str)]; 4] = [
+		&[("sec-fetch-site", "cross-site")],
+		&[("sec-fetch-site", "same-site")],
+		&[("origin", "https://evil.example")],
+		&[("origin", "null")],
+	];
+
+	#[test]
+	fn quarantine_opt_in_refuses_cross_site_requests() {
+		for headers in CROSS_SITE {
+			let res = block_on(add_quarantine_exception(post("/r/foo?redir=/r/foo", "foo", headers))).unwrap();
+			assert_eq!(res.status(), 403, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_none(), "{headers:?}: opted in");
+		}
+	}
+
+	#[test]
+	fn quarantine_opt_in_accepts_same_origin_requests() {
+		for headers in [&[][..], &[("sec-fetch-site", "same-origin")][..], &[("origin", "https://redlib.example")][..]] {
+			let res = block_on(add_quarantine_exception(post("/r/foo?redir=/r/foo", "foo", headers))).unwrap();
+			assert_eq!(res.status(), 302, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_some(), "{headers:?}");
+		}
+	}
+
+	#[test]
+	fn subscribe_and_filter_refuse_cross_site_requests() {
+		// `random` makes the handler fail before it would call Reddit, if the request got that far
+		for action in ["subscribe", "unsubscribe", "filter", "unfilter"] {
+			for headers in CROSS_SITE {
+				let res = block_on(subscriptions_filters(post(&format!("/r/random/{action}"), "random", headers)));
+				assert_eq!(res.as_ref().map(Response::status).ok(), Some(hyper::StatusCode::FORBIDDEN), "{action} {headers:?}");
+			}
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;

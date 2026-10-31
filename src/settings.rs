@@ -633,3 +633,63 @@ mod redirect_tests {
 		assert_eq!(res.headers()["location"], "/r/rust");
 	}
 }
+
+/// POSTs that change preferences must come from a page on this instance (audit finding #9)
+#[cfg(test)]
+mod origin_tests {
+	use super::*;
+	use futures_lite::future::block_on;
+
+	fn post(uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+		let mut builder = Request::builder().method("POST").uri(uri).header("host", "redlib.example");
+		for (name, value) in headers {
+			builder = builder.header(*name, *value);
+		}
+		builder.body(Body::from("theme=dark&return_to=%2Fr%2Frust")).unwrap()
+	}
+
+	const CROSS_SITE: [&[(&str, &str)]; 6] = [
+		&[("sec-fetch-site", "cross-site")],
+		&[("sec-fetch-site", "same-site")],
+		&[("sec-fetch-site", "none")],
+		&[("origin", "https://evil.example")],
+		&[("origin", "null")],
+		&[("origin", "https://redlib.example.evil.example")],
+	];
+
+	const SAME_ORIGIN: [&[(&str, &str)]; 5] = [
+		// curl, scripts, anything that is not a browser
+		&[],
+		&[("sec-fetch-site", "same-origin")],
+		&[("origin", "https://redlib.example")],
+		&[("origin", "http://REDLIB.example")],
+		// Behind a proxy that rewrites Host
+		&[("origin", "https://front.example"), ("x-forwarded-host", "front.example")],
+	];
+
+	#[test]
+	fn settings_post_refuses_cross_site_requests() {
+		for headers in CROSS_SITE {
+			let res = block_on(set(post("/settings", headers))).unwrap();
+			assert_eq!(res.status(), 403, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_none(), "{headers:?}: changed settings");
+		}
+	}
+
+	#[test]
+	fn settings_post_accepts_same_origin_requests() {
+		for headers in SAME_ORIGIN {
+			let res = block_on(set(post("/settings", headers))).unwrap();
+			assert_eq!(res.status(), 302, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_some(), "{headers:?}");
+		}
+	}
+
+	#[test]
+	fn encoded_restore_refuses_cross_site_requests() {
+		for headers in CROSS_SITE {
+			let res = block_on(encoded_restore(post("/settings/encoded-restore", headers))).unwrap();
+			assert_eq!(res.status(), 403, "{headers:?}");
+		}
+	}
+}

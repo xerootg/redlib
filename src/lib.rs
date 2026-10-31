@@ -9,6 +9,7 @@ pub mod oauth;
 pub mod oauth_resources;
 pub mod oidc;
 pub mod post;
+pub mod pref_validation;
 pub mod reddit_health;
 pub mod redgifs;
 pub mod search;
@@ -17,3 +18,6 @@ pub mod settings;
 pub mod subreddit;
 pub mod user;
 pub mod utils;
+
+#[cfg(test)]
+mod pref_validation_tests;

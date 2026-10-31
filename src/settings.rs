@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 // CRATES
 use crate::body::{Body, CollectError};
+use crate::pref_validation::{is_valid_pref, sanitize_pref};
 use crate::server::ResponseExt;
 use crate::subreddit::join_until_size_limit;
 use crate::utils::{deflate_decompress, local_path, redirect, reject_cross_site_post, template, Preferences};
@@ -379,14 +380,14 @@ pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	for &name in &PREFS {
 		match form.get(name) {
-			Some(value) => response.insert_cookie(
+			Some(value) if is_valid_pref(name, value) => response.insert_cookie(
 				Cookie::build((name.to_owned(), value.clone()))
 					.path("/")
 					.http_only(true)
 					.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
 					.into(),
 			),
-			None => response.remove_cookie(name.to_string()),
+			_ => response.remove_cookie(name.to_string()),
 		};
 	}
 
@@ -446,14 +447,14 @@ fn apply_settings(req: Request<Body>, remove_cookies: bool) -> Response<Body> {
 
 	for name in PREFS {
 		match form.get(name) {
-			Some(value) => response.insert_cookie(
+			Some(value) if is_valid_pref(name, value) => response.insert_cookie(
 				Cookie::build((name.to_owned(), value.clone()))
 					.path("/")
 					.http_only(true)
 					.expires(OffsetDateTime::now_utc() + Duration::weeks(52))
 					.into(),
 			),
-			None => {
+			_ => {
 				if remove_cookies {
 					response.remove_cookie(name.to_string());
 				}
@@ -462,8 +463,8 @@ fn apply_settings(req: Request<Body>, remove_cookies: bool) -> Response<Body> {
 	}
 
 	// Get subscriptions/filters to restore from query string
-	let subscriptions = form.get("subscriptions");
-	let filters = form.get("filters");
+	let subscriptions = form.get("subscriptions").map(|list| sanitize_pref("subscriptions", list.to_string()));
+	let filters = form.get("filters").map(|list| sanitize_pref("filters", list.to_string()));
 
 	// We can't search through the cookies directly like in subreddit.rs, so instead we have to make a string out of the request's headers to search through
 	let cookies_string = parts

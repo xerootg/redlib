@@ -653,15 +653,16 @@ mod tests {
 		("LIBREDDIT_AUTH_BYPASS_CIDRS", "0.0.0.0/0"),
 		("LIBREDDIT_TRUSTED_PROXIES", "0.0.0.0/0"),
 		("LIBREDDIT_MCP_TOKEN", "token"),
+		("LIBREDDIT_READ_TOKEN", "token"),
 	])]
 	fn test_auth_settings_have_no_legacy_names() {
 		// These never existed under LIBREDDIT_. A stray variable with such a
 		// name must not quietly switch auth off, widen the bypass or set a token.
 		let auth_keys: Vec<String> = serde_names("rename")
 			.into_iter()
-			.filter(|k| k.starts_with("REDLIB_OIDC_") || ["REDLIB_AUTH_BYPASS_CIDRS", "REDLIB_TRUSTED_PROXIES", "REDLIB_MCP_TOKEN"].contains(&k.as_str()))
+			.filter(|k| k.starts_with("REDLIB_OIDC_") || ["REDLIB_AUTH_BYPASS_CIDRS", "REDLIB_TRUSTED_PROXIES", "REDLIB_MCP_TOKEN", "REDLIB_READ_TOKEN"].contains(&k.as_str()))
 			.collect();
-		assert_eq!(auth_keys.len(), 12, "update the env list above: {auth_keys:?}");
+		assert_eq!(auth_keys.len(), 13, "update the env list above: {auth_keys:?}");
 		let config = Config::load();
 		for key in &auth_keys {
 			assert!(var(key.replace("REDLIB_", "LIBREDDIT_")).is_ok(), "{key} has no legacy variable set above");

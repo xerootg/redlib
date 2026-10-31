@@ -1848,3 +1848,177 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		}
 	}
 }
+
+/// `REDLIB_READ_TOKEN`: a bearer token for in-cluster services that only
+/// read pages. Kept apart from the main test module, which covers sessions,
+/// bypasses and the MCP token.
+#[cfg(test)]
+mod read_token_tests {
+	use super::*;
+	use hyper::header::HeaderValue;
+	use sealed_test::prelude::*;
+
+	const OUTSIDE: &str = "203.0.113.9";
+	const TOKEN: &str = "read-only-token-0123456789abcdef";
+
+	fn outside() -> IpAddr {
+		OUTSIDE.parse().unwrap()
+	}
+
+	fn bearer(value: &str) -> HeaderMap {
+		let mut map = HeaderMap::new();
+		map.append("authorization", HeaderValue::from_str(value).unwrap());
+		map.append("accept", HeaderValue::from_static("application/json"));
+		map
+	}
+
+	fn with_token() -> HeaderMap {
+		bearer(&format!("Bearer {TOKEN}"))
+	}
+
+	fn assert_rejected(method: &Method, path: &str, headers: &HeaderMap) {
+		let res = gate(outside(), method, path, headers).unwrap_or_else(|| panic!("{method} {path} must be gated"));
+		assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_READ_TOKEN", "read-only-token-0123456789abcdef"),
+	])]
+	fn opens_pages_for_get_and_head() {
+		for path in ["/r/rust", "/r/rust/comments/1abcdef/some_title", "/", "/user/someone", "/info.json"] {
+			for method in [Method::GET, Method::HEAD] {
+				assert!(gate(outside(), &method, path, &with_token()).is_none(), "{method} {path}");
+			}
+		}
+
+		// The scheme is case-insensitive (RFC 9110 11.1).
+		for scheme in ["bearer", "BEARER", "BeArEr"] {
+			let headers = bearer(&format!("{scheme} {TOKEN}"));
+			assert!(gate(outside(), &Method::GET, "/r/rust", &headers).is_none(), "{scheme}");
+		}
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_READ_TOKEN", "read-only-token-0123456789abcdef"),
+	])]
+	fn never_allows_a_method_that_can_change_state() {
+		for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE, Method::OPTIONS] {
+			for path in ["/r/rust", "/r/rust/subscribe", "/settings", "/settings/encoded-restore"] {
+				assert_rejected(&method, path, &with_token());
+			}
+		}
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_READ_TOKEN", "read-only-token-0123456789abcdef"),
+	])]
+	fn never_opens_settings_mcp_or_oidc() {
+		// /settings/restore and /settings/update change preferences on GET,
+		// /mcp has its own token, and /oidc/ belongs to the login flow.
+		for path in [
+			"/settings",
+			"/settings/update",
+			"/settings/restore",
+			"/Settings",
+			"/SETTINGS/update",
+			"/mcp",
+			"/mcp/other",
+			"/oidc",
+			"/oidc/other",
+		] {
+			for method in [Method::GET, Method::HEAD] {
+				assert_rejected(&method, path, &with_token());
+			}
+		}
+
+		// Paths that merely start with the same letters are ordinary pages.
+		for path in ["/settingsx", "/mcpx", "/oidcx"] {
+			assert!(gate(outside(), &Method::GET, path, &with_token()).is_none(), "{path}");
+		}
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_READ_TOKEN", "read-only-token-0123456789abcdef"),
+		("REDLIB_MCP_TOKEN", "mcp-token-0123456789abcdef"),
+	])]
+	fn rejects_wrong_or_malformed_tokens() {
+		for value in [
+			"Bearer read-only-token-0123456789abcde",
+			"Bearer read-only-token-0123456789abcdefx",
+			"Bearer ",
+			"Basic read-only-token-0123456789abcdef",
+			"read-only-token-0123456789abcdef",
+			// The MCP token is not a read token.
+			"Bearer mcp-token-0123456789abcdef",
+		] {
+			assert_rejected(&Method::GET, "/r/rust", &bearer(value));
+		}
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+		("REDLIB_READ_TOKEN", "   "),
+	])]
+	fn a_blank_token_authorises_nothing() {
+		for value in ["Bearer ", "Bearer    ", "Bearer x"] {
+			assert_rejected(&Method::GET, "/r/rust", &bearer(value));
+		}
+	}
+
+	#[test]
+	#[sealed_test(env = [
+		("REDLIB_OIDC_ENABLED", "on"),
+		("REDLIB_OIDC_ISSUER", "https://idp.example/application/o/redlib/"),
+		("REDLIB_OIDC_CLIENT_ID", "id"),
+		("REDLIB_OIDC_CLIENT_SECRET", "secret"),
+		("REDLIB_OIDC_REDIRECT_URI", "https://redlib.example/oidc/callback"),
+		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
+	])]
+	fn an_unset_token_authorises_nothing() {
+		for value in ["Bearer ", "Bearer x", "Bearer read-only-token-0123456789abcdef"] {
+			assert_rejected(&Method::GET, "/r/rust", &bearer(value));
+		}
+	}
+
+	#[test]
+	#[sealed_test(env = [("REDLIB_READ_TOKEN", "read-only-token-0123456789abcdef")])]
+	fn is_loaded_but_never_reaches_info_json() {
+		assert_eq!(crate::config::get_setting("REDLIB_READ_TOKEN").as_deref(), Some(TOKEN));
+		let json = serde_json::to_string(&crate::config::Config::load()).unwrap();
+		assert!(!json.contains(TOKEN), "the read token is in /info.json");
+	}
+}

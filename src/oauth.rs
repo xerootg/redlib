@@ -202,6 +202,11 @@ impl From<serde_json::Error> for AuthError {
 	}
 }
 
+/// How long to wait before refreshing a token that is valid for `expires_in` seconds.
+fn refresh_delay(expires_in: u64) -> Duration {
+	Duration::from_secs(expires_in - 120)
+}
+
 pub async fn token_daemon() {
 	// Monitor for refreshing token
 	loop {
@@ -209,7 +214,7 @@ pub async fn token_daemon() {
 		let expires_in = { OAUTH_CLIENT.load_full().expires_in };
 
 		// sleep for the expiry time minus 2 minutes
-		let duration = Duration::from_secs(expires_in - 120);
+		let duration = refresh_delay(expires_in);
 
 		info!("[⏳] Waiting for {duration:?} seconds before refreshing OAuth token...");
 
@@ -628,6 +633,23 @@ mod retry_tests {
 			Duration::ZERO,
 		));
 		assert_eq!(generic_tries.load(Ordering::SeqCst), 5);
+	}
+}
+
+#[cfg(test)]
+mod hardening_tests {
+	use super::*;
+
+	// Audit info item: `expires_in - 120` wrapped to a sleep of 584 billion
+	// years in release builds when Reddit answered with a short expiry, which
+	// stopped the refreshes (and panicked the task in debug builds).
+	#[test]
+	fn test_refresh_delay_with_a_short_expiry() {
+		assert_eq!(refresh_delay(86400), Duration::from_secs(86280));
+		for expires_in in [0, 60, 119, 120, 121] {
+			assert!(refresh_delay(expires_in) <= Duration::from_secs(86400), "{expires_in}");
+			assert!(refresh_delay(expires_in) >= Duration::from_secs(1), "{expires_in}");
+		}
 	}
 }
 

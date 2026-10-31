@@ -263,6 +263,16 @@ pub fn join_until_size_limit<T: std::fmt::Display>(vec: &[T]) -> Vec<std::string
 	result
 }
 
+/// Where to send the user after subscribing or filtering: back to the subreddit
+/// or, when unsubscribing/unfiltering from outside the sidebar, to the `redirect` parameter
+fn subscription_redirect(sub: &str, query: &str) -> String {
+	if let Some(redirect_path) = param(&format!("?{query}"), "redirect") {
+		format!("/{redirect_path}")
+	} else {
+		format!("/r/{sub}")
+	}
+}
+
 // Sub, filter, unfilter, or unsub by setting subscription cookie using response "Set-Cookie" header
 pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>, String> {
 	let sub = req.param("sub").unwrap_or_default();
@@ -345,15 +355,7 @@ pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>,
 		}
 	}
 
-	// Redirect back to subreddit
-	// check for redirect parameter if unsubscribing/unfiltering from outside sidebar
-	let path = if let Some(redirect_path) = param(&format!("?{query}"), "redirect") {
-		format!("/{redirect_path}")
-	} else {
-		format!("/r/{sub}")
-	};
-
-	let mut response = redirect(&path);
+	let mut response = redirect(&subscription_redirect(&sub, &query));
 
 	// If sub_list is empty remove all subscriptions cookies, otherwise update them and remove old ones
 	if sub_list.is_empty() {

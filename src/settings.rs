@@ -701,3 +701,95 @@ mod origin_tests {
 		}
 	}
 }
+
+/// GET /settings/restore and /settings/update change cookies, so a link on another site must not
+/// be able to trigger them (audit finding #7)
+#[cfg(test)]
+mod navigation_tests {
+	use super::*;
+	use futures_lite::future::block_on;
+
+	fn get_with(uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+		let mut builder = Request::builder()
+			.method("GET")
+			.uri(uri)
+			.header("host", "redlib.example")
+			.header("cookie", "theme=dark; subscriptions=rust+news; filters=memes");
+		for (name, value) in headers {
+			builder = builder.header(*name, *value);
+		}
+		builder.body(Body::empty()).unwrap()
+	}
+
+	const LINKED_FROM_ELSEWHERE: [&[(&str, &str)]; 2] = [&[("sec-fetch-site", "cross-site")], &[("sec-fetch-site", "same-site")]];
+
+	// Typed in, bookmarked, clicked inside Redlib (or the redirect after encoded-restore), or sent by something that is not a browser
+	const FROM_THE_USER: [&[(&str, &str)]; 4] = [
+		&[],
+		&[("sec-fetch-site", "none")],
+		&[("sec-fetch-site", "same-origin")],
+		&[("sec-fetch-user", "?1"), ("sec-fetch-site", "none")],
+	];
+
+	fn body_of(res: Response<Body>) -> String {
+		String::from_utf8(block_on(res.into_body().collect_bytes()).unwrap().to_vec()).unwrap()
+	}
+
+	#[test]
+	fn restore_from_another_site_does_not_touch_cookies() {
+		for headers in LINKED_FROM_ELSEWHERE {
+			let res = block_on(restore(get_with("/settings/restore?redirect=/", headers))).unwrap();
+			assert_eq!(res.status(), 200, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_none(), "{headers:?}: wiped or changed cookies");
+			assert!(res.headers().get("location").is_none(), "{headers:?}");
+		}
+	}
+
+	#[test]
+	fn update_from_another_site_does_not_touch_cookies() {
+		for headers in LINKED_FROM_ELSEWHERE {
+			let res = block_on(update(get_with("/settings/update?theme=light&redirect=/", headers))).unwrap();
+			assert_eq!(res.status(), 200, "{headers:?}");
+			assert!(res.headers().get("set-cookie").is_none(), "{headers:?}: changed cookies");
+		}
+	}
+
+	#[test]
+	fn link_from_another_site_gets_a_page_that_continues_from_this_site() {
+		// Restore links are meant to be shared, so they still work: one click on the page continues
+		let res = block_on(restore(get_with(
+			"/settings/restore/?theme=light&subscriptions=a+b&redirect=/r/a",
+			&[("sec-fetch-site", "cross-site")],
+		)))
+		.unwrap();
+		let body = body_of(res);
+		assert!(body.contains("href=\"/settings/restore/?theme=light&#38;subscriptions=a+b&#38;redirect=/r/a\""), "{body}");
+	}
+
+	#[test]
+	fn restore_by_the_user_still_works() {
+		for headers in FROM_THE_USER {
+			let res = block_on(restore(get_with("/settings/restore?theme=light&redirect=/r/rust", headers))).unwrap();
+			assert_eq!(res.status(), 302, "{headers:?}");
+			assert_eq!(res.headers()["location"], "/r/rust", "{headers:?}");
+			let cookies: Vec<_> = res.headers().get_all("set-cookie").iter().map(|c| c.to_str().unwrap().to_string()).collect();
+			assert!(cookies.iter().any(|c| c.starts_with("theme=light")), "{headers:?}: {cookies:?}");
+			assert!(
+				cookies.iter().any(|c| c.starts_with("subscriptions=;")),
+				"{headers:?}: restore removes what the link does not carry: {cookies:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn update_by_the_user_still_works() {
+		for headers in FROM_THE_USER {
+			let res = block_on(update(get_with("/settings/update?use_hls=on&redirect=/r/rust", headers))).unwrap();
+			assert_eq!(res.status(), 302, "{headers:?}");
+			assert_eq!(res.headers()["location"], "/r/rust", "{headers:?}");
+			let cookies: Vec<_> = res.headers().get_all("set-cookie").iter().map(|c| c.to_str().unwrap().to_string()).collect();
+			assert!(cookies.iter().any(|c| c.starts_with("use_hls=on")), "{headers:?}: {cookies:?}");
+			assert!(!cookies.iter().any(|c| c.starts_with("subscriptions=;")), "{headers:?}: update keeps the rest: {cookies:?}");
+		}
+	}
+}

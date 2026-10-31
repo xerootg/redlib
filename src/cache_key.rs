@@ -236,20 +236,41 @@ mod normalize_tests {
 		let key = fetch_key("/r/rust/comments/abc.json?sort=top&raw_json=1");
 		assert_eq!(fetch_key("/r/rust/comments/abc.json?sort=%74op&raw_json=1"), key);
 		assert_eq!(fetch_key("/r/rust/comments/abc.json?sort=t%6Fp&raw_json=%31"), key);
-		assert_eq!(
-			fetch_key("/r/rust/search.json?q=a%20b&raw_json=1"),
-			fetch_key("/r/rust/search.json?q=a+b&raw_json=1")
-		);
+		assert_eq!(fetch_key("/r/rust/search.json?q=a%20b&raw_json=1"), fetch_key("/r/rust/search.json?q=a+b&raw_json=1"));
 		assert_eq!(fetch_key("/r/rust/hot.json?after=t3_a%3D").as_deref(), Some("/r/rust/hot.json?after=t3_a%3D"));
 	}
 
 	#[test]
 	fn test_values_that_are_not_valid_leave_the_key() {
 		let bare = fetch_key("/r/rust/comments/abc.json?raw_json=1");
-		for query in ["sort=confidence1", "sort=confidence2", "sort=zzz", "context=12", "context=x", "limit=1000000", "limit=x", "depth=-1", "t=forever", "type=zzz", "raw_json=2", "restrict_sr=maybe"] {
+		for query in [
+			"sort=confidence1",
+			"sort=confidence2",
+			"sort=zzz",
+			"context=12",
+			"context=x",
+			"limit=1000000",
+			"limit=x",
+			"depth=-1",
+			"t=forever",
+			"type=zzz",
+			"raw_json=2",
+			"restrict_sr=maybe",
+		] {
 			assert_eq!(fetch_key(&format!("/r/rust/comments/abc.json?{query}&raw_json=1")), bare, "{query}");
 		}
-		for query in ["sort=confidence", "sort=top", "context=3", "limit=100", "depth=5", "t=week", "type=link", "restrict_sr=on", "sort=", "t="] {
+		for query in [
+			"sort=confidence",
+			"sort=top",
+			"context=3",
+			"limit=100",
+			"depth=5",
+			"t=week",
+			"type=link",
+			"restrict_sr=on",
+			"sort=",
+			"t=",
+		] {
 			let key = fetch_key(&format!("/r/rust/comments/abc.json?{query}&raw_json=1"));
 			assert_ne!(key, bare, "{query}");
 		}

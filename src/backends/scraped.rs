@@ -144,7 +144,14 @@ const COMMENTS_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 static COMMENTS_CACHE: LazyLock<ByteCache<Result<Value, String>>> = LazyLock::new(|| ByteCache::new(COMMENTS_CACHE_BYTES, 100, Duration::from_secs(30)));
 
-async fn comments_uncached(subreddit: String, post_id: String, comment_id: Option<String>, sort: String, context: Option<String>, more: Option<More>) -> Result<Value, String> {
+async fn comments_uncached(
+	subreddit: String,
+	post_id: String,
+	comment_id: Option<String>,
+	sort: String,
+	context: Option<String>,
+	more: Option<More>,
+) -> Result<Value, String> {
 	let html = match &more {
 		Some(more) => shreddit_fragment(more_path(&subreddit, &post_id, &more.query), Some(more.cursor.clone())).await?,
 		None => shreddit_fragment(comments_path(&subreddit, &post_id, comment_id.as_deref(), &sort), None).await?,

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 // CRATES
-use crate::body::Body;
+use crate::body::{Body, CollectError};
 use crate::server::ResponseExt;
 use crate::subreddit::join_until_size_limit;
 use crate::utils::{deflate_decompress, redirect, template, Preferences};
@@ -23,6 +23,12 @@ struct SettingsTemplate {
 }
 
 // CONSTANTS
+
+/// Largest `POST /settings` form accepted: a few dozen short values.
+const MAX_SETTINGS_BODY_LEN: usize = 64 * 1024;
+/// Largest `POST /settings/encoded-restore` body accepted. A settings code is
+/// base2048 text, which form-encoding turns into about six bytes per character.
+const MAX_ENCODED_RESTORE_BODY_LEN: usize = 256 * 1024;
 
 const PREFS: [&str; 23] = [
 	"theme",
@@ -305,6 +311,15 @@ pub static GEO_FILTERS: [(&str, &str); 250] = [
 
 // FUNCTIONS
 
+/// The answer to a request body that exceeds its limit.
+fn payload_too_large() -> Response<Body> {
+	Response::builder()
+		.status(413)
+		.header("content-type", "text/plain")
+		.body("Request body too large".into())
+		.unwrap_or_default()
+}
+
 /// Retrieve cookies from request "Cookie" header
 pub async fn get(req: Request<Body>) -> Result<Response<Body>, String> {
 	let url = req.uri().to_string();
@@ -333,7 +348,11 @@ pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 		.collect();
 
 	// Aggregate the body...
-	let body_bytes = body.collect_bytes().await.map_err(|e| e.to_string())?;
+	let body_bytes = match body.collect_bytes_limited(MAX_SETTINGS_BODY_LEN).await {
+		Ok(bytes) => bytes,
+		Err(CollectError::TooLarge) => return Ok(payload_too_large()),
+		Err(e) => return Err(e.to_string()),
+	};
 
 	let form = url::form_urlencoded::parse(&body_bytes).collect::<HashMap<_, _>>();
 
@@ -536,6 +555,31 @@ pub async fn update(req: Request<Body>) -> Result<Response<Body>, String> {
 	Ok(set_cookies_method(req, false))
 }
 
+pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, String> {
+	let body = match req.into_body().collect_bytes_limited(MAX_ENCODED_RESTORE_BODY_LEN).await {
+		Ok(bytes) => bytes,
+		Err(CollectError::TooLarge) => return Ok(payload_too_large()),
+		Err(e) => return Err(e.to_string()),
+	};
+
+	let encoded_prefs = form_urlencoded::parse(&body)
+		.find(|(key, _)| key == "encoded_prefs")
+		.map(|(_, value)| value)
+		.ok_or_else(|| "encoded_prefs parameter not found in request body".to_string())?;
+
+	let bytes = base2048::decode(&encoded_prefs).ok_or_else(|| "Failed to decode base2048 encoded preferences".to_string())?;
+
+	let out = deflate_decompress(bytes)?;
+
+	let mut prefs: Preferences = Preferences::from_bincode(&out).map_err(|e| format!("Failed to deserialize bytes into Preferences struct: {e}"))?;
+
+	prefs.available_themes = vec![];
+
+	let url = format!("/settings/restore/?{}", prefs.to_urlencoded()?);
+
+	Ok(redirect(&url))
+}
+
 /// Hostile settings codes and request bodies (audit findings 3, 4, 5).
 #[cfg(test)]
 mod bounds_tests {
@@ -606,29 +650,4 @@ mod bounds_tests {
 		let res = set(post("theme=dark&layout=compact")).await.unwrap();
 		assert_eq!(res.status(), 302);
 	}
-}
-
-pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, String> {
-	let body = req.into_body().collect_bytes().await.map_err(|e| format!("Failed to get bytes from request body: {e}"))?;
-
-	if body.len() > 1024 * 1024 {
-		return Err("Request body too large".to_string());
-	}
-
-	let encoded_prefs = form_urlencoded::parse(&body)
-		.find(|(key, _)| key == "encoded_prefs")
-		.map(|(_, value)| value)
-		.ok_or_else(|| "encoded_prefs parameter not found in request body".to_string())?;
-
-	let bytes = base2048::decode(&encoded_prefs).ok_or_else(|| "Failed to decode base2048 encoded preferences".to_string())?;
-
-	let out = deflate_decompress(bytes)?;
-
-	let mut prefs: Preferences = Preferences::from_bincode(&out).map_err(|e| format!("Failed to deserialize bytes into Preferences struct: {e}"))?;
-
-	prefs.available_themes = vec![];
-
-	let url = format!("/settings/restore/?{}", prefs.to_urlencoded()?);
-
-	Ok(redirect(&url))
 }

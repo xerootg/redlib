@@ -37,6 +37,43 @@ impl Body {
 	}
 }
 
+/// Why [`Body::collect_bytes_limited`] gave up.
+#[derive(Debug)]
+pub enum CollectError {
+	/// The body is larger than the limit.
+	TooLarge,
+	Other(BoxError),
+}
+
+impl std::fmt::Display for CollectError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::TooLarge => write!(f, "Request body too large"),
+			Self::Other(e) => write!(f, "Failed to get bytes from request body: {e}"),
+		}
+	}
+}
+
+impl Body {
+	/// Like `collect_bytes`, but stops reading once the body exceeds `limit` bytes.
+	/// For bodies a client sends; never buffer those unbounded.
+	///
+	/// Written as a frame loop rather than `http_body_util::Limited`: its error
+	/// conversion trips a rustc higher-ranked-lifetime bug inside the route closures.
+	pub async fn collect_bytes_limited(mut self, limit: usize) -> Result<Bytes, CollectError> {
+		let mut collected = Vec::new();
+		while let Some(frame) = self.0.frame().await {
+			if let Ok(data) = frame.map_err(CollectError::Other)?.into_data() {
+				if data.len() > limit - collected.len() {
+					return Err(CollectError::TooLarge);
+				}
+				collected.extend_from_slice(&data);
+			}
+		}
+		Ok(collected.into())
+	}
+}
+
 impl Default for Body {
 	fn default() -> Self {
 		Self::empty()
@@ -96,6 +133,31 @@ impl From<std::borrow::Cow<'static, [u8]>> for Body {
 			std::borrow::Cow::Borrowed(b) => b.into(),
 			std::borrow::Cow::Owned(v) => v.into(),
 		}
+	}
+}
+
+#[cfg(test)]
+mod limit_tests {
+	use super::*;
+	use futures_lite::future::block_on;
+
+	#[test]
+	fn limited_collect_passes_bodies_within_the_limit() {
+		assert_eq!(block_on(Body::from("hello").collect_bytes_limited(5)).unwrap(), Bytes::from_static(b"hello"));
+	}
+
+	#[test]
+	fn limited_collect_stops_at_the_limit() {
+		assert!(matches!(block_on(Body::from("hello!").collect_bytes_limited(5)), Err(CollectError::TooLarge)));
+		// A stream is cut off after the chunk that crosses the limit, not read to the end.
+		let chunks = futures_lite::stream::iter((0..1000).map(|_| Ok::<_, std::io::Error>(Bytes::from_static(&[0u8; 1024]))));
+		assert!(matches!(block_on(Body::from_stream(chunks).collect_bytes_limited(4096)), Err(CollectError::TooLarge)));
+	}
+
+	#[test]
+	fn limited_collect_reports_body_errors_as_other() {
+		let chunks = futures_lite::stream::iter(vec![Err::<Bytes, _>(std::io::Error::other("boom"))]);
+		assert!(matches!(block_on(Body::from_stream(chunks).collect_bytes_limited(16)), Err(CollectError::Other(_))));
 	}
 }
 

@@ -1,0 +1,45 @@
+# cargo-deny config for this fork. CI runs `cargo deny --all-features check
+# advisories` from the test job in .github/workflows/fork-container.yml
+# (audit finding #21); --all-features so the obscura-only crates are checked
+# too. Only advisories are gated: licences and bans are not this fork's
+# concern. Every ignore below is a decision made in the audit, with the
+# reason next to it. Delete an entry as soon as the dependency moves on.
+
+[advisories]
+# Yanked crates fail the build; so does anything new in RustSec.
+yanked = "deny"
+# `unmaintained` defaults to workspace-only in cargo-deny >= 0.18, which
+# hides transitive crates. Check them all and list the accepted ones below.
+unmaintained = "all"
+ignore = [
+    # zstd-safe 7.3.0 (zstd 0.13.3), reached only through wreq-util's
+    # `emulation` feature for TLS 1.3 certificate decompression. The only call
+    # is `zstd::stream::read::Decoder::new(input)`, which the advisories name
+    # as unaffected: the read path decodes into an initialized `&mut [u8]`,
+    # and the rest need `with_context`, seekable, training or
+    # dictionary APIs that nothing here calls. Remove when wreq-util moves
+    # to zstd >= 0.14. cargo-deny matches three of the sixteen advisories
+    # (RUSTSEC-2026-0391, 0398, 0403) against this tree; the rest do not
+    # apply to the crates in Cargo.lock.
+    { id = "RUSTSEC-2026-0391", reason = "zstd read::Decoder path in use is unaffected (audit #21)" },
+    { id = "RUSTSEC-2026-0398", reason = "zstd read::Decoder path in use is unaffected (audit #21)" },
+    { id = "RUSTSEC-2026-0403", reason = "zstd read::Decoder path in use is unaffected (audit #21)" },
+
+    # jsonwebtoken 9.3.1: a wrong-typed nbf/exp claim skips validation (fixed
+    # in 10.3.0). Not exploitable here: src/oidc.rs always requires `exp`, and
+    # every token is signed by the session secret or by the IdP's JWKS, so an
+    # attacker cannot forge a wrong-typed claim. Not in RustSec, so cargo-deny
+    # does not see it today; listed so it is recorded if the db adds it.
+    { id = "GHSA-h395-gr6q-cpjc", reason = "exp is required and tokens are signed by a trusted party (audit #21)" },
+
+    # Unmaintained, no patched release exists to move to.
+    # bincode 1.3.x is a direct dependency; 2.x changes the format of
+    # exported settings codes and 3.0.0 is only a compile_error!, so
+    # dependabot ignores its major bumps too.
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 is unmaintained; the settings-code format is frozen on it" },
+    # fxhash 0.2.1 comes in through selectors <- scraper.
+    { id = "RUSTSEC-2025-0057", reason = "fxhash 0.2.1 is unmaintained; transitive via scraper, hashing only" },
+    # paste 1.0.15 comes in through v8, the `obscura` feature only, which the
+    # deployed image does not build.
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 is unmaintained; obscura feature only, not in the deployed image" },
+]

@@ -22,7 +22,7 @@ use redlib::client::OAUTH_CLIENT;
 // Required for the manifest to be valid
 /// Where `/r/:sub/w/*page` redirects to.
 fn sub_wiki_page_path(req: &Request<Body>) -> String {
-	format!("/r/{}/wiki/{}", req.param("sub").unwrap_or_default(), req.param("wiki").unwrap_or_default())
+	format!("/r/{}/wiki/{}", req.param("sub").unwrap_or_default(), req.param("page").unwrap_or_default())
 }
 
 async fn pwa_logo() -> Result<Response<Body>, String> {

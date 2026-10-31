@@ -313,6 +313,12 @@ fn route_segments(path: &str) -> Vec<String> {
 		.collect()
 }
 
+/// Whether a client or server may rewrite the path around `c`, so the path
+/// can't be judged by how it reads.
+fn is_rewritable(c: char) -> bool {
+	c == '#' || c == '\\' || c.is_whitespace() || c.is_control()
+}
+
 /// Whether `path` is a page that belongs to a logged-in account, so no backend may be asked for it.
 ///
 /// Reddit answers the saved, upvoted, downvoted and hidden listings of a user,
@@ -321,9 +327,22 @@ fn route_segments(path: &str) -> Vec<String> {
 /// nothing for them, but a session backend would answer as its account. User
 /// pages are therefore an allowlist, so spellings Reddit decodes or
 /// normalizes (`%73aved`, `comments/../saved`) can't slip past.
+///
+/// The HTTP client rewrites a path before it sends it: it drops everything
+/// from a `#`, strips tabs and newlines, and resolves `..` segments. Visitors
+/// control raw characters of a path through cookies, so a route with a `#`, a
+/// backslash, whitespace or a control character is refused instead of judged,
+/// because what is sent is not what was checked.
 fn is_account_only(path: &str) -> bool {
+	let route = path.split('?').next().unwrap_or_default();
+	if route.chars().any(is_rewritable) {
+		return true;
+	}
 	let segments = route_segments(path);
-	if segments.iter().any(|segment| segment == "." || segment == ".." || segment.contains('/')) {
+	if segments
+		.iter()
+		.any(|segment| segment == "." || segment == ".." || segment.contains('/') || segment.contains(is_rewritable))
+	{
 		return true;
 	}
 	match segments.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {

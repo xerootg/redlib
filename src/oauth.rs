@@ -108,6 +108,16 @@ impl Oauth {
 		}
 	}
 
+	/// `new_with`, but gives up after `wait`.
+	#[allow(dead_code)]
+	async fn new_within<F, Fut>(_wait: Duration, _attempt: F, _pause: Duration) -> Option<Self>
+	where
+		F: FnMut(OauthBackendImpl) -> Fut,
+		Fut: std::future::Future<Output = Result<Result<Self, AuthError>, Elapsed>>,
+	{
+		None
+	}
+
 	/// Calls `attempt` until it yields a client, waiting `pause` (doubled
 	/// after each failure, up to four times as long) between tries. Gives up
 	/// after `MAX_ATTEMPTS` failures.
@@ -588,6 +598,22 @@ mod retry_tests {
 		));
 		assert!(result.is_none());
 		assert_eq!(tries.load(Ordering::SeqCst), 10);
+	}
+
+	// Audit finding #18: startup waited for a token as long as it took, and
+	// then exited, which put the pod in CrashLoopBackOff while Reddit's token
+	// endpoint was down, although settings, login and static pages need no token.
+	#[test]
+	fn test_startup_stops_waiting_for_a_token() {
+		let hanging = crate::client::block_on_shared(Oauth::new_within(
+			Duration::from_millis(50),
+			|_| std::future::pending::<Result<Result<Oauth, AuthError>, Elapsed>>(),
+			Duration::ZERO,
+		));
+		assert!(hanging.is_none());
+
+		let late = crate::client::block_on_shared(Oauth::new_within(Duration::from_millis(500), |_| async { Ok(Ok(client("in time"))) }, Duration::ZERO));
+		assert_eq!(late.unwrap().headers_map["Authorization"], "Bearer in time");
 	}
 
 	#[test]

@@ -1,0 +1,19 @@
+# Tests that call Reddit over the internet. The gating CI job skips them
+# (Reddit captchas and rate-limits GitHub's runners, so they fail at random);
+# the non-gating `live` job still runs them. Found by running the suite in a
+# network namespace with only loopback. One test path per line.
+backends::live_tests::
+backends::tests::test_banned_sub
+backends::tests::test_gated_sub
+backends::tests::test_localization_popular
+backends::tests::test_private_sub
+client::tests::test_obfuscated_share_link
+oauth::tests::test_mobile_spoof_backend
+oauth::tests::test_oauth_client
+oauth::tests::test_oauth_token_exists
+subreddit::tests::test_fetching_subreddit
+subreddit::tests::test_gated_and_quarantined
+user::tests::test_fetching_user
+utils::tests::test_fetching_nsfw_subreddit
+utils::tests::test_fetching_subreddit_quarantined
+utils::tests::test_fetching_ws

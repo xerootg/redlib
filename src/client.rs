@@ -1,4 +1,5 @@
 use crate::body::Body;
+use crate::cache_key;
 use crate::config::get_setting;
 use crate::dbg_msg;
 use crate::oauth::{token_daemon, Oauth};
@@ -476,9 +477,17 @@ fn sanitize_cookie(raw: &str) -> Option<String> {
 /// value is `Ok(None)` if Reddit responded with a 3xx, but did not provide a
 /// `Location` header. An `Err(String)` is returned if Reddit responds with a
 /// 429, or if we were unable to decode the value in the `Location` header.
+pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, String> {
+	// The path comes from the visitor and is the key of the cache below
+	if !cache_key::segments_within_limit(&path) {
+		return Ok(None);
+	}
+	canonical_path_cached(path, tries).await
+}
+
 #[cached(max_size = 1024, ttl_secs = 600)]
 #[async_recursion::async_recursion]
-pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, String> {
+async fn canonical_path_cached(path: String, tries: i8) -> Result<Option<String>, String> {
 	if tries == 0 {
 		return Ok(None);
 	}

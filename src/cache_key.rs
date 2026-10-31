@@ -4,18 +4,62 @@
 //! visitor who can make up keys can fill the memory with copies of one page.
 //! These functions leave a key only the parts that change what Reddit sends.
 
+use std::collections::BTreeMap;
+
 /// The longest path segment (between two slashes) that is looked up.
 pub const MAX_SEGMENT_LEN: usize = 256;
 
+/// Query parameters that change what Reddit sends, or what a backend makes of
+/// it. A parameter that is not here is not sent to Reddit either.
+const QUERY_KEYS: &[&str] = &[
+	"after",
+	"before",
+	"context",
+	"count",
+	"depth",
+	"geo_filter",
+	"include_over_18",
+	"limit",
+	"more_cursor",
+	"more_query",
+	"post_types",
+	"q",
+	"raw_json",
+	"restrict_sr",
+	"sort",
+	"t",
+	"type",
+];
+
 /// The key for a fetch of `path` (a Reddit JSON API path with its query), or
-/// `None` if a path segment is longer than `MAX_SEGMENT_LEN`.
+/// `None` if a path segment is longer than `MAX_SEGMENT_LEN`. The key is
+/// `path` with only the parameters in `QUERY_KEYS`, sorted by name and with
+/// the last of any repeated one, as `utils::param` reads them.
 pub fn fetch_key(path: &str) -> Option<String> {
-	Some(path.to_string())
+	let (route, query) = path.split_once('?').unwrap_or((path, ""));
+	if !segments_within_limit(route) {
+		return None;
+	}
+
+	let mut kept = BTreeMap::new();
+	for pair in query.split('&') {
+		if let Some((key, value)) = pair.split_once('=') {
+			if QUERY_KEYS.contains(&key) {
+				kept.insert(key, value);
+			}
+		}
+	}
+	if kept.is_empty() {
+		return Some(route.to_string());
+	}
+	let query: Vec<String> = kept.into_iter().map(|(key, value)| format!("{key}={value}")).collect();
+	Some(format!("{route}?{}", query.join("&")))
 }
 
-/// Whether no segment of `path` (query and all) is longer than `MAX_SEGMENT_LEN`.
-pub fn segments_within_limit(_path: &str) -> bool {
-	true
+/// Whether no segment of the path in `path` (up to any `?`) is longer than `MAX_SEGMENT_LEN`.
+pub fn segments_within_limit(path: &str) -> bool {
+	let route = path.split('?').next().unwrap_or_default();
+	route.split('/').all(|segment| segment.len() <= MAX_SEGMENT_LEN)
 }
 
 #[cfg(test)]

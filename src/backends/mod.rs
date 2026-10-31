@@ -18,6 +18,7 @@ pub mod obscura;
 mod score;
 pub mod scraped;
 
+use crate::cache_key;
 use crate::config::get_setting;
 use crate::oauth::force_refresh_token;
 use crate::utils::param;
@@ -297,8 +298,20 @@ fn cursor_owner(path: &str) -> Option<&'static str> {
 }
 
 /// Fetches `path` from the first backend that serves it, and names that backend.
-#[cached(max_size = 100, ttl_secs = 30)]
+///
+/// The cache is keyed on the path, so only the query parameters that change
+/// the answer are kept (see `cache_key`): anyone can add to a URL, and every
+/// variation would otherwise be a copy of the page in memory and a request to
+/// Reddit.
 pub async fn fetch(path: String, quarantine: bool) -> Result<(Value, &'static str), String> {
+	let Some(path) = cache_key::fetch_key(&path) else {
+		return Err("Invalid URL: a path segment is too long".to_string());
+	};
+	fetch_cached(path, quarantine).await
+}
+
+#[cached(max_size = 100, ttl_secs = 30)]
+async fn fetch_cached(path: String, quarantine: bool) -> Result<(Value, &'static str), String> {
 	let kind = Kind::of(&path);
 	let mut blocked = false;
 	let mut last_error = None;

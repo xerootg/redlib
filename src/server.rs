@@ -441,7 +441,7 @@ async fn new_boilerplate(
 	status: u16,
 	body: Body,
 ) -> Result<Response<Body>, String> {
-	match Response::builder().status(status).body(body) {
+	match Response::builder().status(status).header(header::CONTENT_TYPE, "text/plain; charset=utf-8").body(body) {
 		Ok(mut res) => {
 			let _ = compress_response(&req_headers, &mut res).await;
 

@@ -3,9 +3,9 @@
 <!DOCTYPE html>
 <html lang="en" class="{% if prefs.fixed_navbar == "on" %}fixed_navbar{% endif %}">
     <head>
+        <meta charset="utf-8">
         {% block head %}
             <title>{% block title %}Redlib{% endblock %}</title>
-            <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
             <meta name="description" content="View on Redlib, an alternative private front-end to Reddit.">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             {% if crate::utils::disable_indexing() %}

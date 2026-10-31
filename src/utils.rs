@@ -1496,7 +1496,7 @@ pub fn val(j: &Value, k: &str) -> String {
 pub fn template(t: &impl Template) -> Response<Body> {
 	Response::builder()
 		.status(200)
-		.header("content-type", "text/html")
+		.header("content-type", "text/html; charset=utf-8")
 		.body(t.render().unwrap_or_default().into())
 		.unwrap_or_default()
 }
@@ -1504,7 +1504,7 @@ pub fn template(t: &impl Template) -> Response<Body> {
 pub fn redirect(path: &str) -> Response<Body> {
 	Response::builder()
 		.status(302)
-		.header("content-type", "text/html")
+		.header("content-type", "text/html; charset=utf-8")
 		.header("Location", path)
 		.body(format!("Redirecting to <a href=\"{path}\">{path}</a>...").into())
 		.unwrap_or_default()
@@ -1532,7 +1532,13 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 	.render()
 	.unwrap_or_default();
 
-	Ok(Response::builder().status(404).header("content-type", "text/html").body(body.into()).unwrap_or_default())
+	Ok(
+		Response::builder()
+			.status(404)
+			.header("content-type", "text/html; charset=utf-8")
+			.body(body.into())
+			.unwrap_or_default(),
+	)
 }
 
 /// Renders a generic info landing page.
@@ -1546,7 +1552,13 @@ pub async fn info(req: Request<Body>, msg: &str) -> Result<Response<Body>, Strin
 	.render()
 	.unwrap_or_default();
 
-	Ok(Response::builder().status(200).header("content-type", "text/html").body(body.into()).unwrap_or_default())
+	Ok(
+		Response::builder()
+			.status(200)
+			.header("content-type", "text/html; charset=utf-8")
+			.body(body.into())
+			.unwrap_or_default(),
+	)
 }
 
 /// Returns true if the config/env variable `REDLIB_SFW_ONLY` carries the
@@ -1654,7 +1666,13 @@ pub async fn nsfw_landing(req: Request<Body>, req_url: String) -> Result<Respons
 	.render()
 	.unwrap_or_default();
 
-	Ok(Response::builder().status(403).header("content-type", "text/html").body(body.into()).unwrap_or_default())
+	Ok(
+		Response::builder()
+			.status(403)
+			.header("content-type", "text/html; charset=utf-8")
+			.body(body.into())
+			.unwrap_or_default(),
+	)
 }
 
 /// Returns the last (non-empty) segment of a path string

@@ -204,7 +204,7 @@ pub fn quarantine(req: &Request<Body>, sub: String, restriction: &str) -> Respon
 
 	Response::builder()
 		.status(403)
-		.header("content-type", "text/html")
+		.header("content-type", "text/html; charset=utf-8")
 		.body(wall.render().unwrap_or_default().into())
 		.unwrap_or_default()
 }

@@ -115,6 +115,56 @@ fn url_attr(value: Option<&str>) -> String {
 	htmlescape::encode_minimal(&format_url(value))
 }
 
+#[cfg(test)]
+mod url_attr_tests {
+	use super::url_attr;
+
+	// Audit info item (gql.rs:110-116): browsers drop tabs and newlines from
+	// anywhere in a URL and C0 controls from its start before they read the
+	// scheme, so none of these were caught by trim() + starts_with("javascript:").
+	#[test]
+	fn test_url_attr_drops_script_urls_hidden_by_control_characters() {
+		for url in [
+			"javascript:alert(1)",
+			" JaVaScRiPt:alert(1)",
+			"\u{1}javascript:alert(1)",
+			"\u{0}javascript:alert(1)",
+			"java\tscript:alert(1)",
+			"java\nscript:alert(1)",
+			"jav\rascript:alert(1)",
+			"javascript\n:alert(1)",
+		] {
+			assert_eq!(url_attr(Some(url)), "", "{url:?}");
+		}
+	}
+
+	#[test]
+	fn test_url_attr_only_allows_web_and_mail_schemes() {
+		for url in [
+			"data:text/html,<script>alert(1)</script>",
+			"vbscript:msgbox(1)",
+			"file:///etc/passwd",
+			"intent://x#Intent;end",
+			"blob:https://example.com/x",
+		] {
+			assert_eq!(url_attr(Some(url)), "", "{url:?}");
+		}
+	}
+
+	#[test]
+	fn test_url_attr_keeps_ordinary_urls() {
+		assert_eq!(url_attr(Some("https://example.com/a?b=c&d=e")), "https://example.com/a?b=c&amp;d=e");
+		assert_eq!(url_attr(Some("HTTP://example.com/")), "HTTP://example.com/");
+		assert_eq!(url_attr(Some("mailto:someone@example.com")), "mailto:someone@example.com");
+		assert_eq!(url_attr(Some("/r/rust")), "/r/rust");
+		assert_eq!(url_attr(Some("#fn1")), "#fn1");
+		assert_eq!(url_attr(Some("//example.com/x")), "//example.com/x");
+		assert_eq!(url_attr(Some("example.com/a:b")), "example.com/a:b");
+		assert_eq!(url_attr(Some("  https://example.com/  ")), "https://example.com/");
+		assert_eq!(url_attr(None), "");
+	}
+}
+
 async fn comments(id: &str, comment_id: Option<String>, path: &str) -> Result<Vec<Value>, String> {
 	let sort = param(path, "sort").filter(|s| !s.is_empty()).unwrap_or_else(|| "confidence".to_string());
 	let mut variables = json_value!({

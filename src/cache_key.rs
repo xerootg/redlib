@@ -343,3 +343,49 @@ mod review_tests {
 		assert!(fetched.is_err_and(|e| e.contains("too long")));
 	}
 }
+
+// Second review of the fix for audit finding #17, minor points.
+#[cfg(test)]
+mod thread_tests {
+	use super::*;
+
+	// `comments` anywhere in the path was taken for a thread.
+	#[test]
+	fn test_a_sub_or_wiki_page_named_comments_is_not_a_thread() {
+		assert_ne!(entry_key("/r/comments/comments/AAA.json"), entry_key("/r/comments/comments/BBB.json"));
+		assert_ne!(entry_key("/r/comments/hot.json"), entry_key("/r/comments/new.json"));
+		assert_ne!(entry_key("/r/rust/wiki/comments/x/y.json"), entry_key("/r/rust/wiki/comments/x/z.json"));
+		assert_ne!(entry_key("/user/comments/about.json"), entry_key("/user/comments/submitted.json"));
+		// the threads still are
+		assert_eq!(entry_key("/r/comments/comments/AAA/one.json"), entry_key("/r/Comments/comments/AAA/two.json"));
+		assert_eq!(entry_key("/comments/AAA/one.json"), entry_key("/comments/AAA/two.json"));
+		assert_eq!(entry_key("/user/x/comments/AAA/one.json"), entry_key("/user/x/comments/AAA/two.json"));
+	}
+
+	// Reddit ignores these on a thread, and each value was a fetch of the page.
+	#[test]
+	fn test_a_thread_has_only_the_parameters_it_reads() {
+		let bare = fetch_key("/r/rust/comments/abc.json?raw_json=1&sort=top");
+		for n in 0..5 {
+			for query in ["after", "before", "q", "geo_filter", "count"] {
+				assert_eq!(fetch_key(&format!("/r/rust/comments/abc.json?raw_json=1&sort=top&{query}=v{n}")), bare, "{query}");
+			}
+		}
+		assert_eq!(fetch_key("/comments/abc.json?raw_json=1&sort=top&after=1"), fetch_key("/comments/abc.json?raw_json=1&sort=top"));
+		let kept = fetch_key("/r/rust/comments/abc.json?context=3&depth=5&limit=100&more_cursor=c&more_query=top&raw_json=1&sort=top");
+		assert_eq!(kept.as_deref(), Some("/r/rust/comments/abc.json?context=3&depth=5&limit=100&more_cursor=c&more_query=top&raw_json=1&sort=top"));
+		// listings keep them
+		assert_ne!(fetch_key("/r/rust/hot.json?after=t3_a"), fetch_key("/r/rust/hot.json"));
+		assert_ne!(fetch_key("/r/rust/comments.json?after=t1_a"), fetch_key("/r/rust/comments.json"));
+	}
+
+	// The duplicates page sorts by num_comments (duplicates.rs), which Reddit
+	// then does not take for the default.
+	#[test]
+	fn test_the_duplicates_sort_is_kept() {
+		assert_eq!(
+			fetch_key("/duplicates/abc.json?sort=num_comments&raw_json=1").as_deref(),
+			Some("/duplicates/abc.json?raw_json=1&sort=num_comments")
+		);
+	}
+}

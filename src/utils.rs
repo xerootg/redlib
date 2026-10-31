@@ -898,10 +898,21 @@ pub fn deflate_compress(i: Vec<u8>) -> Result<Vec<u8>, String> {
 	e.finish().into_result().map_err(|e| e.to_string())
 }
 
+/// Most a settings code may inflate to. Real codes are a few KB; the cap stops a
+/// small body from expanding into hundreds of MB.
+const MAX_INFLATED_PREFS_LEN: u64 = 64 * 1024;
+
 pub fn deflate_decompress(i: Vec<u8>) -> Result<Vec<u8>, String> {
-	let mut decoder = Decoder::new(&i[..]);
+	let decoder = Decoder::new(&i[..]);
 	let mut out = Vec::new();
-	decoder.read_to_end(&mut out).map_err(|e| format!("Failed to read from gzip decoder: {e}"))?;
+	// Read one byte past the cap so overflow is told apart from an exact fit.
+	decoder
+		.take(MAX_INFLATED_PREFS_LEN + 1)
+		.read_to_end(&mut out)
+		.map_err(|e| format!("Failed to read from gzip decoder: {e}"))?;
+	if out.len() as u64 > MAX_INFLATED_PREFS_LEN {
+		return Err(format!("Decompressed data exceeds {MAX_INFLATED_PREFS_LEN} bytes"));
+	}
 	Ok(out)
 }
 

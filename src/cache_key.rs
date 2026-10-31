@@ -293,7 +293,11 @@ mod normalize_tests {
 			"t=",
 		] {
 			// a thread reads only some of them
-			let path = if ["t=", "type=", "restrict_sr="].iter().any(|name| query.starts_with(name)) { "search" } else { "comments/abc" };
+			let path = if ["t=", "type=", "restrict_sr="].iter().any(|name| query.starts_with(name)) {
+				"search"
+			} else {
+				"comments/abc"
+			};
 			let key = fetch_key(&format!("/r/rust/{path}.json?{query}&raw_json=1"));
 			let bare = fetch_key(&format!("/r/rust/{path}.json?raw_json=1"));
 			assert_ne!(key, bare, "{query}");
@@ -396,9 +400,15 @@ mod thread_tests {
 				assert_eq!(fetch_key(&format!("/r/rust/comments/abc.json?raw_json=1&sort=top&{query}=v{n}")), bare, "{query}");
 			}
 		}
-		assert_eq!(fetch_key("/comments/abc.json?raw_json=1&sort=top&after=1"), fetch_key("/comments/abc.json?raw_json=1&sort=top"));
+		assert_eq!(
+			fetch_key("/comments/abc.json?raw_json=1&sort=top&after=1"),
+			fetch_key("/comments/abc.json?raw_json=1&sort=top")
+		);
 		let kept = fetch_key("/r/rust/comments/abc.json?context=3&depth=5&limit=100&more_cursor=c&more_query=top&raw_json=1&sort=top");
-		assert_eq!(kept.as_deref(), Some("/r/rust/comments/abc.json?context=3&depth=5&limit=100&more_cursor=c&more_query=top&raw_json=1&sort=top"));
+		assert_eq!(
+			kept.as_deref(),
+			Some("/r/rust/comments/abc.json?context=3&depth=5&limit=100&more_cursor=c&more_query=top&raw_json=1&sort=top")
+		);
 		// listings keep them
 		assert_ne!(fetch_key("/r/rust/hot.json?after=t3_a"), fetch_key("/r/rust/hot.json"));
 		assert_ne!(fetch_key("/r/rust/comments.json?after=t1_a"), fetch_key("/r/rust/comments.json"));

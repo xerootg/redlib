@@ -545,7 +545,8 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 	}
 }
 
-pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperResponse<Body>, String> {
+/// Fills the route parameters of `req` into `format` and parses the result.
+fn proxy_url(req: &HyperRequest<Body>, format: &str) -> Result<wreq::Uri, String> {
 	let mut url = format!("{format}?{}", req.uri().query().unwrap_or_default());
 
 	// For each parameter in request
@@ -555,7 +556,11 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 	}
 
 	// First parameter is target URL (mandatory).
-	let wreq_uri = wreq::Uri::try_from(url).map_err(|_| "Couldn't parse URL".to_string())?;
+	wreq::Uri::try_from(url).map_err(|_| "Couldn't parse URL".to_string())
+}
+
+pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperResponse<Body>, String> {
+	let wreq_uri = proxy_url(&req, format)?;
 
 	let mut builder = CLIENT.load_full().get(wreq_uri);
 

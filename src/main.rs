@@ -12,7 +12,7 @@ use log::{info, warn};
 use redlib::body::Body;
 use redlib::client::{canonical_path, proxy, CLIENT};
 use redlib::server::{self, RequestExt};
-use redlib::utils::{error, get_source_url, redirect, ThemeAssets};
+use redlib::utils::{error, get_source_url, redirect, redirect_local, ThemeAssets};
 use redlib::{config, duplicates, headers, instance_info, post, search, settings, subreddit, user};
 
 use redlib::client::OAUTH_CLIENT;
@@ -445,7 +445,7 @@ async fn main() {
 			match req.param("id").as_deref() {
 				// Subreddit post share link
 				Some(id) if (8..12).contains(&id.len()) => match canonical_path(format!("/r/{sub}/s/{id}"), 3).await {
-					Ok(Some(path)) => Ok(redirect(&path)),
+					Ok(Some(path)) => Ok(redirect_local(&path)),
 					Ok(None) => error(req, "Post ID is invalid. It may point to a post on a community that has been banned.").await,
 					Err(e) => error(req, &e).await,
 				},
@@ -461,7 +461,7 @@ async fn main() {
 			match req.param("id").as_deref() {
 				// User post share link
 				Some(id) if (8..12).contains(&id.len()) => match canonical_path(format!("/u/{name}/s/{id}"), 3).await {
-					Ok(Some(path)) => Ok(redirect(&path)),
+					Ok(Some(path)) => Ok(redirect_local(&path)),
 					Ok(None) => error(req, "Post ID is invalid. It may point to a post on a user that has been banned.").await,
 					Err(e) => error(req, &e).await,
 				},
@@ -481,7 +481,7 @@ async fn main() {
 				// Short link for post
 				Some(id) if (5..8).contains(&id.len()) => match canonical_path(format!("/comments/{id}"), 3).await {
 					Ok(path_opt) => match path_opt {
-						Some(path) => Ok(redirect(&path)),
+						Some(path) => Ok(redirect_local(&path)),
 						None => error(req, "Post ID is invalid. It may point to a post on a community that has been banned.").await,
 					},
 					Err(e) => error(req, &e).await,

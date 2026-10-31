@@ -2,8 +2,9 @@
 
 use crate::body::Body;
 use crate::utils::{
-	build_rss_items, catch_random, clean_url, enable_rss, error, filter_posts, format_num, format_url, get_filters, info, nsfw_landing, param, redirect, rewrite_urls,
-	rss_page_link, rss_page_path, rss_response, setting, setting_or_default, should_be_nsfw_gated, template, val, Post, Preferences, Subreddit, RSS_LISTING_SORTS,
+	build_rss_items, catch_random, clean_url, enable_rss, error, filter_posts, format_num, format_url, get_filters, info, local_path, nsfw_landing, param, redirect,
+	redirect_local, rewrite_urls, rss_page_link, rss_page_path, rss_response, setting, setting_or_default, should_be_nsfw_gated, template, val, Post, Preferences, Subreddit,
+	RSS_LISTING_SORTS,
 };
 use crate::{backends::json, server::RequestExt, server::ResponseExt};
 use askama::Template;
@@ -212,7 +213,7 @@ pub fn quarantine(req: &Request<Body>, sub: String, restriction: &str) -> Respon
 pub async fn add_quarantine_exception(req: Request<Body>) -> Result<Response<Body>, String> {
 	let subreddit = req.param("sub").ok_or("Invalid URL")?;
 	let redir = param(&format!("?{}", req.uri().query().unwrap_or_default()), "redir").ok_or("Invalid URL")?;
-	let mut response = redirect(&redir);
+	let mut response = redirect_local(&redir);
 	response.insert_cookie(
 		Cookie::build((&format!("allow_quaran_{}", subreddit.to_lowercase()), "true"))
 			.path("/")
@@ -266,10 +267,9 @@ pub fn join_until_size_limit<T: std::fmt::Display>(vec: &[T]) -> Vec<std::string
 /// Where to send the user after subscribing or filtering: back to the subreddit
 /// or, when unsubscribing/unfiltering from outside the sidebar, to the `redirect` parameter
 fn subscription_redirect(sub: &str, query: &str) -> String {
-	if let Some(redirect_path) = param(&format!("?{query}"), "redirect") {
-		format!("/{redirect_path}")
-	} else {
-		format!("/r/{sub}")
+	match param(&format!("?{query}"), "redirect").as_deref().and_then(local_path) {
+		Some(path) => path,
+		None => format!("/r/{sub}"),
 	}
 }
 

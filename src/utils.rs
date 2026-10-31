@@ -1501,6 +1501,44 @@ pub fn template(t: &impl Template) -> Response<Body> {
 		.unwrap_or_default()
 }
 
+/// Turns a user-supplied redirect target into a path on this instance, or `None`.
+///
+/// A relative value such as `r/rust` gets its leading slash. The result always starts with a
+/// single `/`, so a browser can never read it as `//host`, `/\host` or `scheme:...`. Control
+/// characters, whitespace and backslashes are rejected, and so is an encoded slash or backslash
+/// right after the first `/`, in case something downstream decodes the path a second time.
+pub fn local_path(value: &str) -> Option<String> {
+	let path = if value.starts_with('/') {
+		value.to_owned()
+	} else {
+		// `https://host` and `javascript:...` are not relative paths
+		if value.split(['/', '?', '#']).next().unwrap_or_default().contains(':') {
+			return None;
+		}
+		format!("/{value}")
+	};
+
+	if matches!(path.as_bytes().get(1), Some(b'/' | b'\\')) {
+		return None;
+	}
+	if path.chars().any(|c| c == '\\' || c.is_control() || c.is_whitespace()) {
+		return None;
+	}
+	if path[1..]
+		.get(..3)
+		.is_some_and(|prefix| prefix.eq_ignore_ascii_case("%2f") || prefix.eq_ignore_ascii_case("%5c"))
+	{
+		return None;
+	}
+
+	Some(path)
+}
+
+/// Redirects to `path` when it is a path on this instance (see [`local_path`]), otherwise to `/`
+pub fn redirect_local(path: &str) -> Response<Body> {
+	redirect(&local_path(path).unwrap_or_else(|| "/".to_string()))
+}
+
 pub fn redirect(path: &str) -> Response<Body> {
 	Response::builder()
 		.status(302)
@@ -1939,6 +1977,82 @@ fn get_mime_type(url: &str) -> &'static str {
 		"webp" => "image/webp",
 		"svg" => "image/svg+xml",
 		_ => "application/octet-stream",
+	}
+}
+
+#[cfg(test)]
+mod local_path_tests {
+	use super::{local_path, redirect_local};
+
+	#[test]
+	fn accepts_paths_on_the_instance() {
+		assert_eq!(local_path("/"), Some("/".to_string()));
+		assert_eq!(local_path("/settings"), Some("/settings".to_string()));
+		assert_eq!(
+			local_path("/r/rust/comments/abc/a_title?sort=top&t=week#c"),
+			Some("/r/rust/comments/abc/a_title?sort=top&t=week#c".to_string())
+		);
+		assert_eq!(local_path("/r/rust/search?q=a:b"), Some("/r/rust/search?q=a:b".to_string()));
+		assert_eq!(local_path("/r/%C3%A9"), Some("/r/%C3%A9".to_string()));
+		assert_eq!(local_path("/r/rust%2Fhot"), Some("/r/rust%2Fhot".to_string()));
+	}
+
+	#[test]
+	fn adds_the_leading_slash_to_relative_values() {
+		assert_eq!(local_path("settings"), Some("/settings".to_string()));
+		assert_eq!(local_path("r/rust?x=a:b"), Some("/r/rust?x=a:b".to_string()));
+		assert_eq!(local_path(""), Some("/".to_string()));
+	}
+
+	#[test]
+	fn rejects_other_origins() {
+		for bad in [
+			"//evil.example",
+			"///evil.example",
+			"//evil.example/path",
+			"/\\evil.example",
+			"\\evil.example",
+			"\\\\evil.example",
+			"https://evil.example",
+			"http://evil.example/",
+			"javascript:alert(1)",
+			"data:text/html,x",
+			"evil.example:80/x",
+			"/%2F%2Fevil.example",
+			"/%2fevil.example",
+			"/%5Cevil.example",
+			"/%5cevil.example",
+		] {
+			assert_eq!(local_path(bad), None, "{bad:?}");
+		}
+	}
+
+	#[test]
+	fn rejects_control_characters_and_whitespace() {
+		for bad in [
+			"/ok\r\nSet-Cookie: a=b",
+			"/ok\nx",
+			"/ok\rx",
+			"/ok\0x",
+			"/ok\tx",
+			"/ok x",
+			"/ok\u{a0}x",
+			"/ok\u{85}x",
+			"/\t/evil.example",
+			"/\u{b}/evil.example",
+		] {
+			assert_eq!(local_path(bad), None, "{bad:?}");
+		}
+	}
+
+	#[test]
+	fn redirect_local_falls_back_to_the_front_page() {
+		assert_eq!(redirect_local("/r/rust").headers()["location"], "/r/rust");
+		for bad in ["//evil.example", "/\\evil.example", "https://evil.example", "/a\r\nSet-Cookie: x=1"] {
+			let res = redirect_local(bad);
+			assert_eq!(res.status(), 302, "{bad:?}");
+			assert_eq!(res.headers()["location"], "/", "{bad:?}");
+		}
 	}
 }
 

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::body::Body;
 use crate::server::ResponseExt;
 use crate::subreddit::join_until_size_limit;
-use crate::utils::{deflate_decompress, redirect, template, Preferences};
+use crate::utils::{deflate_decompress, local_path, redirect, template, Preferences};
 use askama::Template;
 use cookie::Cookie;
 use hyper::{Request, Response};
@@ -313,10 +313,7 @@ pub async fn get(req: Request<Body>) -> Result<Response<Body>, String> {
 	Ok(template(&SettingsTemplate {
 		prefs: Preferences::new(&req),
 		url,
-		return_url: match form.get("return_to") {
-			Some(url) => url.clone().to_string(),
-			None => String::new(),
-		},
+		return_url: form.get("return_to").and_then(|url| local_path(url)).unwrap_or_default(),
 	}))
 }
 
@@ -343,7 +340,7 @@ pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 			if value.is_empty() {
 				redirect("/settings")
 			} else {
-				redirect(value)
+				redirect(&local_path(value).unwrap_or_else(|| "/settings".to_string()))
 			}
 		}
 		None => redirect("/settings"),
@@ -384,11 +381,7 @@ fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body
 	let path = match form.get("redirect") {
 		Some(value) => {
 			let value = value.replace("%26", "&").replace("%23", "#");
-			if value.starts_with('/') {
-				value
-			} else {
-				format!("/{value}")
-			}
+			local_path(&value).unwrap_or_else(|| "/".to_string())
 		}
 		None => "/".to_string(),
 	};

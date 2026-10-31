@@ -2,7 +2,7 @@ use crate::body::Body;
 use crate::cache_key;
 use crate::config::get_setting;
 use crate::dbg_msg;
-use crate::oauth::{token_daemon, Oauth};
+use crate::oauth::{force_refresh_token, token_daemon, Oauth};
 use crate::server::RequestExt;
 use crate::utils::format_url;
 use arc_swap::ArcSwap;
@@ -62,9 +62,10 @@ pub(crate) fn block_on_shared<F: std::future::Future>(future: F) -> F::Output {
 pub static OAUTH_CLIENT: LazyLock<ArcSwap<Oauth>> = LazyLock::new(|| {
 	// A token endpoint that is down at the start is no reason to refuse to
 	// serve settings, login and static pages: start without a token, and
-	// token_daemon fetches one.
-	let client = block_on(Oauth::try_new()).unwrap_or_else(|| {
+	// fetch one in the background.
+	let client = block_on(Oauth::try_new_at_startup()).unwrap_or_else(|| {
 		log::error!("[⛔] Starting without an OAuth token; will keep trying");
+		tokio::spawn(force_refresh_token());
 		Oauth::without_token()
 	});
 	tokio::spawn(token_daemon());

@@ -28,6 +28,9 @@ const AUTH_ENDPOINT: &str = "https://www.reddit.com";
 
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long startup waits for the first token before it serves without one.
+const STARTUP_WAIT: Duration = Duration::from_secs(30);
+
 /// Failed attempts after which a token request gives up.
 const MAX_ATTEMPTS: u32 = 10;
 
@@ -89,12 +92,6 @@ pub struct Oauth {
 }
 
 impl Oauth {
-	/// Create a new OAuth client, or `None` when Reddit's token endpoint
-	/// kept failing. Callers keep the client they have and try again later.
-	pub(crate) async fn try_new() -> Option<Self> {
-		Self::new_with(Self::new_with_timeout_with_backend, OAUTH_TIMEOUT).await
-	}
-
 	/// A client without a token, for a start while the token endpoint is
 	/// down. Requests made with it fail with 401, which starts a refresh,
 	/// and `token_daemon` (which waits `expires_in` minus two minutes) tries
@@ -108,14 +105,19 @@ impl Oauth {
 		}
 	}
 
+	/// The first client, for startup: `None` when no token came within
+	/// `STARTUP_WAIT`.
+	pub(crate) async fn try_new_at_startup() -> Option<Self> {
+		Self::new_within(STARTUP_WAIT, Self::new_with_timeout_with_backend, OAUTH_TIMEOUT).await
+	}
+
 	/// `new_with`, but gives up after `wait`.
-	#[allow(dead_code)]
-	async fn new_within<F, Fut>(_wait: Duration, _attempt: F, _pause: Duration) -> Option<Self>
+	async fn new_within<F, Fut>(wait: Duration, attempt: F, pause: Duration) -> Option<Self>
 	where
 		F: FnMut(OauthBackendImpl) -> Fut,
 		Fut: std::future::Future<Output = Result<Result<Self, AuthError>, Elapsed>>,
 	{
-		None
+		timeout(wait, Self::new_with(attempt, pause)).await.ok().flatten()
 	}
 
 	/// Calls `attempt` until it yields a client, waiting `pause` (doubled

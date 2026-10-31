@@ -210,9 +210,9 @@ fn refresh_delay(expires_in: u64) -> Duration {
 	Duration::from_secs(expires_in.saturating_sub(120)).max(MIN_REFRESH_DELAY)
 }
 
-/// The start of a token, for the log.
+/// The first 32 characters of a token, for the log.
 fn token_preview(token: &str) -> &str {
-	&token[..32]
+	token.char_indices().nth(32).map_or(token, |(end, _)| &token[..end])
 }
 
 pub async fn token_daemon() {
@@ -479,11 +479,7 @@ impl OauthBackend for GenericWebAuth {
 			.ok_or_else(|| field("token_v2 cookie"))?;
 		let expires_in = token_lifetime(&token).ok_or_else(|| field("token_v2 expiry"))?;
 
-		info!(
-			"[✅] GenericWebAuth success - Retrieved token \"{}...\", expires in {}",
-			&token[..32.min(token.len())],
-			expires_in
-		);
+		info!("[✅] GenericWebAuth success - Retrieved token \"{}...\", expires in {}", token_preview(&token), expires_in);
 
 		// Insert a few necessary headers
 		self.additional_headers.insert("Origin".to_owned(), "https://www.reddit.com".to_owned());

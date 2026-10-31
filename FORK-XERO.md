@@ -25,7 +25,22 @@ the same data from the Android app's GraphQL API instead. Everything in
 | `port-fix-download-audio` | `nachtalb-base` | Labels video downloads that have no audio track. |
 | `port-fix-missing-comment-notice` | `nachtalb-base` | Explains permalinks to removed or missing comments. |
 | `port-fix-quarantine-access` | `nachtalb-base` | Explains why quarantined subreddits are empty without an account. |
+| `gate-exact-paths` | `harden-oidc` | The gate exempts exactly `/oidc/login`, `/oidc/callback`, `/oidc/logout` and `/healthz`, not every `/oidc/` path. |
+| `feat-read-token` | `gate-exact-paths` | `REDLIB_READ_TOKEN`: a bearer token for in-cluster readers (mcp-reddit), GET/HEAD only, never `/settings`, `/mcp` or `/oidc`. |
+| `fix-oidc-observability` | `gate-exact-paths` | Logs gate denials (rate-limited) and first passes per client, and keeps the query string across login. |
+| `fix-compress-dos` | `nachtalb-base` | No memoised Accept-Encoding, digest cache keys, brotli off the async worker at quality 5. |
+| `fix-settings-bounds` | `nachtalb-base` | Bounded settings-code decoding, capped inflate, a request body limit. |
+| `fix-safe-redirects` | `nachtalb-base` | One same-origin redirect check everywhere, settings links confirm before acting, cross-site POSTs refused. |
+| `fix-pref-validation` | `nachtalb-base` | Allowlisted preference values and subreddit names, so cookies can't carry attributes or odd API paths. |
+| `fix-user-listing-allowlist` | `nachtalb-base` | Account-only listings never reach a backend. Known gap: non-ASCII spellings of `mod`/`friends` (only matters with a Reddit session). |
+| `fix-proxy-hardening` | `nachtalb-base` | Media proxy host allowlist, outbound timeouts, redirect hop limit, header allowlist. |
+| `fix-info-allowlist` | `nachtalb-base` | `/info` and `/info.json` show an explicit allowlist of settings, so new fields stay private by default. |
+| `fix-html-charset` | `nachtalb-base` | `charset=utf-8` on every HTML response, `<meta charset>` first. |
+| `fix-robustness` | `nachtalb-base` | Byte-bounded fetch cache with normalised keys, no `process::exit` on OAuth refresh failure, assorted panics and parsing fixes. |
+| `fix-ci-supply-chain` | `port-ci` | Actions and base images pinned by digest, Dependabot, `cargo deny check advisories` in CI. |
 | `port-docs` | `nachtalb-base` | This file. |
+
+Not merged yet: `fix-cookie-parse` (numbered-cookie parsing; its review found remaining linear work and a flaky test).
 
 Every carried branch is one or more pairs of commits: a test that fails
 without the change, then the change. Keep it that way, so a branch can be

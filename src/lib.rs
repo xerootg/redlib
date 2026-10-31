@@ -1,5 +1,6 @@
 pub mod backends;
 pub mod body;
+pub mod byte_cache;
 pub mod cache_key;
 pub mod client;
 pub mod config;

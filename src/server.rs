@@ -799,6 +799,75 @@ fn compress_body(compressor: CompressionType, body_bytes: Vec<u8>) -> Result<Vec
 }
 
 #[cfg(test)]
+mod path_normalization_tests {
+	use super::*;
+	use route_recognizer::Router as RouteRecognizer;
+
+	/// Spellings of `/mcp` that only collapse to it after more than one round
+	/// of removing doubled slashes, decoding `%2F` and trimming slashes.
+	const MCP_SPELLINGS: [&str; 9] = [
+		"/%2Fmcp",
+		"//%2Fmcp",
+		"/%2F/mcp",
+		"/%2F%2Fmcp",
+		"///mcp",
+		"/mcp%2F%2F",
+		"/mcp///",
+		"/mcp/%2F",
+		"/%2F%2F%2Fmcp%2F%2F%2F",
+	];
+
+	// Audit info item: path normalisation is single-pass (server.rs:337-347).
+	// The OIDC gate scopes the MCP bearer token to exactly `/mcp` on the
+	// normalised path, so the gate and the router must see one stable form.
+	#[test]
+	fn normalising_a_path_twice_changes_nothing() {
+		for raw in MCP_SPELLINGS
+			.into_iter()
+			.chain(["/", "//", "/%2F", "/r/rust//", "/r/rust%2F%2F", "/a/%2F/b", "/a/.rss", "/a//.rss", "/a%2F.rss%2F", "/.rss/"])
+		{
+			let once = normalize_path(raw);
+			assert_eq!(normalize_path(&once), once, "{raw:?} normalised to {once:?}, which normalises again");
+		}
+	}
+
+	#[test]
+	fn every_spelling_of_mcp_normalises_to_mcp() {
+		for raw in MCP_SPELLINGS {
+			assert_eq!(normalize_path(raw), "/mcp", "{raw:?}");
+		}
+	}
+
+	#[test]
+	fn ordinary_paths_are_unchanged() {
+		for (raw, want) in [
+			("/", "/"),
+			("/r/rust", "/r/rust"),
+			("/r/rust/", "/r/rust"),
+			("/r//rust", "/r/rust"),
+			("/r%2Frust", "/r/rust"),
+			("/r/rust/top/.rss", "/r/rust/top.rss"),
+			("/mcp/other", "/mcp/other"),
+			("/mcpx", "/mcpx"),
+		] {
+			assert_eq!(normalize_path(raw), want, "{raw:?}");
+		}
+	}
+
+	// The reverse of the above: the router must not be more generous than the
+	// gate. A path the gate does not see as `/mcp` must not route to it.
+	#[test]
+	fn the_router_does_not_read_unnormalised_slashes_as_mcp() {
+		let mut router = RouteRecognizer::new();
+		router.add("/GET/mcp", ());
+		assert!(router.recognize("/GET/mcp").is_ok());
+		for raw in ["//mcp", "/mcp/", "///mcp"] {
+			assert!(router.recognize(&format!("/GET{raw}")).is_err(), "{raw}");
+		}
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use brotli::Decompressor as BrotliDecompressor;

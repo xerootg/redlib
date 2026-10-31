@@ -673,14 +673,18 @@ fn send_to_reddit(
 	}
 }
 
+/// Most redirects `follow_redirects` follows before it gives up. Reddit sends
+/// a handful at most (a short link, then the canonical path).
+const MAX_REDIRECTS: usize = 10;
+
 /// Sends the request for `path` with `send` and, if `redirect` is `true`,
-/// follows the redirects Reddit answers with.
+/// follows the redirects Reddit answers with, up to `MAX_REDIRECTS`.
 async fn follow_redirects<F, Fut>(mut path: String, redirect: bool, send: F) -> Result<WreqResponse, String>
 where
 	F: Fn(String) -> Fut,
 	Fut: std::future::Future<Output = Result<WreqResponse, String>>,
 {
-	loop {
+	for _ in 0..=MAX_REDIRECTS {
 		let response = send(path).await?;
 
 		// Reddit may respond with a 3xx. Decide whether or not to
@@ -714,6 +718,7 @@ where
 			})
 			.unwrap_or_default();
 	}
+	Err("Too many redirects".to_string())
 }
 
 pub(crate) trait IntoHyperResponse {

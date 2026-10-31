@@ -263,7 +263,6 @@ pub fn join_until_size_limit<T: std::fmt::Display>(vec: &[T]) -> Vec<std::string
 	result
 }
 
-// Sub, filter, unfilter, or unsub by setting subscription cookie using response "Set-Cookie" header
 /// Adds a removal for `{base}{start}`, `{base}{start + 1}`, ... for as long as the request carries them
 /// (at most up to `MAX_NUMBERED_COOKIES`, the most that `setting()` reads)
 fn remove_numbered_cookies(req: &Request<Body>, response: &mut Response<Body>, base: &str, start: usize) {
@@ -272,6 +271,32 @@ fn remove_numbered_cookies(req: &Request<Body>, response: &mut Response<Body>, b
 	}
 }
 
+#[cfg(test)]
+mod numbered_cookie_removal_tests {
+	use super::remove_numbered_cookies;
+	use crate::body::Body;
+	use hyper::{Request, Response};
+
+	// The security audit's payload: "name=a; name1=a; ...; name{count-1}=a"
+	fn request_with_numbered_cookies(name: &str, count: usize) -> Request<Body> {
+		let mut cookies = format!("{name}=a");
+		for n in 1..count {
+			cookies.push_str(&format!("; {name}{n}=a"));
+		}
+		Request::builder().uri("/").header("Cookie", cookies).body(Body::empty()).unwrap()
+	}
+
+	#[test]
+	fn removing_numbered_cookies_is_capped() {
+		// Every lookup re-parsed the whole Cookie header: 18000 cookies stalled POST /r/x/unsubscribe for 66 s
+		let req = request_with_numbered_cookies("subscriptions", 3000);
+		let mut response = Response::new(Body::empty());
+		remove_numbered_cookies(&req, &mut response, "subscriptions", 1);
+		assert_eq!(response.headers().get_all("Set-Cookie").iter().count(), 64);
+	}
+}
+
+// Sub, filter, unfilter, or unsub by setting subscription cookie using response "Set-Cookie" header
 pub async fn subscriptions_filters(req: Request<Body>) -> Result<Response<Body>, String> {
 	let sub = req.param("sub").unwrap_or_default();
 	let action: Vec<String> = req.uri().path().split('/').map(String::from).collect();
@@ -667,30 +692,5 @@ mod tests {
 			let gated = subreddit("drugs", true).await;
 			assert!(gated.is_ok());
 		});
-	}
-}
-
-#[cfg(test)]
-mod numbered_cookie_removal_tests {
-	use super::remove_numbered_cookies;
-	use crate::body::Body;
-	use hyper::{Request, Response};
-
-	// The security audit's payload: "name=a; name1=a; ...; name{count-1}=a"
-	fn request_with_numbered_cookies(name: &str, count: usize) -> Request<Body> {
-		let mut cookies = format!("{name}=a");
-		for n in 1..count {
-			cookies.push_str(&format!("; {name}{n}=a"));
-		}
-		Request::builder().uri("/").header("Cookie", cookies).body(Body::empty()).unwrap()
-	}
-
-	#[test]
-	fn removing_numbered_cookies_is_capped() {
-		// Every lookup re-parsed the whole Cookie header: 18000 cookies stalled POST /r/x/unsubscribe for 66 s
-		let req = request_with_numbered_cookies("subscriptions", 3000);
-		let mut response = Response::new(Body::empty());
-		remove_numbered_cookies(&req, &mut response, "subscriptions", 1);
-		assert_eq!(response.headers().get_all("Set-Cookie").iter().count(), 64);
 	}
 }

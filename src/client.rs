@@ -619,11 +619,19 @@ const PROXY_RESPONSE_HEADERS: &[&str] = &[
 
 /// Whether `content_type` is something the media proxy serves: images, video,
 /// audio, fonts and the streaming playlists. Pages, scripts and SVG are not,
-/// since the proxy serves from redlib's own origin.
-fn proxy_content_type_allowed(content_type: Option<&header::HeaderValue>) -> bool {
-	let Some(content_type) = content_type.and_then(|value| value.to_str().ok()) else {
+/// since the proxy serves from redlib's own origin. There must be exactly one
+/// `Content-Type` and no list in it: browsers use the last valid entry.
+fn proxy_content_type_allowed(headers: &header::HeaderMap) -> bool {
+	let mut values = headers.get_all(header::CONTENT_TYPE).iter();
+	let (Some(content_type), None) = (values.next(), values.next()) else {
 		return false;
 	};
+	let Ok(content_type) = content_type.to_str() else {
+		return false;
+	};
+	if content_type.contains(',') {
+		return false;
+	}
 	let media_type = content_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase();
 	media_type != "image/svg+xml"
 		&& (["image/", "video/", "audio/", "font/"].iter().any(|prefix| media_type.starts_with(prefix))
@@ -645,7 +653,7 @@ fn restrict_proxy_response(mut res: HyperResponse<Body>) -> HyperResponse<Body> 
 	let status = res.status();
 	// A 304 answers a conditional request and has no body or type.
 	let not_modified = status == hyper::StatusCode::NOT_MODIFIED;
-	if !not_modified && (status.is_redirection() || !proxy_content_type_allowed(res.headers().get(header::CONTENT_TYPE))) {
+	if !not_modified && (status.is_redirection() || !proxy_content_type_allowed(res.headers())) {
 		return if status.is_client_error() || status.is_server_error() {
 			proxy_error(status.as_u16(), "Upstream error")
 		} else {

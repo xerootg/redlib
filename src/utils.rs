@@ -2033,6 +2033,20 @@ fn get_mime_type(url: &str) -> &'static str {
 }
 
 #[cfg(test)]
+mod referrer_policy_tests {
+	/// A browser puts `Origin: null` on a same-origin form POST when the page was served with
+	/// `Referrer-Policy: no-referrer`. Browsers without `Sec-Fetch-Site` rely on `Origin` alone to
+	/// show a POST is same-origin (see `is_same_origin_post`), so the policy has to keep it, while
+	/// still sending no Referer to other sites.
+	#[test]
+	fn default_policy_keeps_origin_on_same_origin_posts() {
+		let main = include_str!("main.rs");
+		let line = main.lines().find(|line| line.contains("\"Referrer-Policy\"")).expect("main.rs sets a Referrer-Policy");
+		assert!(line.contains("=> \"same-origin\""), "{line}");
+	}
+}
+
+#[cfg(test)]
 mod origin_check_tests {
 	use super::{is_same_origin_post, reject_cross_site_post};
 	use crate::body::Body;

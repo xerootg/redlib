@@ -681,6 +681,43 @@ mod redirect_tests {
 
 /// POSTs that change preferences must come from a page on this instance (audit finding #9)
 #[cfg(test)]
+mod confirm_page_tests {
+	use super::*;
+	use futures_lite::future::block_on;
+
+	fn get(uri: &str) -> Request<Body> {
+		Request::builder().method("GET").uri(uri).header("host", "redlib.example").body(Body::empty()).unwrap()
+	}
+
+	fn body_of(res: Response<Body>) -> String {
+		String::from_utf8(block_on(res.into_body().collect_bytes()).unwrap().to_vec()).unwrap()
+	}
+
+	/// Routing collapses `//` in the path before a handler runs, but the handler sees the raw URI:
+	/// the form action must not be taken from it, or `//settings//restore` becomes a
+	/// protocol-relative URL pointing at another host.
+	#[test]
+	fn form_action_is_a_fixed_route_with_the_query() {
+		for uri in ["//settings//restore?theme=light", "/settings%2Frestore?theme=light", "/settings/restore/?theme=light", "/settings/restore?theme=light"] {
+			let body = body_of(block_on(restore(get(uri))).unwrap());
+			assert!(body.contains("method=\"post\" action=\"/settings/restore?theme=light\""), "{uri}: {body}");
+		}
+		for uri in ["//settings//update?theme=light", "/settings/update/?theme=light"] {
+			let body = body_of(block_on(update(get(uri))).unwrap());
+			assert!(body.contains("method=\"post\" action=\"/settings/update?theme=light\""), "{uri}: {body}");
+		}
+	}
+
+	#[test]
+	fn update_page_does_not_claim_to_restore() {
+		let update_page = body_of(block_on(update(get("/settings/update?theme=light"))).unwrap());
+		assert!(!update_page.contains("Restoring replaces"), "{update_page}");
+		let restore_page = body_of(block_on(restore(get("/settings/restore?theme=light"))).unwrap());
+		assert!(restore_page.contains("Restoring replaces all of your settings"), "{restore_page}");
+	}
+}
+
+#[cfg(test)]
 mod origin_tests {
 	use super::*;
 	use futures_lite::future::block_on;
@@ -818,7 +855,7 @@ mod navigation_tests {
 		.unwrap();
 		let body = body_of(res);
 		assert!(
-			body.contains("method=\"post\" action=\"/settings/restore/?theme=light&#38;subscriptions=a+b&#38;redirect=/r/a\""),
+			body.contains("method=\"post\" action=\"/settings/restore?theme=light&#38;subscriptions=a+b&#38;redirect=/r/a\""),
 			"{body}"
 		);
 	}

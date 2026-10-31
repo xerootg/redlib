@@ -313,6 +313,12 @@ fn route_segments(path: &str) -> Vec<String> {
 		.collect()
 }
 
+/// A subreddit or user name without the extension Reddit strips from it
+/// (`.api`, `.json-html`, ...), since their names never contain a `.`.
+fn name_of(segment: &str) -> &str {
+	segment.split('.').next().unwrap_or_default()
+}
+
 /// Whether a client or server may rewrite the path around `c`, so the path
 /// can't be judged by how it reads.
 fn is_rewritable(c: char) -> bool {
@@ -347,14 +353,14 @@ fn is_account_only(path: &str) -> bool {
 	}
 	match segments.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
 		["user" | "u", name, rest @ ..] => {
-			*name == "me"
+			name_of(name) == "me"
 				|| !match rest {
 					[] | ["comments", ..] | ["m", _, ..] => true,
 					[listing] => PUBLIC_USER_LISTINGS.contains(listing),
 					_ => false,
 				}
 		}
-		["r", sub, ..] => sub.split('+').any(|part| part == "mod" || part == "friends"),
+		["r", sub, ..] => sub.split('+').any(|part| matches!(name_of(part), "mod" | "friends")),
 		_ => false,
 	}
 }

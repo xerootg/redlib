@@ -20,9 +20,11 @@
 //!   trusted proxy, and the chain is walked from the right, skipping trusted
 //!   hops. See [`resolve_client_ip`].
 
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::IpAddr;
-use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{LazyLock, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -904,6 +906,7 @@ pub fn gate(peer: IpAddr, path: &str, query: Option<&str>, headers: &HeaderMap) 
 	// An unknown client is never bypassed, but can still authenticate.
 	let client = resolve_client_ip(peer, headers);
 	if client.is_some_and(is_bypassed) {
+		note_pass("bypass", client, peer);
 		return None;
 	}
 
@@ -912,6 +915,7 @@ pub fn gate(peer: IpAddr, path: &str, query: Option<&str>, headers: &HeaderMap) 
 	// not open the rest of the instance. `path` has already been normalised
 	// by the server (no doubled or trailing slashes).
 	if path == MCP_PATH && bearer_token_valid(headers) {
+		note_pass("bearer", client, peer);
 		return None;
 	}
 
@@ -920,6 +924,7 @@ pub fn gate(peer: IpAddr, path: &str, query: Option<&str>, headers: &HeaderMap) 
 	}
 
 	debug!("unauthenticated request from {client:?} for {path}");
+	note_denial(client, peer, path);
 
 	// Programmatic clients get a plain 401 rather than an HTML redirect they
 	// cannot follow. This is what an MCP client or curl will see.
@@ -952,6 +957,97 @@ fn login_target(path: &str, query: Option<&str>) -> String {
 	};
 	let back = [full.as_str(), path].into_iter().find(|p| p.len() <= MAX_REDIRECT_LEN).unwrap_or("/");
 	format!("/oidc/login?redirect={}", urlencoding_path(back))
+}
+
+// ---------------------------------------------------------------------------
+// Gate logging
+// ---------------------------------------------------------------------------
+
+/// Lets one line through per key and interval, and counts what it held back.
+/// The table is capped, so an attacker who varies the key cannot grow it
+/// without bound: once it is full of live entries, new keys are not logged
+/// until old ones expire. That also caps the lines per interval at `cap`.
+struct LogThrottle<K> {
+	interval: Duration,
+	cap: usize,
+	seen: HashMap<K, (Instant, u32)>,
+}
+
+impl<K: Hash + Eq> LogThrottle<K> {
+	fn new(interval: Duration, cap: usize) -> Self {
+		Self {
+			interval,
+			cap,
+			seen: HashMap::new(),
+		}
+	}
+
+	/// `Some(n)` if a line may be logged now, where `n` is how many were held
+	/// back for this key since the last one; `None` if it should be held back.
+	fn allow(&mut self, key: K, now: Instant) -> Option<u32> {
+		if let Some((last, held)) = self.seen.get_mut(&key) {
+			if now.duration_since(*last) < self.interval {
+				*held = held.saturating_add(1);
+				return None;
+			}
+			*last = now;
+			return Some(std::mem::take(held));
+		}
+		if self.seen.len() >= self.cap {
+			let interval = self.interval;
+			self.seen.retain(|_, (last, _)| now.duration_since(*last) < interval);
+			if self.seen.len() >= self.cap {
+				return None;
+			}
+		}
+		self.seen.insert(key, (now, 0));
+		Some(0)
+	}
+}
+
+/// One denial line per client per minute.
+static DENIAL_LOG: LazyLock<Mutex<LogThrottle<IpAddr>>> = LazyLock::new(|| Mutex::new(LogThrottle::new(Duration::from_secs(60), 1024)));
+
+/// One line per client and kind of pass per day, so the first use of a
+/// bypass address or of the MCP token is on record without logging every
+/// request.
+static PASS_LOG: LazyLock<Mutex<LogThrottle<(&'static str, IpAddr)>>> = LazyLock::new(|| Mutex::new(LogThrottle::new(Duration::from_secs(86_400), 1024)));
+
+/// The most of a path that goes into a log line.
+const MAX_LOGGED_PATH: usize = 200;
+
+fn describe_client(client: Option<IpAddr>) -> String {
+	client.map_or_else(|| "unknown".to_string(), |ip| ip.to_string())
+}
+
+/// Logs a denied request at info, at most once a minute per client. The
+/// path is attacker-controlled, so it is escaped and cut short; the query
+/// string is left out because it can carry secrets.
+fn note_denial(client: Option<IpAddr>, peer: IpAddr, path: &str) {
+	let peer = canonical(peer);
+	let allowed = DENIAL_LOG.lock().unwrap_or_else(PoisonError::into_inner).allow(client.unwrap_or(peer), Instant::now());
+	if let Some(held) = allowed {
+		let path: String = path.chars().take(MAX_LOGGED_PATH).collect();
+		let held = if held > 0 {
+			format!(" ({held} more from this client in the last minute)")
+		} else {
+			String::new()
+		};
+		info!("OIDC gate: denied {path:?} from client {} (peer {peer}){held}", describe_client(client));
+	}
+}
+
+/// Logs the first request a client gets through without a session, as a
+/// `kind` of "bypass" (address allowlist) or "bearer" (MCP token).
+fn note_pass(kind: &'static str, client: Option<IpAddr>, peer: IpAddr) {
+	let peer = canonical(peer);
+	let allowed = PASS_LOG
+		.lock()
+		.unwrap_or_else(PoisonError::into_inner)
+		.allow((kind, client.unwrap_or(peer)), Instant::now());
+	if allowed.is_some() {
+		info!("OIDC gate: first {kind} pass from client {} (peer {peer})", describe_client(client));
+	}
 }
 
 /// Percent-encodes a path (and query) for use as a query-string value.
@@ -1076,6 +1172,45 @@ mod login_query_tests {
 	fn programmatic_clients_still_get_a_401_with_a_query() {
 		let res = gate("203.0.113.9".parse().unwrap(), "/search", Some("q=x"), &HeaderMap::new()).expect("must be gated");
 		assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+	}
+}
+
+#[cfg(test)]
+mod log_throttle_tests {
+	use super::*;
+
+	const MINUTE: Duration = Duration::from_secs(60);
+
+	#[test]
+	fn one_line_per_key_per_interval_and_the_rest_are_counted() {
+		let mut t = LogThrottle::new(MINUTE, 8);
+		let start = Instant::now();
+		assert_eq!(t.allow("a", start), Some(0));
+		for n in 1..=5 {
+			assert_eq!(t.allow("a", start + Duration::from_secs(n)), None);
+		}
+		// Another key is its own story.
+		assert_eq!(t.allow("b", start + Duration::from_secs(6)), Some(0));
+		// After the interval the next line reports what was held back.
+		assert_eq!(t.allow("a", start + MINUTE), Some(5));
+		assert_eq!(t.allow("a", start + MINUTE + Duration::from_secs(1)), None);
+	}
+
+	#[test]
+	fn the_table_cannot_grow_past_its_cap() {
+		let mut t = LogThrottle::new(MINUTE, 4);
+		let start = Instant::now();
+		for key in 0..4 {
+			assert_eq!(t.allow(key, start), Some(0));
+		}
+		// Full of live entries: new keys are held back, not stored.
+		for key in 4..1000 {
+			assert_eq!(t.allow(key, start + Duration::from_secs(1)), None);
+		}
+		assert_eq!(t.seen.len(), 4);
+		// Once the old entries expire, new keys fit again.
+		assert_eq!(t.allow(1000, start + MINUTE), Some(0));
+		assert!(t.seen.len() <= 4);
 	}
 }
 

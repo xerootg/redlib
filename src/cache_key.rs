@@ -81,13 +81,13 @@ impl Check {
 }
 
 /// The key for a fetch of `path` (a Reddit JSON API path with its query), or
-/// `None` if a path segment is longer than `MAX_SEGMENT_LEN`. The key is
+/// `None` if its route is longer than `MAX_ROUTE_LEN`. The key is
 /// `path` with only the parameters in `QUERY_KEYS` that have a valid value,
 /// sorted by name, with the last of any repeated one, as `utils::param` reads
 /// them, and with their values written one way.
 pub fn fetch_key(path: &str) -> Option<String> {
 	let (route, query) = path.split_once('?').unwrap_or((path, ""));
-	if !segments_within_limit(route) {
+	if route.len() > MAX_ROUTE_LEN {
 		return None;
 	}
 

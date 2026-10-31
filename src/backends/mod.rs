@@ -314,9 +314,10 @@ static FETCH_CACHE: LazyLock<ByteCache<Fetched>> = LazyLock::new(|| ByteCache::n
 /// variations that no key can rule out.
 pub async fn fetch(path: String, quarantine: bool) -> Result<(Value, &'static str), String> {
 	let Some(path) = cache_key::fetch_key(&path) else {
-		return Err("Invalid URL: a path segment is too long".to_string());
+		return Err("Invalid URL: the path is too long".to_string());
 	};
 	let key = format!("{quarantine} {}", cache_key::entry_key(&path));
+	let key_len = key.len();
 	if let Some(hit) = FETCH_CACHE.get(&key) {
 		return hit;
 	}
@@ -324,7 +325,7 @@ pub async fn fetch(path: String, quarantine: bool) -> Result<(Value, &'static st
 	let size = match &result {
 		Ok((json, _)) => value_size(json),
 		Err(msg) => msg.len(),
-	};
+	} + key_len;
 	FETCH_CACHE.insert(key, result.clone(), size);
 	result
 }

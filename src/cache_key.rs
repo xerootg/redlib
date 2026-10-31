@@ -56,6 +56,11 @@ pub fn fetch_key(path: &str) -> Option<String> {
 	Some(format!("{route}?{}", query.join("&")))
 }
 
+/// The key of the cache entry for `path`, which `fetch_key` made.
+pub fn entry_key(path: &str) -> String {
+	path.to_string()
+}
+
 /// Whether no segment of the path in `path` (up to any `?`) is longer than `MAX_SEGMENT_LEN`.
 pub fn segments_within_limit(path: &str) -> bool {
 	let route = path.split('?').next().unwrap_or_default();
@@ -142,5 +147,72 @@ mod tests {
 		assert!(fetched.is_err_and(|e| e.contains("too long")));
 		let canonical = crate::client::block_on_shared(crate::client::canonical_path(format!("/r/{long}/s/abcdefgh"), 3));
 		assert_eq!(canonical, Ok(None));
+	}
+}
+
+// Review of the fix for audit finding #17: the same thread, listing or search
+// could still be made into many cache entries (and Reddit requests) by changing
+// what the URL says but not what Reddit sends.
+#[cfg(test)]
+mod normalize_tests {
+	use super::*;
+
+	#[test]
+	fn test_spellings_of_one_value_are_one_key() {
+		let key = fetch_key("/r/rust/comments/abc.json?sort=top&raw_json=1");
+		assert_eq!(fetch_key("/r/rust/comments/abc.json?sort=%74op&raw_json=1"), key);
+		assert_eq!(fetch_key("/r/rust/comments/abc.json?sort=t%6Fp&raw_json=%31"), key);
+		assert_eq!(
+			fetch_key("/r/rust/search.json?q=a%20b&raw_json=1"),
+			fetch_key("/r/rust/search.json?q=a+b&raw_json=1")
+		);
+		assert_eq!(fetch_key("/r/rust/hot.json?after=t3_a%3D").as_deref(), Some("/r/rust/hot.json?after=t3_a%3D"));
+	}
+
+	#[test]
+	fn test_values_that_are_not_valid_leave_the_key() {
+		let bare = fetch_key("/r/rust/comments/abc.json?raw_json=1");
+		for query in ["sort=confidence1", "sort=confidence2", "sort=zzz", "context=12", "context=x", "limit=1000000", "limit=x", "depth=-1", "t=forever", "type=zzz", "raw_json=2", "restrict_sr=maybe"] {
+			assert_eq!(fetch_key(&format!("/r/rust/comments/abc.json?{query}&raw_json=1")), bare, "{query}");
+		}
+		for query in ["sort=confidence", "sort=top", "context=3", "limit=100", "depth=5", "t=week", "type=link", "restrict_sr=on", "sort=", "t="] {
+			let key = fetch_key(&format!("/r/rust/comments/abc.json?{query}&raw_json=1"));
+			assert_ne!(key, bare, "{query}");
+		}
+	}
+
+	#[test]
+	fn test_a_bare_parameter_is_kept_as_an_empty_one() {
+		// utils::param reads `?include_over_18` as an empty value, and gql only asks if it is there
+		assert_eq!(fetch_key("/r/rust/hot.json?include_over_18&utm=1").as_deref(), Some("/r/rust/hot.json?include_over_18="));
+	}
+
+	#[test]
+	fn test_thread_slug_and_sub_case_leave_the_entry_key() {
+		let key = entry_key("/r/rust/comments/abc/some_title.json?raw_json=1");
+		assert_eq!(entry_key("/r/rust/comments/abc/other_title.json?raw_json=1"), key);
+		assert_eq!(entry_key("/r/Rust/comments/abc/s3.json?raw_json=1"), key);
+		assert_eq!(entry_key("/r/RUST/comments/abc.json?raw_json=1"), key);
+		assert_eq!(entry_key("/r/rUst/comments/abc/.json?raw_json=1"), key);
+		assert_ne!(entry_key("/r/rust/comments/abd/some_title.json?raw_json=1"), key);
+		assert_ne!(entry_key("/r/rust/comments/abc/some_title.json?sort=top&raw_json=1"), key);
+	}
+
+	#[test]
+	fn test_a_permalink_keeps_its_comment_in_the_entry_key() {
+		let key = entry_key("/r/rust/comments/abc/title/def.json?raw_json=1");
+		assert_eq!(entry_key("/r/Rust/comments/abc/another/def.json?raw_json=1"), key);
+		assert_ne!(entry_key("/r/rust/comments/abc/title/ghi.json?raw_json=1"), key);
+		assert_ne!(entry_key("/r/rust/comments/abc/title.json?raw_json=1"), key);
+	}
+
+	#[test]
+	fn test_sub_case_leaves_the_entry_key_of_listings() {
+		assert_eq!(entry_key("/r/Rust/hot.json?raw_json=1"), entry_key("/r/rust/hot.json?raw_json=1"));
+		assert_eq!(entry_key("/r/RUST/search.json?q=Rust&raw_json=1"), entry_key("/r/rust/search.json?q=Rust&raw_json=1"));
+		// not the search text, nor other kinds of name
+		assert_ne!(entry_key("/r/rust/search.json?q=Rust"), entry_key("/r/rust/search.json?q=rust"));
+		assert_ne!(entry_key("/r/rust/hot.json"), entry_key("/r/rust/new.json"));
+		assert_ne!(entry_key("/r/rust/hot.json"), entry_key("/r/golang/hot.json"));
 	}
 }

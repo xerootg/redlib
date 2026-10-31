@@ -225,8 +225,12 @@ fn refresh_delay(expires_in: u64) -> Duration {
 /// How long `token_daemon` waits before its next refresh: for a refresh that
 /// failed, the token it still holds is about to run out, so not as long as it
 /// would have lasted.
-fn refresh_after(_refreshed: bool, expires_in: u64) -> Duration {
-	refresh_delay(expires_in)
+fn refresh_after(refreshed: bool, expires_in: u64) -> Duration {
+	if refreshed {
+		refresh_delay(expires_in)
+	} else {
+		MIN_REFRESH_DELAY
+	}
 }
 
 /// The first 32 characters of a token, for the log.
@@ -236,12 +240,13 @@ fn token_preview(token: &str) -> &str {
 
 pub async fn token_daemon() {
 	// Monitor for refreshing token
+	let mut refreshed = true;
 	loop {
 		// Get expiry time - be sure to not hold the read lock
 		let expires_in = { OAUTH_CLIENT.load_full().expires_in };
 
 		// sleep for the expiry time minus 2 minutes
-		let duration = refresh_delay(expires_in);
+		let duration = refresh_after(refreshed, expires_in);
 
 		info!("[⏳] Waiting for {duration:?} seconds before refreshing OAuth token...");
 
@@ -251,19 +256,21 @@ pub async fn token_daemon() {
 
 		// Refresh token - in its own scope
 		{
-			force_refresh_token().await;
+			refreshed = force_refresh_token().await;
 		}
 	}
 }
 
-pub async fn force_refresh_token() {
+/// Whether a new token was had.
+pub async fn force_refresh_token() -> bool {
 	if OAUTH_IS_ROLLING_OVER.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
 		trace!("Skipping refresh token roll over, already in progress");
-		return;
+		return false;
 	}
 
 	trace!("Rolling over refresh token. Current rate limit: {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst));
-	if refresh_into(&OAUTH_CLIENT, Oauth::new_with_timeout_with_backend, OAUTH_TIMEOUT).await {
+	let refreshed = refresh_into(&OAUTH_CLIENT, Oauth::new_with_timeout_with_backend, OAUTH_TIMEOUT).await;
+	if refreshed {
 		OAUTH_RATELIMIT_REMAINING.store(99, Ordering::SeqCst);
 		OAUTH_IS_ROLLING_OVER.store(false, Ordering::SeqCst);
 	} else {
@@ -274,6 +281,7 @@ pub async fn force_refresh_token() {
 			OAUTH_IS_ROLLING_OVER.store(false, Ordering::SeqCst);
 		});
 	}
+	refreshed
 }
 
 /// Replaces the client in `target` with a fresh one. Keeps the current client

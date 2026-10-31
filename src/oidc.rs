@@ -46,6 +46,11 @@ const UNGATED_PATHS: [&str; 4] = ["/oidc/login", "/oidc/callback", "/oidc/logout
 /// The only path `REDLIB_MCP_TOKEN` opens.
 const MCP_PATH: &str = "/mcp";
 
+/// Paths `REDLIB_READ_TOKEN` never opens, together with everything under
+/// them: `/settings/restore` and `/settings/update` change preferences on a
+/// GET, `/mcp` has its own token, and `/oidc` belongs to the login flow.
+const READ_TOKEN_EXCLUDED: [&str; 3] = ["/settings", MCP_PATH, "/oidc"];
+
 // `__Host-` makes browsers accept these only with Secure, Path=/ and no
 // Domain, so another host under the same parent domain cannot set or shadow
 // them. The prefix changed the names, which logged everyone out once.
@@ -407,11 +412,12 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 		})
 }
 
-/// Whether the request carries the configured API bearer token.
+/// Whether the request carries the bearer token configured under `key`.
 ///
 /// Session cookies are unusable by headless clients such as an MCP client, so
-/// a long random token stands in for them. The gate only consults this for
-/// [`MCP_PATH`]. Returns false whenever no token is
+/// a long random token stands in for them. The gate consults
+/// `REDLIB_MCP_TOKEN` for [`MCP_PATH`] only and `REDLIB_READ_TOKEN` only where
+/// [`read_token_applies`] says so. Returns false whenever no token is
 /// configured, so an unset value can never authorise anything.
 ///
 /// The comparison hashes both sides first. A plain `==` on the raw strings
@@ -419,8 +425,8 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 /// matching prefix and lets an attacker recover the token byte by byte.
 /// Comparing digests makes the timing independent of how much of the token was
 /// correct.
-fn bearer_token_valid(headers: &HeaderMap) -> bool {
-	let Some(expected) = setting("REDLIB_MCP_TOKEN") else {
+fn bearer_token_valid(headers: &HeaderMap, key: &str) -> bool {
+	let Some(expected) = setting(key) else {
 		return false;
 	};
 
@@ -439,6 +445,24 @@ fn bearer_token_valid(headers: &HeaderMap) -> bool {
 	};
 
 	Sha256::digest(presented.as_bytes()) == Sha256::digest(expected.as_bytes())
+}
+
+/// Whether `REDLIB_READ_TOKEN` may open this request: GET or HEAD only, so it
+/// can never submit a form, and nowhere in [`READ_TOKEN_EXCLUDED`]. The prefix
+/// match ignores case, so a differently cased path cannot slip past it.
+fn read_token_applies(method: &Method, path: &str) -> bool {
+	if !matches!(*method, Method::GET | Method::HEAD) {
+		return false;
+	}
+	!READ_TOKEN_EXCLUDED.iter().any(|excluded| is_at_or_under(path, excluded))
+}
+
+/// Whether `path` is `prefix` or lies under it, ignoring ASCII case.
+fn is_at_or_under(path: &str, prefix: &str) -> bool {
+	let Some(head) = path.get(..prefix.len()) else {
+		return false;
+	};
+	head.eq_ignore_ascii_case(prefix) && matches!(path.as_bytes().get(prefix.len()), None | Some(b'/'))
 }
 
 /// Reads and validates the session cookie, if present and well-formed.
@@ -886,12 +910,13 @@ pub async fn logout(_req: Request<Body>) -> Result<Response<Body>, String> {
 /// Only the login endpoints and `/healthz` are exempt (`UNGATED_PATHS`).
 /// Static files, `/healthz/reddit` and `/mcp` are gated like everything
 /// else; MCP clients present `REDLIB_MCP_TOKEN` as a bearer token, which
-/// opens `/mcp` and nothing else.
+/// opens `/mcp` and nothing else. Read-only services present
+/// `REDLIB_READ_TOKEN`, which opens GET and HEAD requests outside
+/// [`READ_TOKEN_EXCLUDED`].
 ///
 /// `method` is the request's original method, before the server maps HEAD
 /// to GET for routing.
 pub fn gate(peer: IpAddr, method: &Method, path: &str, headers: &HeaderMap) -> Option<Response<Body>> {
-	let _ = method;
 	if !AUTH.enabled {
 		return None;
 	}
@@ -915,7 +940,13 @@ pub fn gate(peer: IpAddr, method: &Method, path: &str, headers: &HeaderMap) -> O
 	// actually present. Only for `/mcp`: a token handed to an MCP client must
 	// not open the rest of the instance. `path` has already been normalised
 	// by the server (no doubled or trailing slashes).
-	if path == MCP_PATH && bearer_token_valid(headers) {
+	if path == MCP_PATH && bearer_token_valid(headers, "REDLIB_MCP_TOKEN") {
+		return None;
+	}
+
+	// For services that only read pages. Never for a method that can submit
+	// a form, never for settings, and never for /mcp or /oidc.
+	if read_token_applies(method, path) && bearer_token_valid(headers, "REDLIB_READ_TOKEN") {
 		return None;
 	}
 

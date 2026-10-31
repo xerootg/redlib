@@ -272,6 +272,15 @@ pub struct Config {
 	#[serde(rename = "REDLIB_MCP_TOKEN")]
 	#[serde(skip_serializing)]
 	pub(crate) mcp_token: Option<String>,
+
+	/// Bearer token the OIDC gate accepts for GET and HEAD requests, except on
+	/// `/settings`, `/mcp` and `/oidc` and everything under them, for
+	/// in-cluster services that only read pages.
+	/// Unset means no token is accepted at all. A credential, so it is never
+	/// serialized.
+	#[serde(rename = "REDLIB_READ_TOKEN")]
+	#[serde(skip_serializing)]
+	pub(crate) read_token: Option<String>,
 }
 
 impl Config {
@@ -378,6 +387,7 @@ impl Config {
 			auth_bypass_cidrs: parse("REDLIB_AUTH_BYPASS_CIDRS"),
 			trusted_proxies: parse("REDLIB_TRUSTED_PROXIES"),
 			mcp_token: parse("REDLIB_MCP_TOKEN"),
+			read_token: parse("REDLIB_READ_TOKEN"),
 		}
 	}
 }
@@ -448,6 +458,7 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 		"REDLIB_AUTH_BYPASS_CIDRS" => config.auth_bypass_cidrs.clone(),
 		"REDLIB_TRUSTED_PROXIES" => config.trusted_proxies.clone(),
 		"REDLIB_MCP_TOKEN" => config.mcp_token.clone(),
+		"REDLIB_READ_TOKEN" => config.read_token.clone(),
 		_ => None,
 	}
 }
@@ -456,7 +467,7 @@ fn get_setting_from_config(name: &str, config: &Config) -> Option<String> {
 /// settings never had one, so a stray variable under such a name must not
 /// switch authentication off, widen the bypass list or set a token.
 fn has_legacy_name(key: &str) -> bool {
-	!(key.starts_with("REDLIB_OIDC_") || matches!(key, "REDLIB_AUTH_BYPASS_CIDRS" | "REDLIB_TRUSTED_PROXIES" | "REDLIB_MCP_TOKEN"))
+	!(key.starts_with("REDLIB_OIDC_") || matches!(key, "REDLIB_AUTH_BYPASS_CIDRS" | "REDLIB_TRUSTED_PROXIES" | "REDLIB_MCP_TOKEN" | "REDLIB_READ_TOKEN"))
 }
 
 /// Retrieves setting from environment variable or config file.

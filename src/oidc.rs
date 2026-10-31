@@ -887,7 +887,7 @@ pub async fn logout(_req: Request<Body>) -> Result<Response<Body>, String> {
 /// Static files, `/healthz/reddit` and `/mcp` are gated like everything
 /// else; MCP clients present `REDLIB_MCP_TOKEN` as a bearer token, which
 /// opens `/mcp` and nothing else.
-pub fn gate(peer: IpAddr, path: &str, headers: &HeaderMap) -> Option<Response<Body>> {
+pub fn gate(peer: IpAddr, path: &str, _query: Option<&str>, headers: &HeaderMap) -> Option<Response<Body>> {
 	if !AUTH.enabled {
 		return None;
 	}
@@ -1515,7 +1515,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 	#[test]
 	#[sealed_test]
 	fn gate_is_open_when_disabled() {
-		assert!(gate(ip(OUTSIDE), "/", &headers(&[BROWSER])).is_none());
+		assert!(gate(ip(OUTSIDE), "/", None, &headers(&[BROWSER])).is_none());
 	}
 
 	#[test]
@@ -1528,7 +1528,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_redirects_browsers_to_login() {
-		let res = gate(ip(OUTSIDE), "/r/rust/comments/abc", &headers(&[BROWSER])).expect("must be gated");
+		let res = gate(ip(OUTSIDE), "/r/rust/comments/abc", None, &headers(&[BROWSER])).expect("must be gated");
 		assert_eq!(res.status(), StatusCode::FOUND);
 		assert_eq!(location(&res), "/oidc/login?redirect=%2Fr%2Frust%2Fcomments%2Fabc");
 	}
@@ -1543,7 +1543,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		("REDLIB_OIDC_SESSION_SECRET", "test-session-secret-0123456789abcdef"),
 	])]
 	fn gate_answers_programmatic_clients_with_401_json() {
-		let res = gate(ip(OUTSIDE), "/r/rust", &headers(&[("accept", "application/json")])).expect("must be gated");
+		let res = gate(ip(OUTSIDE), "/r/rust", None, &headers(&[("accept", "application/json")])).expect("must be gated");
 		assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 		assert_eq!(res.headers()["www-authenticate"], "Bearer realm=\"https://idp.example/application/o/redlib\"");
 		assert_eq!(res.headers()["content-type"], "application/json");
@@ -1565,7 +1565,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		// bridge address: a trusted-proxy address that sends no
 		// X-Forwarded-For, so it gets no bypass.
 		for path in ["/oidc/login", "/oidc/callback", "/oidc/logout", "/healthz"] {
-			assert!(gate(ip(OUTSIDE), path, &headers(&[BROWSER])).is_none(), "{path}");
+			assert!(gate(ip(OUTSIDE), path, None, &headers(&[BROWSER])).is_none(), "{path}");
 		}
 	}
 
@@ -1597,7 +1597,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 			"/oidc/loginx",
 			"/healthzx",
 		] {
-			let res = gate(ip(OUTSIDE), path, &HeaderMap::new()).unwrap_or_else(|| panic!("{path} must be gated"));
+			let res = gate(ip(OUTSIDE), path, None, &HeaderMap::new()).unwrap_or_else(|| panic!("{path} must be gated"));
 			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
 		}
 	}
@@ -1614,14 +1614,14 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		("REDLIB_TRUSTED_PROXIES", "10.42.0.0/16"),
 	])]
 	fn gate_lets_bypass_addresses_through() {
-		assert!(gate(ip("192.168.1.20"), "/", &headers(&[BROWSER])).is_none());
+		assert!(gate(ip("192.168.1.20"), "/", None, &headers(&[BROWSER])).is_none());
 		// Dual-stack sockets report IPv4 clients as mapped IPv6.
-		assert!(gate(ip("::ffff:127.0.0.1"), "/", &headers(&[BROWSER])).is_none());
+		assert!(gate(ip("::ffff:127.0.0.1"), "/", None, &headers(&[BROWSER])).is_none());
 		// Through the trusted proxy, the forwarded address decides.
-		assert!(gate(ip("10.42.0.7"), "/", &xff("192.168.1.20")).is_none());
-		assert!(gate(ip("10.42.0.7"), "/", &xff(OUTSIDE)).is_some());
+		assert!(gate(ip("10.42.0.7"), "/", None, &xff("192.168.1.20")).is_none());
+		assert!(gate(ip("10.42.0.7"), "/", None, &xff(OUTSIDE)).is_some());
 		// The proxy itself is not a bypass address.
-		assert!(gate(ip("10.42.0.7"), "/", &HeaderMap::new()).is_some());
+		assert!(gate(ip("10.42.0.7"), "/", None, &HeaderMap::new()).is_some());
 	}
 
 	#[test]
@@ -1635,7 +1635,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		("REDLIB_AUTH_BYPASS_CIDRS", "192.168.0.0/16"),
 	])]
 	fn gate_ignores_forged_forwarded_for_without_trusted_proxies() {
-		let res = gate(ip(OUTSIDE), "/", &xff("192.168.1.20"));
+		let res = gate(ip(OUTSIDE), "/", None, &xff("192.168.1.20"));
 		assert_eq!(res.expect("forged XFF must not bypass").status(), StatusCode::UNAUTHORIZED);
 	}
 
@@ -1661,17 +1661,17 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 			("only trusted hops, several", xff("10.42.0.3, 10.42.0.4")),
 			("nothing parseable", xff("unknown")),
 		] {
-			let res = gate(proxy, "/", &h).unwrap_or_else(|| panic!("{label}: must not bypass"));
+			let res = gate(proxy, "/", None, &h).unwrap_or_else(|| panic!("{label}: must not bypass"));
 			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{label}");
 		}
 
 		// A forwarded bypass address still gets through the proxy.
-		assert!(gate(proxy, "/", &xff("192.168.1.20")).is_none());
+		assert!(gate(proxy, "/", None, &xff("192.168.1.20")).is_none());
 		// A peer that is not a proxy is the client, e.g. a kubelet probe from a node.
-		assert!(gate(ip("192.168.1.20"), "/", &HeaderMap::new()).is_none());
+		assert!(gate(ip("192.168.1.20"), "/", None, &HeaderMap::new()).is_none());
 		// An unknown client can still log in.
 		let token = sign(&session(now() + 3600)).unwrap();
-		assert!(gate(proxy, "/", &session_cookie(&token)).is_none());
+		assert!(gate(proxy, "/", None, &session_cookie(&token)).is_none());
 	}
 
 	fn session(exp: u64) -> Session {
@@ -1700,7 +1700,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 	])]
 	fn gate_accepts_a_valid_session_cookie() {
 		let token = sign(&session(now() + 3600)).unwrap();
-		assert!(gate(ip(OUTSIDE), "/", &session_cookie(&token)).is_none());
+		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&token)).is_none());
 		assert_eq!(session_from(&session_cookie(&token)).unwrap().sub, "user-1");
 	}
 
@@ -1716,7 +1716,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 	fn gate_rejects_expired_tampered_and_foreign_sessions() {
 		// Expired beyond jsonwebtoken's default 60 s leeway.
 		let expired = sign(&session(now() - 3600)).unwrap();
-		assert!(gate(ip(OUTSIDE), "/", &session_cookie(&expired)).is_some(), "expired");
+		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&expired)).is_some(), "expired");
 
 		// Payload swapped under an existing signature.
 		let valid = sign(&session(now() + 3600)).unwrap();
@@ -1729,16 +1729,16 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 			.unwrap(),
 		);
 		parts[1] = &forged_claims;
-		assert!(gate(ip(OUTSIDE), "/", &session_cookie(&parts.join("."))).is_some(), "tampered");
+		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&parts.join("."))).is_some(), "tampered");
 
 		// Signed with a different key.
 		let foreign = encode(&Header::new(Algorithm::HS256), &session(now() + 3600), &EncodingKey::from_secret(b"other")).unwrap();
-		assert!(gate(ip(OUTSIDE), "/", &session_cookie(&foreign)).is_some(), "foreign key");
+		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&foreign)).is_some(), "foreign key");
 
 		// `alg: none` must never be accepted.
 		let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
 		let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&session(now() + 3600)).unwrap());
-		assert!(gate(ip(OUTSIDE), "/", &session_cookie(&format!("{header}.{claims}."))).is_some(), "alg none");
+		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&format!("{header}.{claims}."))).is_some(), "alg none");
 	}
 
 	#[test]
@@ -1760,7 +1760,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 			exp: now() + TX_TTL,
 		})
 		.unwrap();
-		assert!(gate(ip(OUTSIDE), "/", &session_cookie(&tx)).is_some());
+		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&tx)).is_some());
 	}
 
 	#[test]
@@ -1773,7 +1773,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 	])]
 	fn sessions_still_work_with_an_ephemeral_key() {
 		let token = sign(&session(now() + 3600)).unwrap();
-		assert!(gate(ip(OUTSIDE), "/", &session_cookie(&token)).is_none());
+		assert!(gate(ip(OUTSIDE), "/", None, &session_cookie(&token)).is_none());
 	}
 
 	fn bearer(value: &str) -> HeaderMap {
@@ -1794,13 +1794,13 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 		// The scheme is case-insensitive (RFC 9110 11.1).
 		for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
 			let value = format!("{scheme} correct-horse-battery-staple");
-			assert!(gate(ip(OUTSIDE), "/mcp", &bearer(&value)).is_none(), "{scheme}");
+			assert!(gate(ip(OUTSIDE), "/mcp", None, &bearer(&value)).is_none(), "{scheme}");
 		}
 
 		// The token is for the MCP endpoint. A leaked one must not open the
 		// rest of the instance.
 		for path in ["/", "/r/rust", "/info.json", "/mcp/other", "/mcpx"] {
-			let res = gate(ip(OUTSIDE), path, &bearer("Bearer correct-horse-battery-staple")).unwrap_or_else(|| panic!("{path} must be gated"));
+			let res = gate(ip(OUTSIDE), path, None, &bearer("Bearer correct-horse-battery-staple")).unwrap_or_else(|| panic!("{path} must be gated"));
 			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{path}");
 		}
 	}
@@ -1823,7 +1823,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 			"Basic correct-horse-battery-staple",
 			"correct-horse-battery-staple",
 		] {
-			let res = gate(ip(OUTSIDE), "/mcp", &bearer(value)).unwrap_or_else(|| panic!("{value:?} must not pass"));
+			let res = gate(ip(OUTSIDE), "/mcp", None, &bearer(value)).unwrap_or_else(|| panic!("{value:?} must not pass"));
 			assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{value:?}");
 		}
 	}
@@ -1840,7 +1840,7 @@ J6LdBPXCFDZfsB7AdnW3CIo=
 	])]
 	fn an_unset_or_blank_token_authorises_nothing() {
 		for value in ["Bearer ", "Bearer    ", "Bearer x"] {
-			assert!(gate(ip(OUTSIDE), "/mcp", &bearer(value)).is_some(), "{value:?}");
+			assert!(gate(ip(OUTSIDE), "/mcp", None, &bearer(value)).is_some(), "{value:?}");
 		}
 	}
 }

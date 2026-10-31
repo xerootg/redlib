@@ -333,24 +333,13 @@ impl Server {
 				}
 			}
 
-			// Remove double slashes and decode encoded slashes
-			let mut path = req.uri().path().replace("//", "/").replace("%2F", "/");
-
-			// Remove trailing slashes
-			if path != "/" && path.ends_with('/') {
-				path.pop();
-			}
-
-			// Reddit permalinks end in a slash, so feed URLs are often written `/r/rust/top/.rss`
-			if path != "/.rss" && path.ends_with("/.rss") {
-				path.replace_range(path.len() - "/.rss".len().., ".rss");
-			}
+			let path = normalize_path(req.uri().path());
 
 			// Enforce OIDC before anything else routes. Returns None when the
 			// request is allowed through -- because auth is off, the client is
 			// in a bypass CIDR, it already holds a valid session, or it is
 			// hitting the /oidc/ endpoints.
-			if let Some(mut res) = oidc::gate(peer, &path, &req_headers) {
+			if let Some(mut res) = oidc::gate(peer, &path, req.uri().query(), &req_headers) {
 				res.headers_mut().extend(def_headers);
 				return async move { Ok(res) }.boxed();
 			}
@@ -430,6 +419,25 @@ impl Server {
 		}
 		.boxed()
 	}
+}
+
+/// The path the gate and the router both see: doubled slashes collapsed,
+/// encoded slashes decoded and trailing slashes removed.
+fn normalize_path(raw: &str) -> String {
+	// Remove double slashes and decode encoded slashes
+	let mut path = raw.replace("//", "/").replace("%2F", "/");
+
+	// Remove trailing slashes
+	if path != "/" && path.ends_with('/') {
+		path.pop();
+	}
+
+	// Reddit permalinks end in a slash, so feed URLs are often written `/r/rust/top/.rss`
+	if path != "/.rss" && path.ends_with("/.rss") {
+		path.replace_range(path.len() - "/.rss".len().., ".rss");
+	}
+
+	path
 }
 
 async fn shutdown_signal() {

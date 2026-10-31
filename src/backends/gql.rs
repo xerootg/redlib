@@ -106,11 +106,23 @@ fn listing(children: Vec<Value>) -> Value {
 	json_value!({ "kind": "Listing", "data": { "children": children } })
 }
 
-/// Escaped URL attribute value, proxied through Redlib for Reddit media. Empty for `javascript:` URLs.
+/// Schemes a link or media URL may have. A URL without a scheme is relative.
+const URL_SCHEMES: &[&str] = &["http", "https", "mailto"];
+
+/// Escaped URL attribute value, proxied through Redlib for Reddit media. Empty for URLs with other schemes than `URL_SCHEMES`.
 fn url_attr(value: Option<&str>) -> String {
 	let value = value.unwrap_or_default().trim();
-	if value.to_lowercase().starts_with("javascript:") {
+	// Browsers drop tabs and newlines from anywhere in a URL, and control
+	// characters from its start, before they read the scheme. Don't guess
+	// what they would see: no real URL has any.
+	if value.chars().any(char::is_control) {
 		return String::new();
+	}
+	// A colon before the first `/`, `?` or `#` ends a scheme
+	if let Some((scheme, _)) = value.split_once(':') {
+		if !scheme.contains(['/', '?', '#']) && !URL_SCHEMES.iter().any(|allowed| scheme.eq_ignore_ascii_case(allowed)) {
+			return String::new();
+		}
 	}
 	htmlescape::encode_minimal(&format_url(value))
 }

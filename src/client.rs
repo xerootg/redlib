@@ -545,7 +545,27 @@ pub async fn canonical_path(path: String, tries: i8) -> Result<Option<String>, S
 	}
 }
 
-/// Fills the route parameters of `req` into `format` and parses the result.
+/// Every host `proxy` may fetch from, one per media route (see `main.rs` and
+/// `redgifs.rs`). A new route needs its host added here.
+const PROXY_HOSTS: &[&str] = &[
+	"v.redd.it",
+	"packaged-media.redd.it",
+	"external-packaged-media.redd.it",
+	"i.redd.it",
+	"a.thumbs.redditmedia.com",
+	"b.thumbs.redditmedia.com",
+	"emoji.redditmedia.com",
+	"reddit-econ-prod-assets-permanent.s3.amazonaws.com",
+	"preview.redd.it",
+	"external-preview.redd.it",
+	"styles.redditmedia.com",
+	"www.redditstatic.com",
+	"media.giphy.com",
+	"media.redgifs.com",
+];
+
+/// Fills the route parameters of `req` into `format`, parses the result and
+/// checks it against `PROXY_HOSTS`.
 fn proxy_url(req: &HyperRequest<Body>, format: &str) -> Result<wreq::Uri, String> {
 	let mut url = format!("{format}?{}", req.uri().query().unwrap_or_default());
 
@@ -556,11 +576,35 @@ fn proxy_url(req: &HyperRequest<Body>, format: &str) -> Result<wreq::Uri, String
 	}
 
 	// First parameter is target URL (mandatory).
-	wreq::Uri::try_from(url).map_err(|_| "Couldn't parse URL".to_string())
+	let uri = wreq::Uri::try_from(url).map_err(|_| "Couldn't parse URL".to_string())?;
+
+	// Route parameters can end up in the host (`{loc}view.redd.it`), so check
+	// the host that came out, not the one the route meant. Only whole, listed
+	// hosts pass: no IP literal, port or userinfo, and no other subdomain.
+	let host_allowed = uri.scheme_str() == Some("https")
+		&& uri.host().is_some_and(|host| PROXY_HOSTS.contains(&host))
+		&& uri.authority().is_some_and(|authority| Some(authority.as_str()) == uri.host());
+	if host_allowed {
+		Ok(uri)
+	} else {
+		Err("Host not allowed".to_string())
+	}
+}
+
+/// A plain text error for a client of the media proxy. It says what went wrong
+/// in general terms and never repeats the URL it was asked to fetch.
+fn proxy_error(status: u16, message: &'static str) -> HyperResponse<Body> {
+	HyperResponse::builder()
+		.status(status)
+		.header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+		.body(Body::from(message))
+		.unwrap()
 }
 
 pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperResponse<Body>, String> {
-	let wreq_uri = proxy_url(&req, format)?;
+	let Ok(wreq_uri) = proxy_url(&req, format) else {
+		return Ok(proxy_error(400, "Bad request"));
+	};
 
 	let mut builder = CLIENT.load_full().get(wreq_uri);
 
@@ -603,7 +647,11 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 
 			res.into_hyper_response()
 		})
-		.map_err(|e| e.to_string())
+		.or_else(|e| {
+			// Not `e`: wreq puts the upstream URL in its errors.
+			dbg_msg!("proxy request failed: {}", e);
+			Ok(proxy_error(502, "Bad gateway"))
+		})
 }
 
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
@@ -899,6 +947,22 @@ mod proxy_target_tests {
 		for point in ["evil", "c", "a.evil", "", "A", "a@evil.example/#"] {
 			assert!(target(THUMB, &[("point", point), ("id", "x")], "").is_err(), "thumb point {point}");
 		}
+	}
+
+	#[test]
+	fn test_a_rejected_target_gets_a_generic_text_error() {
+		let mut req = HyperRequest::builder().uri("/preview/[::1]/x.jpg").body(Body::empty()).unwrap();
+		let mut params = Params::new();
+		params.insert("loc".to_string(), "[::1]".to_string());
+		params.insert("id".to_string(), "x.jpg".to_string());
+		req.set_params(params);
+		block_on_shared(async {
+			let res = proxy(req, PREVIEW).await.expect("a rejected target is an answer, not an error");
+			assert_eq!(res.status().as_u16(), 400);
+			assert_eq!(res.headers().get(header::CONTENT_TYPE).unwrap(), "text/plain; charset=utf-8");
+			let body = String::from_utf8(res.into_body().collect_bytes().await.unwrap().to_vec()).unwrap();
+			assert!(!body.contains("::1") && !body.contains("redd.it"), "the error repeats the target: {body}");
+		});
 	}
 }
 

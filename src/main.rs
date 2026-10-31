@@ -20,6 +20,11 @@ use redlib::client::OAUTH_CLIENT;
 // Create Services
 
 // Required for the manifest to be valid
+/// Where `/r/:sub/w/*page` redirects to.
+fn sub_wiki_page_path(req: &Request<Body>) -> String {
+	format!("/r/{}/wiki/{}", req.param("sub").unwrap_or_default(), req.param("wiki").unwrap_or_default())
+}
+
 async fn pwa_logo() -> Result<Response<Body>, String> {
 	Ok(
 		Response::builder()
@@ -406,9 +411,7 @@ async fn main() {
 	app
 		.at("/r/:sub/w")
 		.get(|r| async move { Ok(redirect(&format!("/r/{}/wiki", r.param("sub").unwrap_or_default()))) }.boxed());
-	app
-		.at("/r/:sub/w/*page")
-		.get(|r| async move { Ok(redirect(&format!("/r/{}/wiki/{}", r.param("sub").unwrap_or_default(), r.param("wiki").unwrap_or_default()))) }.boxed());
+	app.at("/r/:sub/w/*page").get(|r| async move { Ok(redirect(&sub_wiki_page_path(&r))) }.boxed());
 	app.at("/r/:sub/wiki").get(|r| subreddit::wiki(r).boxed());
 	app.at("/r/:sub/wiki/*page").get(|r| subreddit::wiki(r).boxed());
 
@@ -541,4 +544,23 @@ fn proxied_text(body: Result<String, String>, content_type: &str) -> Response<Bo
 		}
 	}
 	.unwrap_or_default()
+}
+
+#[cfg(test)]
+mod wiki_redirect_tests {
+	use super::*;
+
+	// Audit info item (main.rs:421): the route captures `page` but the
+	// handler read `wiki`, so /r/rust/w/faq went to /r/rust/wiki/.
+	#[test]
+	fn test_sub_wiki_shortcut_keeps_the_page() {
+		let mut router = route_recognizer::Router::new();
+		router.add("/r/:sub/w/*page", ());
+		let found = router.recognize("/r/rust/w/faq/intro").unwrap();
+
+		let mut req = Request::get("/r/rust/w/faq/intro").body(Body::empty()).unwrap();
+		req.set_params(found.params().clone());
+
+		assert_eq!(sub_wiki_page_path(&req), "/r/rust/wiki/faq/intro");
+	}
 }

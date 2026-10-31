@@ -1,4 +1,4 @@
-use super::{check_json, non_json_failure, Backend, Failure, Fetch};
+use super::{check_json, non_json_failure, session_refuses, Backend, Failure, Fetch};
 use crate::client::session_cookies;
 use log::{trace, warn};
 use obscura::Browser;
@@ -63,6 +63,10 @@ impl Backend for ObscuraCookiedJson {
 
 	fn fetch<'a>(&'a self, path: &'a str, _quarantine: bool) -> Fetch<'a> {
 		Box::pin(async move {
+			// Never ask as the account for what only the account itself should see
+			if session_refuses(path) {
+				return Err(Failure::Unsupported);
+			}
 			let (status, body) = get(path).await.map_err(|e| Failure::Network(format!("Couldn't send request to Reddit: {e} | {path}")))?;
 			match serde_json::from_slice::<Value>(&body) {
 				Ok(json) => check_json(json, path).await,

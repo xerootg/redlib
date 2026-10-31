@@ -296,6 +296,21 @@ fn cursor_owner(path: &str) -> Option<&'static str> {
 	})
 }
 
+/// What `fetch` answers for a page that only exists for a logged-in account.
+pub const ACCOUNT_ONLY_ERROR: &str = "Reddit only shows this page to the account it belongs to, and Redlib never signs in as a visitor.";
+
+/// Whether `path` is a page that belongs to a logged-in account, so no backend may be asked for it.
+fn is_account_only(_path: &str) -> bool {
+	false
+}
+
+/// Whether a logged-in session must not be asked for `path`: everything
+/// `is_account_only` refuses, plus pages that show an account's private data
+/// when the account owns them.
+pub(crate) fn session_refuses(_path: &str) -> bool {
+	false
+}
+
 /// Fetches `path` from the first backend that serves it, and names that backend.
 #[cached(max_size = 100, ttl_secs = 30)]
 pub async fn fetch(path: String, quarantine: bool) -> Result<(Value, &'static str), String> {
@@ -608,6 +623,170 @@ mod tests {
 			// quarantine to false to specifically catch when we _don't_ catch it
 			let link = json("/r/drugs/about.json?raw_json=1".into(), false).await;
 			assert_eq!(link, Err("gated".into()));
+		});
+	}
+}
+
+#[cfg(test)]
+mod account_only_tests {
+	use super::*;
+
+	#[test]
+	fn test_private_user_listings_are_account_only() {
+		for listing in [
+			"saved",
+			"upvoted",
+			"downvoted",
+			"hidden",
+			"SAVED",
+			"%73aved",
+			"saved.json",
+			"watching",
+			"preferences",
+			"overview/../saved",
+			"overview/saved",
+		] {
+			let path = format!("/user/spez/{listing}.json?raw_json=1");
+			assert!(is_account_only(&path), "{path}");
+			assert!(is_account_only(&path.replace("/user/", "/u/")), "{path}");
+		}
+		assert!(is_account_only("/user/spez/saved.json?raw_json=1&sort=new"));
+		assert!(is_account_only("/user/spez/upvoted?raw_json=1"));
+	}
+
+	#[test]
+	fn test_dot_segments_cannot_reach_account_only_pages() {
+		for path in [
+			"/user/spez/comments/../saved.json?raw_json=1",
+			"/user/spez/comments/%2e%2e/saved.json",
+			"/user/spez/comments/abc/../../me/about.json",
+			"/r/rust/../mod/hot.json",
+			"/r/rust/%2E%2E/friends/hot.json",
+			"/user/spez/./saved.json",
+		] {
+			assert!(is_account_only(path), "{path}");
+		}
+	}
+
+	#[test]
+	fn test_user_me_is_account_only() {
+		for path in [
+			"/user/me/about.json?raw_json=1",
+			"/user/me/overview.json",
+			"/user/ME/submitted.json",
+			"/u/me.json",
+			"/user/%6De/about.json",
+		] {
+			assert!(is_account_only(path), "{path}");
+		}
+		assert!(!is_account_only("/user/meme/about.json?raw_json=1"));
+		assert!(!is_account_only("/user/me_irl/overview.json"));
+	}
+
+	#[test]
+	fn test_mod_and_friends_feeds_are_account_only() {
+		for path in [
+			"/r/mod/hot.json?raw_json=1",
+			"/r/friends/new.json?raw_json=1",
+			"/r/Mod/about.json?raw_json=1",
+			"/r/mod.json",
+			"/r/rust%2Bmod/hot.json?raw_json=1",
+			"/r/friends%2Brust/hot.json",
+			"/r/rust+friends/hot.json",
+			"/r/%6Dod/hot.json",
+			"/r/mod/search.json?q=a&restrict_sr=on",
+		] {
+			assert!(is_account_only(path), "{path}");
+		}
+		for path in [
+			"/r/modest/hot.json",
+			"/r/friendsofrust/hot.json",
+			"/r/rust%2Bprogramming/hot.json",
+			"/r/rust/comments/abc/mod.json",
+		] {
+			assert!(!is_account_only(path), "{path}");
+		}
+	}
+
+	#[test]
+	fn test_public_user_pages_are_not_account_only() {
+		for path in [
+			"/user/spez/about.json?raw_json=1",
+			"/user/spez.json",
+			"/user/spez/overview.json?raw_json=1",
+			"/user/spez/submitted.json?sort=top&t=all&raw_json=1",
+			"/user/spez/comments.json?raw_json=1",
+			"/user/spez/gilded.json?raw_json=1",
+			"/user/spez/Comments.json",
+			"/u/spez/comments.json",
+			"/user/spez/comments/abc123/a_title.json?raw_json=1",
+			"/user/kjoneslol/m/sfwpornnetwork/hot.json?raw_json=1",
+			"/r/rust/hot.json?raw_json=1",
+			"/r/all/new.json",
+			"/r/popular/hot.json?geo_filter=GLOBAL",
+			"/by_id/t3_abc.json",
+			"/search.json?q=saved",
+			"/r/rust/search.json?q=user/me/saved&restrict_sr=on",
+			"/user/spez/overview.json?x=/user/me/saved",
+		] {
+			assert!(!is_account_only(path), "{path}");
+		}
+	}
+
+	#[test]
+	fn test_sessions_refuse_account_only_pages_and_multireddits() {
+		for path in [
+			"/user/spez/saved.json",
+			"/user/me/about.json",
+			"/r/mod/hot.json",
+			"/user/spez/m/private_multi/hot.json?raw_json=1",
+		] {
+			assert!(session_refuses(path), "{path}");
+		}
+		for path in [
+			"/user/spez/about.json",
+			"/user/spez/gilded.json",
+			"/user/spez/comments/abc/t.json",
+			"/r/rust/hot.json",
+			"/r/rust/comments/abc.json",
+		] {
+			assert!(!session_refuses(path), "{path}");
+		}
+	}
+
+	#[test]
+	fn test_fetch_refuses_account_only_pages_before_any_backend() {
+		crate::client::block_on_shared(async {
+			for path in [
+				"/user/spez/saved.json?raw_json=1",
+				"/user/spez/hidden.json",
+				"/user/me/about.json",
+				"/r/mod/hot.json",
+				"/r/friends/hot.json?raw_json=1",
+			] {
+				assert_eq!(
+					fetch(path.to_string(), false).await.map(|(_, backend)| backend),
+					Err(ACCOUNT_ONLY_ERROR.to_string()),
+					"{path}"
+				);
+				assert_eq!(json(path.to_string(), true).await, Err(ACCOUNT_ONLY_ERROR.to_string()), "{path}");
+			}
+		});
+	}
+
+	#[test]
+	fn test_session_backends_refuse_account_only_pages() {
+		crate::client::block_on_shared(async {
+			for path in [
+				"/user/spez/saved.json?raw_json=1",
+				"/user/spez/upvoted.json",
+				"/user/me/about.json",
+				"/r/mod/hot.json",
+				"/user/spez/m/multi/hot.json",
+			] {
+				let result = cookied_json::CookiedJson.fetch(path, false).await;
+				assert!(matches!(result, Err(Failure::Unsupported)), "{path}: {result:?}");
+			}
 		});
 	}
 }

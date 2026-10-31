@@ -4,7 +4,7 @@ use crate::{
 };
 use arc_swap::ArcSwap;
 use base64::{engine::general_purpose, Engine as _};
-use log::{error, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use serde_json::json;
 use std::{collections::HashMap, sync::atomic::Ordering, time::Duration};
 use tegen::tegen::TextGenerator;
@@ -534,7 +534,7 @@ impl Device {
 			("X-Reddit-Http-QoS".into(), "GOOD".into()),
 		]);
 
-		info!("[🔄] Spoofing Android client with headers: {headers:?}, uuid: \"{uuid}\", and OAuth ID \"{REDDIT_ANDROID_OAUTH_CLIENT_ID}\"");
+		debug!("[🔄] Spoofing Android client with headers: {headers:?}, uuid: \"{uuid}\", and OAuth ID \"{REDDIT_ANDROID_OAUTH_CLIENT_ID}\"");
 
 		Self {
 			oauth_id: REDDIT_ANDROID_OAUTH_CLIENT_ID.to_string(),

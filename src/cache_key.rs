@@ -136,6 +136,8 @@ pub fn entry_key(path: &str) -> String {
 /// Whether no segment of the path in `path` (up to any `?`) is longer than `MAX_SEGMENT_LEN`.
 pub fn segments_within_limit(path: &str) -> bool {
 	let route = path.split('?').next().unwrap_or_default();
+	// post.rs adds .json to the visitor's last segment
+	let route = route.strip_suffix(".json").unwrap_or(route);
 	route.split('/').all(|segment| segment.len() <= MAX_SEGMENT_LEN)
 }
 

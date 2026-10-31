@@ -1127,6 +1127,56 @@ pub fn setting_or_default(req: &Request<Body>, name: &str, default: String) -> S
 	}
 }
 
+#[cfg(test)]
+mod numbered_cookie_tests {
+	use super::{setting, Preferences};
+	use crate::body::Body;
+	use hyper::Request;
+	use std::sync::mpsc;
+	use std::time::Duration;
+
+	fn request_with_cookies(cookies: &str) -> Request<Body> {
+		Request::builder().uri("/").header("Cookie", cookies).body(Body::empty()).unwrap()
+	}
+
+	// The security audit's payload: "name=a; name1=a; ...; name{count-1}=a"
+	fn numbered_cookies(name: &str, count: usize) -> String {
+		let mut cookies = format!("{name}=a");
+		for n in 1..count {
+			cookies.push_str(&format!("; {name}{n}=a"));
+		}
+		cookies
+	}
+
+	#[test]
+	fn setting_joins_numbered_cookies_in_order() {
+		let req = request_with_cookies("subscriptions=rust+linux+; subscriptions1=pics; filters=news+; filters1=bestof; filters3=gap");
+		assert_eq!(setting(&req, "subscriptions"), "rust+linux+pics");
+		assert_eq!(setting(&req, "filters"), "news+bestof");
+	}
+
+	#[test]
+	fn setting_reads_at_most_64_numbered_cookies() {
+		let req = request_with_cookies(&numbered_cookies("subscriptions", 1000));
+		// The unnumbered cookie plus subscriptions1..=subscriptions64
+		assert_eq!(setting(&req, "subscriptions"), "a".repeat(65));
+	}
+
+	#[test]
+	fn preferences_with_thousands_of_numbered_cookies_is_fast() {
+		// 18000 cookies (about 385 KB) stalled the server for 255 s in the audit,
+		// because every numbered cookie lookup re-parsed the whole Cookie header.
+		let (done, finished) = mpsc::channel();
+		std::thread::spawn(move || {
+			let req = request_with_cookies(&format!("{}; {}", numbered_cookies("subscriptions", 18000), numbered_cookies("filters", 18000)));
+			let prefs = Preferences::new(&req);
+			done.send((prefs.subscriptions.len(), prefs.filters.len())).unwrap();
+		});
+		let counts = finished.recv_timeout(Duration::from_secs(10)).expect("Preferences::new took longer than 10 s");
+		assert_eq!(counts, (1, 1));
+	}
+}
+
 /// Detect and redirect in the event of a random subreddit
 pub async fn catch_random(sub: &str, additional: &str) -> Result<Response<Body>, String> {
 	if sub == "random" || sub == "randnsfw" {

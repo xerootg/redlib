@@ -887,7 +887,7 @@ pub async fn logout(_req: Request<Body>) -> Result<Response<Body>, String> {
 /// Static files, `/healthz/reddit` and `/mcp` are gated like everything
 /// else; MCP clients present `REDLIB_MCP_TOKEN` as a bearer token, which
 /// opens `/mcp` and nothing else.
-pub fn gate(peer: IpAddr, path: &str, _query: Option<&str>, headers: &HeaderMap) -> Option<Response<Body>> {
+pub fn gate(peer: IpAddr, path: &str, query: Option<&str>, headers: &HeaderMap) -> Option<Response<Body>> {
 	if !AUTH.enabled {
 		return None;
 	}
@@ -934,11 +934,27 @@ pub fn gate(peer: IpAddr, path: &str, _query: Option<&str>, headers: &HeaderMap)
 		);
 	}
 
-	let target = format!("/oidc/login?redirect={}", urlencoding_path(path));
-	Some(redirect_to(&target, &[]))
+	Some(redirect_to(&login_target(path, query), &[]))
 }
 
-/// Percent-encodes a path for use as a query-string value.
+/// Longest path and query the login redirect will carry. It comes back in
+/// the signed login cookie, and browsers drop cookies over 4 KiB.
+const MAX_REDIRECT_LEN: usize = 1024;
+
+/// The login URL that sends the user back to `path` and `query` afterwards.
+/// The login endpoint validates the target again, so this only has to keep
+/// it small: the query is dropped if it is too long, the path as well if
+/// that is.
+fn login_target(path: &str, query: Option<&str>) -> String {
+	let full = match query.filter(|q| !q.is_empty()) {
+		Some(q) => format!("{path}?{q}"),
+		None => path.to_string(),
+	};
+	let back = [full.as_str(), path].into_iter().find(|p| p.len() <= MAX_REDIRECT_LEN).unwrap_or("/");
+	format!("/oidc/login?redirect={}", urlencoding_path(back))
+}
+
+/// Percent-encodes a path (and query) for use as a query-string value.
 fn urlencoding_path(path: &str) -> String {
 	serde_urlencoded::to_string([("r", path)])
 		.map(|s| s.trim_start_matches("r=").to_string())
@@ -1011,7 +1027,7 @@ mod login_query_tests {
 	])]
 	fn the_query_cannot_point_the_redirect_off_site() {
 		// A query is just data after a local path, however URL-shaped.
-		for query in ["redirect=https://evil.example", "next=//evil.example", "u=http://evil.example/&x=\\evil"] {
+		for query in ["redirect=https://evil.example", "next=//evil.example", "u=http://evil.example/&x=1"] {
 			let target = landing(&login_location("/", Some(query)));
 			assert_eq!(target, format!("/?{query}"));
 			assert!(target.starts_with("/?"), "{target}");
@@ -1022,6 +1038,7 @@ mod login_query_tests {
 		assert_eq!(landing(&login_location("//evil.example", Some("q=x"))), "/");
 		// So is a query a browser would read differently from the server.
 		assert_eq!(landing(&login_location("/search", Some("q=a\tb"))), "/");
+		assert_eq!(landing(&login_location("/search", Some("q=a\\b"))), "/");
 	}
 
 	// The target lives in a cookie, and browsers drop cookies over 4 KiB, which

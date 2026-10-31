@@ -707,7 +707,12 @@ mod confirm_page_tests {
 	/// protocol-relative URL pointing at another host.
 	#[test]
 	fn form_action_is_a_fixed_route_with_the_query() {
-		for uri in ["//settings//restore?theme=light", "/settings%2Frestore?theme=light", "/settings/restore/?theme=light", "/settings/restore?theme=light"] {
+		for uri in [
+			"//settings//restore?theme=light",
+			"/settings%2Frestore?theme=light",
+			"/settings/restore/?theme=light",
+			"/settings/restore?theme=light",
+		] {
 			let body = body_of(block_on(restore(get(uri))).unwrap());
 			assert!(body.contains("method=\"post\" action=\"/settings/restore?theme=light\""), "{uri}: {body}");
 		}

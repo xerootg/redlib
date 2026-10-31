@@ -2,8 +2,9 @@ use crate::{
 	client::{CLIENT, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER, OAUTH_RATELIMIT_REMAINING},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 };
+use arc_swap::ArcSwap;
 use base64::{engine::general_purpose, Engine as _};
-use log::{error, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use serde_json::json;
 use std::{collections::HashMap, sync::atomic::Ordering, time::Duration};
 use tegen::tegen::TextGenerator;
@@ -26,6 +27,16 @@ const ANDROID_DEVICE_LIST: &[&str] = &[
 const AUTH_ENDPOINT: &str = "https://www.reddit.com";
 
 const OAUTH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long startup waits for the first token before it serves without one.
+const STARTUP_WAIT: Duration = Duration::from_secs(30);
+
+/// Failed attempts after which a token request gives up.
+const MAX_ATTEMPTS: u32 = 10;
+
+/// How long a failed refresh blocks the next one, so that every request
+/// seeing the old token doesn't start its own round of attempts.
+const REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
 
 // Response from OAuth backend authentication
 #[derive(Debug, Clone)]
@@ -81,22 +92,56 @@ pub struct Oauth {
 }
 
 impl Oauth {
-	/// Create a new OAuth client
-	pub(crate) async fn new() -> Self {
+	/// A client without a token, for a start while the token endpoint is
+	/// down. Requests made with it fail with 401, which starts a refresh,
+	/// and `token_daemon` (which waits `expires_in` minus two minutes) tries
+	/// again after a minute.
+	pub(crate) fn without_token() -> Self {
+		let backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new());
+		Self {
+			headers_map: backend.get_headers(),
+			expires_in: 180,
+			backend,
+		}
+	}
+
+	/// The first client, for startup: `None` when no token came within
+	/// `STARTUP_WAIT`.
+	pub(crate) async fn try_new_at_startup() -> Option<Self> {
+		Self::new_within(STARTUP_WAIT, Self::new_with_timeout_with_backend, OAUTH_TIMEOUT).await
+	}
+
+	/// `new_with`, but gives up after `wait`.
+	async fn new_within<F, Fut>(wait: Duration, attempt: F, pause: Duration) -> Option<Self>
+	where
+		F: FnMut(OauthBackendImpl) -> Fut,
+		Fut: std::future::Future<Output = Result<Result<Self, AuthError>, Elapsed>>,
+	{
+		timeout(wait, Self::new_with(attempt, pause)).await.ok().flatten()
+	}
+
+	/// Calls `attempt` until it yields a client, waiting `pause` (doubled
+	/// after each failure, up to four times as long) between tries. Gives up
+	/// after `MAX_ATTEMPTS` failures.
+	async fn new_with<F, Fut>(mut attempt: F, pause: Duration) -> Option<Self>
+	where
+		F: FnMut(OauthBackendImpl) -> Fut,
+		Fut: std::future::Future<Output = Result<Result<Self, AuthError>, Elapsed>>,
+	{
 		// Try MobileSpoofAuth first, then fall back to GenericWebAuth
-		let mut failure_count = 0;
+		let mut failure_count: u32 = 0;
 		let mut backend = OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new());
 
 		loop {
-			let attempt = Self::new_with_timeout_with_backend(backend.clone()).await;
-			match attempt {
+			let result = attempt(backend.clone()).await;
+			match result {
 				Ok(Ok(oauth)) => {
 					info!("[✅] Successfully created OAuth client");
-					return oauth;
+					return Some(oauth);
 				}
 				Ok(Err(e)) => {
 					error!(
-						"[⛔] Failed to create OAuth client: {}. Retrying in 5 seconds...",
+						"[⛔] Failed to create OAuth client: {}. Retrying shortly...",
 						match e {
 							AuthError::Wreq(error) => error.to_string(),
 							AuthError::SerdeDeserialize(error) => error.to_string(),
@@ -105,7 +150,7 @@ impl Oauth {
 					);
 				}
 				Err(_) => {
-					error!("[⛔] Failed to create OAuth client before timeout. Retrying in 5 seconds...");
+					error!("[⛔] Failed to create OAuth client before timeout. Retrying shortly...");
 				}
 			}
 
@@ -117,13 +162,13 @@ impl Oauth {
 				backend = OauthBackendImpl::GenericWeb(GenericWebAuth::new());
 			}
 
-			// Crash after 10 total failures
-			if failure_count >= 10 {
+			// Give up after 10 total failures
+			if failure_count >= MAX_ATTEMPTS {
 				error!("[⛔] Failed to create OAuth client (mobile + generic)");
-				std::process::exit(1);
+				return None;
 			}
 
-			tokio::time::sleep(OAUTH_TIMEOUT).await;
+			tokio::time::sleep(pause * 2u32.pow((failure_count - 1).min(2))).await;
 		}
 	}
 
@@ -169,14 +214,39 @@ impl From<serde_json::Error> for AuthError {
 	}
 }
 
+/// The shortest wait before `token_daemon` refreshes the token again.
+const MIN_REFRESH_DELAY: Duration = Duration::from_secs(60);
+
+/// How long to wait before refreshing a token that is valid for `expires_in` seconds.
+fn refresh_delay(expires_in: u64) -> Duration {
+	Duration::from_secs(expires_in.saturating_sub(120)).max(MIN_REFRESH_DELAY)
+}
+
+/// How long `token_daemon` waits before its next refresh: for a refresh that
+/// failed, the token it still holds is about to run out, so not as long as it
+/// would have lasted.
+fn refresh_after(refreshed: bool, expires_in: u64) -> Duration {
+	if refreshed {
+		refresh_delay(expires_in)
+	} else {
+		MIN_REFRESH_DELAY
+	}
+}
+
+/// The first 32 characters of a token, for the log.
+fn token_preview(token: &str) -> &str {
+	token.char_indices().nth(32).map_or(token, |(end, _)| &token[..end])
+}
+
 pub async fn token_daemon() {
 	// Monitor for refreshing token
+	let mut refreshed = true;
 	loop {
 		// Get expiry time - be sure to not hold the read lock
 		let expires_in = { OAUTH_CLIENT.load_full().expires_in };
 
 		// sleep for the expiry time minus 2 minutes
-		let duration = Duration::from_secs(expires_in - 120);
+		let duration = refresh_after(refreshed, expires_in);
 
 		info!("[⏳] Waiting for {duration:?} seconds before refreshing OAuth token...");
 
@@ -186,22 +256,51 @@ pub async fn token_daemon() {
 
 		// Refresh token - in its own scope
 		{
-			force_refresh_token().await;
+			refreshed = force_refresh_token().await;
 		}
 	}
 }
 
-pub async fn force_refresh_token() {
+/// Whether a new token was had.
+pub async fn force_refresh_token() -> bool {
 	if OAUTH_IS_ROLLING_OVER.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
 		trace!("Skipping refresh token roll over, already in progress");
-		return;
+		return false;
 	}
 
 	trace!("Rolling over refresh token. Current rate limit: {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst));
-	let new_client = Oauth::new().await;
-	OAUTH_CLIENT.swap(new_client.into());
-	OAUTH_RATELIMIT_REMAINING.store(99, Ordering::SeqCst);
-	OAUTH_IS_ROLLING_OVER.store(false, Ordering::SeqCst);
+	let refreshed = refresh_into(&OAUTH_CLIENT, Oauth::new_with_timeout_with_backend, OAUTH_TIMEOUT).await;
+	if refreshed {
+		OAUTH_RATELIMIT_REMAINING.store(99, Ordering::SeqCst);
+		OAUTH_IS_ROLLING_OVER.store(false, Ordering::SeqCst);
+	} else {
+		// Keep the flag set for a while, so that the requests which see the
+		// old token don't each start another round of attempts.
+		tokio::spawn(async {
+			tokio::time::sleep(REFRESH_COOLDOWN).await;
+			OAUTH_IS_ROLLING_OVER.store(false, Ordering::SeqCst);
+		});
+	}
+	refreshed
+}
+
+/// Replaces the client in `target` with a fresh one. Keeps the current client
+/// and returns `false` when no token could be had.
+async fn refresh_into<F, Fut>(target: &ArcSwap<Oauth>, attempt: F, pause: Duration) -> bool
+where
+	F: FnMut(OauthBackendImpl) -> Fut,
+	Fut: std::future::Future<Output = Result<Result<Oauth, AuthError>, Elapsed>>,
+{
+	match Oauth::new_with(attempt, pause).await {
+		Some(new_client) => {
+			target.store(new_client.into());
+			true
+		}
+		None => {
+			error!("[⛔] Could not refresh the OAuth token. Keeping the current one.");
+			false
+		}
+	}
 }
 
 #[derive(Debug, Clone, Default)]
@@ -294,7 +393,7 @@ impl MobileSpoofAuth {
 			.as_u64()
 			.ok_or_else(|| AuthError::Field((json.clone(), "expires_in: as_u64")))?;
 
-		info!("[✅] Success - Retrieved token \"{}...\", expires in {}", &token[..32], expires_in);
+		info!("[✅] Success - Retrieved token \"{}...\", expires in {}", token_preview(&token), expires_in);
 
 		Ok(OauthResponse {
 			token,
@@ -407,11 +506,7 @@ impl OauthBackend for GenericWebAuth {
 			.ok_or_else(|| field("token_v2 cookie"))?;
 		let expires_in = token_lifetime(&token).ok_or_else(|| field("token_v2 expiry"))?;
 
-		info!(
-			"[✅] GenericWebAuth success - Retrieved token \"{}...\", expires in {}",
-			&token[..32.min(token.len())],
-			expires_in
-		);
+		info!("[✅] GenericWebAuth success - Retrieved token \"{}...\", expires in {}", token_preview(&token), expires_in);
 
 		// Insert a few necessary headers
 		self.additional_headers.insert("Origin".to_owned(), "https://www.reddit.com".to_owned());
@@ -466,7 +561,7 @@ impl Device {
 			("X-Reddit-Http-QoS".into(), "GOOD".into()),
 		]);
 
-		info!("[🔄] Spoofing Android client with headers: {headers:?}, uuid: \"{uuid}\", and OAuth ID \"{REDDIT_ANDROID_OAUTH_CLIENT_ID}\"");
+		debug!("[🔄] Spoofing Android client with headers: {headers:?}, uuid: \"{uuid}\", and OAuth ID \"{REDDIT_ANDROID_OAUTH_CLIENT_ID}\"");
 
 		Self {
 			oauth_id: REDDIT_ANDROID_OAUTH_CLIENT_ID.to_string(),
@@ -483,6 +578,175 @@ impl Device {
 
 fn choose<T: Copy>(list: &[T]) -> T {
 	*fastrand::choose_multiple(list.iter(), 1)[0]
+}
+
+#[cfg(test)]
+mod retry_tests {
+	use super::*;
+	use std::sync::{
+		atomic::{AtomicU32, Ordering},
+		Arc,
+	};
+
+	fn failure() -> Result<Result<Oauth, AuthError>, Elapsed> {
+		Ok(Err(AuthError::Field((serde_json::Value::Null, "token endpoint is down"))))
+	}
+
+	fn client(token: &str) -> Oauth {
+		Oauth {
+			headers_map: HashMap::from([("Authorization".to_owned(), format!("Bearer {token}"))]),
+			expires_in: 86400,
+			backend: OauthBackendImpl::MobileSpoof(MobileSpoofAuth::new()),
+		}
+	}
+
+	// Audit #18: ten failed attempts ended the process (oauth.rs, Oauth::new),
+	// from a refresh a page view had started.
+	#[test]
+	fn test_gives_up_instead_of_exiting() {
+		let tries = Arc::new(AtomicU32::new(0));
+		let counter = tries.clone();
+		let result = crate::client::block_on_shared(Oauth::new_with(
+			move |_| {
+				counter.fetch_add(1, Ordering::SeqCst);
+				async { failure() }
+			},
+			Duration::ZERO,
+		));
+		assert!(result.is_none());
+		assert_eq!(tries.load(Ordering::SeqCst), 10);
+	}
+
+	// Audit finding #18: startup waited for a token as long as it took, and
+	// then exited, which put the pod in CrashLoopBackOff while Reddit's token
+	// endpoint was down, although settings, login and static pages need no token.
+	#[test]
+	fn test_startup_stops_waiting_for_a_token() {
+		let hanging = crate::client::block_on_shared(Oauth::new_within(
+			Duration::from_millis(50),
+			|_| std::future::pending::<Result<Result<Oauth, AuthError>, Elapsed>>(),
+			Duration::ZERO,
+		));
+		assert!(hanging.is_none());
+
+		let late = crate::client::block_on_shared(Oauth::new_within(Duration::from_millis(500), |_| async { Ok(Ok(client("in time"))) }, Duration::ZERO));
+		assert_eq!(late.unwrap().headers_map["Authorization"], "Bearer in time");
+	}
+
+	#[test]
+	fn test_failed_refresh_keeps_the_old_token() {
+		let target = ArcSwap::from_pointee(client("old"));
+		let refreshed = crate::client::block_on_shared(refresh_into(&target, |_| async { failure() }, Duration::ZERO));
+		assert!(!refreshed);
+		assert_eq!(target.load().headers_map["Authorization"], "Bearer old");
+
+		let refreshed = crate::client::block_on_shared(refresh_into(&target, |_| async { Ok(Ok(client("new"))) }, Duration::ZERO));
+		assert!(refreshed);
+		assert_eq!(target.load().headers_map["Authorization"], "Bearer new");
+	}
+
+	#[test]
+	fn test_recovers_after_failures() {
+		let tries = Arc::new(AtomicU32::new(0));
+		let counter = tries.clone();
+		let result = crate::client::block_on_shared(Oauth::new_with(
+			move |_| {
+				let n = counter.fetch_add(1, Ordering::SeqCst);
+				async move {
+					if n < 7 {
+						failure()
+					} else {
+						Ok(Ok(client("fresh")))
+					}
+				}
+			},
+			Duration::ZERO,
+		));
+		assert_eq!(result.unwrap().headers_map["Authorization"], "Bearer fresh");
+		assert_eq!(tries.load(Ordering::SeqCst), 8);
+	}
+
+	#[test]
+	fn test_falls_back_to_the_web_backend_after_five_failures() {
+		let generic_tries = Arc::new(AtomicU32::new(0));
+		let counter = generic_tries.clone();
+		let _ = crate::client::block_on_shared(Oauth::new_with(
+			move |backend| {
+				if matches!(backend, OauthBackendImpl::GenericWeb(_)) {
+					counter.fetch_add(1, Ordering::SeqCst);
+				}
+				async { failure() }
+			},
+			Duration::ZERO,
+		));
+		assert_eq!(generic_tries.load(Ordering::SeqCst), 5);
+	}
+}
+
+#[cfg(test)]
+mod hardening_tests {
+	use super::*;
+
+	/// Collects what the current thread logs.
+	struct Capture(std::sync::Mutex<Vec<(std::thread::ThreadId, log::Level, String)>>);
+
+	impl log::Log for Capture {
+		fn enabled(&self, _: &log::Metadata) -> bool {
+			true
+		}
+
+		fn log(&self, record: &log::Record) {
+			self.0.lock().unwrap().push((std::thread::current().id(), record.level(), record.args().to_string()));
+		}
+
+		fn flush(&self) {}
+	}
+
+	// Audit info item (oauth.rs:469): the spoofed device id and uuid went to
+	// the log at info level, which is the level the deployment runs at.
+	#[test]
+	fn test_device_headers_are_not_logged_at_info() {
+		static CAPTURE: Capture = Capture(std::sync::Mutex::new(Vec::new()));
+		log::set_logger(&CAPTURE).expect("no other test installs a logger");
+		log::set_max_level(log::LevelFilter::Trace);
+
+		let device = Device::android();
+
+		let me = std::thread::current().id();
+		let uuid = &device.headers["X-Reddit-Device-Id"];
+		let records = CAPTURE.0.lock().unwrap();
+		let mine: Vec<_> = records.iter().filter(|(thread, ..)| *thread == me).collect();
+		assert!(
+			mine.iter().any(|(_, _, message)| message.contains(uuid.as_str())),
+			"the device is no longer logged at all: {mine:?}"
+		);
+		for (_, level, message) in mine {
+			assert!(*level > log::Level::Info || !message.contains(uuid.as_str()), "{level}: {message}");
+		}
+	}
+
+	// Audit info item (oauth.rs:297): `&token[..32]` panics on a token that is
+	// shorter than 32 bytes, or one with a multibyte character at byte 32.
+	#[test]
+	fn test_token_preview_of_short_tokens() {
+		assert_eq!(token_preview(""), "");
+		assert_eq!(token_preview("abc"), "abc");
+		let long = "a".repeat(40);
+		assert_eq!(token_preview(&long), "a".repeat(32));
+		let wide = "\u{20ac}".repeat(40);
+		assert_eq!(token_preview(&wide), "\u{20ac}".repeat(32));
+	}
+
+	// Audit info item: `expires_in - 120` wrapped to a sleep of 584 billion
+	// years in release builds when Reddit answered with a short expiry, which
+	// stopped the refreshes (and panicked the task in debug builds).
+	#[test]
+	fn test_refresh_delay_with_a_short_expiry() {
+		assert_eq!(refresh_delay(86400), Duration::from_secs(86280));
+		for expires_in in [0, 60, 119, 120, 121, u64::MAX] {
+			assert!(refresh_delay(expires_in) >= Duration::from_secs(60), "{expires_in}");
+		}
+	}
 }
 
 #[cfg(test)]
@@ -586,5 +850,19 @@ mod tests {
 		// Test that both backends can be created
 		MobileSpoofAuth::new();
 		GenericWebAuth::new();
+	}
+}
+
+// Review of the fix for audit finding #18: after a failed refresh the daemon
+// slept for the whole life of a token it had already used up.
+#[cfg(test)]
+mod daemon_tests {
+	use super::*;
+
+	#[test]
+	fn test_a_failed_refresh_is_tried_again_soon() {
+		assert_eq!(refresh_after(true, 86400), Duration::from_secs(86400 - 120));
+		assert_eq!(refresh_after(false, 86400), MIN_REFRESH_DELAY);
+		assert_eq!(refresh_after(false, 30), MIN_REFRESH_DELAY);
 	}
 }

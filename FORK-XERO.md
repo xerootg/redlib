@@ -79,12 +79,16 @@ The same gate CI runs before it builds an image:
 ```bash
 cargo +stable fmt --all -- --check
 cargo +stable clippy --locked --all-targets -- -D warnings
-cargo +stable test --locked -- --skip live_tests::
+scripts/network-tests.sh check
+cargo +stable test --locked -- $(scripts/network-tests.sh skip)
 ```
 
-The `live_tests` module calls Reddit and is skipped in CI, because Reddit
-captchas GitHub's runners. Run it locally after a sync:
-`cargo +stable test --locked live_tests::`.
+Tests that call Reddit are listed in `scripts/network-tests.txt` and
+skipped by the gating job, because Reddit captchas and rate-limits GitHub's
+runners; a non-gating `live` job runs them. Run them locally after a sync:
+`cargo +stable test --locked -- $(scripts/network-tests.sh only)`. When you
+add a test that needs the network, add it to the list (running the suite
+under `unshare -rn` with loopback up shows which tests need it).
 
 Use the stable toolchain: `sealed_test` doesn't build on nightly.
 

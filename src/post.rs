@@ -370,6 +370,35 @@ fn build_comment(
 }
 
 #[cfg(test)]
+mod comment_cookie_tests {
+	use super::parse_comments;
+	use crate::body::Body;
+	use hyper::Request;
+	use std::collections::HashSet;
+	use std::sync::mpsc;
+	use std::time::Duration;
+
+	#[test]
+	fn many_comments_with_a_large_cookie_header_render_fast() {
+		// build_comment read every preference from the Cookie header once per comment, so a
+		// forged 20 KB header made one thread page cost comments x settings x header size.
+		let children: Vec<serde_json::Value> = (0..300)
+			.map(|n| serde_json::json!({"kind": "t1", "data": {"id": format!("c{n}"), "author": "a", "body": "hi", "body_html": "<p>hi</p>", "parent_id": "t3_x"}}))
+			.collect();
+		let json = serde_json::json!({"data": {"children": children}});
+		let cookies = (0..2000).map(|n| format!("c{n}=b")).collect::<Vec<_>>().join("; ");
+
+		let (done, finished) = mpsc::channel();
+		std::thread::spawn(move || {
+			let req = Request::builder().uri("/").header("Cookie", cookies).body(Body::empty()).unwrap();
+			done.send(parse_comments(&json, "/r/x/comments/1/t/", "a", "", &HashSet::new(), &req).len()).unwrap();
+		});
+		let count = finished.recv_timeout(Duration::from_secs(10)).expect("parse_comments took longer than 10 s");
+		assert_eq!(count, 300);
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 

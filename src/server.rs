@@ -237,6 +237,37 @@ impl RequestExt for Request<Body> {
 	}
 }
 
+#[cfg(test)]
+mod cookie_lookup_tests {
+	use super::RequestExt;
+	use crate::body::Body;
+	use hyper::Request;
+	use std::sync::mpsc;
+	use std::time::Duration;
+
+	#[test]
+	fn cookie_lookup_does_not_parse_the_whole_header() {
+		// Every lookup of one name parsed all of the Cookie header (audit finding 1). A page
+		// reads about 30 settings, a comment thread once per comment: 18000 cookies is ~385 KB.
+		let mut cookies = String::from("theme=dark");
+		for n in 0..18000 {
+			cookies.push_str(&format!("; subscriptions{n}=a"));
+		}
+		let (done, finished) = mpsc::channel();
+		std::thread::spawn(move || {
+			let req = Request::builder().uri("/").header("Cookie", cookies).body(Body::empty()).unwrap();
+			let mut found = 0;
+			for _ in 0..2000 {
+				found += usize::from(req.cookie("not_there").is_some());
+			}
+			done.send((found, req.cookie("theme").map(|c| c.value().to_string()))).unwrap();
+		});
+		let (found, theme) = finished.recv_timeout(Duration::from_secs(5)).expect("2000 cookie lookups took longer than 5 s");
+		assert_eq!(found, 0);
+		assert_eq!(theme.as_deref(), Some("dark"));
+	}
+}
+
 impl ResponseExt for Response<Body> {
 	fn cookies(&self) -> Vec<Cookie<'_>> {
 		self.headers().get("Cookie").map_or(Vec::new(), |header| {

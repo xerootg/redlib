@@ -59,10 +59,31 @@ impl<V: Clone> ByteCache<V> {
 	/// Stores `value`, which takes `size` bytes. A value larger than the whole
 	/// cache is not stored.
 	pub fn insert(&self, key: String, value: V, size: usize) {
+		if size > self.max_bytes {
+			return;
+		}
 		let mut state = self.lock();
+		if let Some(old) = state.entries.remove(&key) {
+			state.bytes -= old.size;
+			state.order.retain(|queued| *queued != key);
+		}
 		state.bytes += size;
 		state.order.push_back(key.clone());
 		state.entries.insert(key, Entry { value, size, at: Instant::now() });
+
+		// Everything in the queue is older than what follows it, so the
+		// expired entries are at its front, and so are the ones to drop for room.
+		while let Some(oldest) = state.order.front() {
+			let expired = state.entries.get(oldest).is_none_or(|entry| entry.at.elapsed() >= self.ttl);
+			if !expired && state.bytes <= self.max_bytes && state.entries.len() <= self.max_entries {
+				break;
+			}
+			if let Some(oldest) = state.order.pop_front() {
+				if let Some(entry) = state.entries.remove(&oldest) {
+					state.bytes -= entry.size;
+				}
+			}
+		}
 	}
 
 	/// The bytes held now.
@@ -81,8 +102,20 @@ impl<V: Clone> ByteCache<V> {
 }
 
 /// About how many bytes `value` takes in memory.
-pub fn value_size(_value: &Value) -> usize {
-	0
+///
+/// A JSON value in memory is several times its text: every node is a
+/// `Value` (32 bytes), and every object member also has an owned key and a
+/// slot in the map.
+pub fn value_size(value: &Value) -> usize {
+	const NODE: usize = 32;
+	const MEMBER: usize = 48;
+	NODE
+		+ match value {
+			Value::String(text) => text.len(),
+			Value::Array(items) => items.iter().map(value_size).sum(),
+			Value::Object(members) => members.iter().map(|(key, member)| MEMBER + key.len() + value_size(member)).sum(),
+			Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+		}
 }
 
 #[cfg(test)]
@@ -144,8 +177,10 @@ mod byte_cache_tests {
 
 	#[test]
 	fn test_expired_entries_are_not_returned_and_are_dropped() {
-		let cache = ByteCache::new(1000, 100, Duration::ZERO);
+		let cache = ByteCache::new(1000, 100, Duration::from_millis(20));
 		cache.insert("key".to_string(), 1, 400);
+		assert_eq!(cache.get("key"), Some(1));
+		std::thread::sleep(Duration::from_millis(40));
 		assert_eq!(cache.get("key"), None);
 		cache.insert("other".to_string(), 2, 100);
 		assert_eq!(cache.len(), 1, "the expired entry should have been dropped by the insert");

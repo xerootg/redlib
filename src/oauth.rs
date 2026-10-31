@@ -222,6 +222,13 @@ fn refresh_delay(expires_in: u64) -> Duration {
 	Duration::from_secs(expires_in.saturating_sub(120)).max(MIN_REFRESH_DELAY)
 }
 
+/// How long `token_daemon` waits before its next refresh: for a refresh that
+/// failed, the token it still holds is about to run out, so not as long as it
+/// would have lasted.
+fn refresh_after(_refreshed: bool, expires_in: u64) -> Duration {
+	refresh_delay(expires_in)
+}
+
 /// The first 32 characters of a token, for the log.
 fn token_preview(token: &str) -> &str {
 	token.char_indices().nth(32).map_or(token, |(end, _)| &token[..end])
@@ -835,5 +842,19 @@ mod tests {
 		// Test that both backends can be created
 		MobileSpoofAuth::new();
 		GenericWebAuth::new();
+	}
+}
+
+// Review of the fix for audit finding #18: after a failed refresh the daemon
+// slept for the whole life of a token it had already used up.
+#[cfg(test)]
+mod daemon_tests {
+	use super::*;
+
+	#[test]
+	fn test_a_failed_refresh_is_tried_again_soon() {
+		assert_eq!(refresh_after(true, 86400), Duration::from_secs(86400 - 120));
+		assert_eq!(refresh_after(false, 86400), MIN_REFRESH_DELAY);
+		assert_eq!(refresh_after(false, 30), MIN_REFRESH_DELAY);
 	}
 }

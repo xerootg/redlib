@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::body::Body;
 use crate::server::ResponseExt;
 use crate::subreddit::join_until_size_limit;
-use crate::utils::{deflate_decompress, local_path, redirect, reject_cross_site_post, template, Preferences};
+use crate::utils::{deflate_decompress, is_user_navigation, local_path, redirect, reject_cross_site_post, template, Preferences};
 use askama::Template;
 use cookie::Cookie;
 use hyper::{Request, Response};
@@ -21,6 +21,14 @@ struct SettingsTemplate {
 	prefs: Preferences,
 	url: String,
 	return_url: String,
+}
+
+/// Shown instead of changing cookies when a settings link was followed from another site
+#[derive(Template)]
+#[template(path = "confirm_settings.html")]
+struct ConfirmSettingsTemplate {
+	prefs: Preferences,
+	url: String,
 }
 
 // CONSTANTS
@@ -367,6 +375,15 @@ pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 }
 
 fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body> {
+	// A link or redirect on another site must not wipe or change settings. Following the link from
+	// this page is a same-origin request, so the user only has to click once.
+	if !is_user_navigation(&req) {
+		return template(&ConfirmSettingsTemplate {
+			prefs: Preferences::new(&req),
+			url: req.uri().to_string(),
+		});
+	}
+
 	// Split the body into parts
 	let (parts, _) = req.into_parts();
 

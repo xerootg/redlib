@@ -699,8 +699,14 @@ async fn compress_response(req_headers: &HeaderMap<header::HeaderValue>, res: &m
 		}
 	};
 
-	// Compress!
-	match compress_body(compressor, body_bytes) {
+	// Compress! This is CPU-bound and takes long enough on a big page to stall
+	// every other request on this worker (including /healthz), so run it on the
+	// blocking pool.
+	let compressed = tokio::task::spawn_blocking(move || compress_body(compressor, body_bytes))
+		.await
+		.map_err(|e| e.to_string())
+		.and_then(|result| result);
+	match compressed {
 		Ok(compressed) => {
 			// We get here iff the compression was successful. Replace the body
 			// with the compressed payload, and add the appropriate
@@ -776,9 +782,13 @@ fn compress_body(compressor: CompressionType, body_bytes: Vec<u8>) -> Result<Vec
 		}
 
 		CompressionType::Brotli => {
-			// We may want to make the compression parameters configurable
-			// in the future. For now, the defaults are sufficient.
-			let brotli_params = BrotliEncoderParams::default();
+			// The library default is quality 11, which took 3.8 s for a 426 KB
+			// thread page. Quality 5 is a common choice for dynamic content; on
+			// the pages we measured it made the output about 15% larger.
+			let brotli_params = BrotliEncoderParams {
+				quality: 5,
+				..BrotliEncoderParams::default()
+			};
 
 			let mut compressed = Vec::<u8>::new();
 			match BrotliCompress(&mut reader, &mut compressed, &brotli_params) {
@@ -901,6 +911,11 @@ mod tests {
 
 	#[test]
 	fn test_compress_response() {
+		// compress_response runs the compressor on tokio's blocking pool, so a
+		// runtime has to be entered even though the future is driven by block_on.
+		let rt = tokio::runtime::Runtime::new().unwrap();
+		let _guard = rt.enter();
+
 		// This macro generates an Accept-Encoding header value given any number of
 		// compressors.
 		macro_rules! ae_gen {

@@ -5,36 +5,82 @@
 //! These functions leave a key only the parts that change what Reddit sends.
 
 use std::collections::BTreeMap;
+use url::form_urlencoded;
 
 /// The longest path segment (between two slashes) that is looked up.
 pub const MAX_SEGMENT_LEN: usize = 256;
 
+/// How a query parameter's value is checked. A value that fails is left out,
+/// as Reddit ignores one it does not know, and so only the values it can tell
+/// apart make entries.
+enum Check {
+	/// Any text
+	Any,
+	/// One of these (the empty string always is)
+	OneOf(&'static [&'static str]),
+	/// Up to this many digits
+	Number(usize),
+}
+
+const FLAGS: &[&str] = &["on", "off", "1", "0", "true", "false"];
+
 /// Query parameters that change what Reddit sends, or what a backend makes of
-/// it. A parameter that is not here is not sent to Reddit either.
-const QUERY_KEYS: &[&str] = &[
-	"after",
-	"before",
-	"context",
-	"count",
-	"depth",
-	"geo_filter",
-	"include_over_18",
-	"limit",
-	"more_cursor",
-	"more_query",
-	"post_types",
-	"q",
-	"raw_json",
-	"restrict_sr",
-	"sort",
-	"t",
-	"type",
+/// it, with what their values may be. A parameter that is not here is not sent
+/// to Reddit either.
+const QUERY_KEYS: &[(&str, Check)] = &[
+	("after", Check::Any),
+	("before", Check::Any),
+	("context", Check::Number(1)),
+	("count", Check::Number(4)),
+	("depth", Check::Number(2)),
+	("geo_filter", Check::Any),
+	("include_over_18", Check::OneOf(FLAGS)),
+	("limit", Check::Number(3)),
+	("more_cursor", Check::Any),
+	("more_query", Check::Any),
+	("post_types", Check::OneOf(&["all", "text", "image", "video", "gif", "gallery", "link", "poll"])),
+	("q", Check::Any),
+	("raw_json", Check::OneOf(&["1", "0"])),
+	("restrict_sr", Check::OneOf(FLAGS)),
+	(
+		"sort",
+		Check::OneOf(&[
+			"confidence",
+			"best",
+			"hot",
+			"new",
+			"top",
+			"old",
+			"controversial",
+			"qa",
+			"live",
+			"relevance",
+			"comments",
+			"rising",
+		]),
+	),
+	("t", Check::OneOf(&["hour", "day", "week", "month", "year", "all"])),
+	(
+		"type",
+		Check::OneOf(&["link", "comment", "comments", "sr", "sr_user", "user", "posts", "media", "communities", "people"]),
+	),
 ];
+
+impl Check {
+	fn accepts(&self, value: &str) -> bool {
+		match self {
+			Check::Any => true,
+			Check::OneOf(allowed) => value.is_empty() || allowed.contains(&value),
+			Check::Number(digits) => value.len() <= *digits && value.bytes().all(|b| b.is_ascii_digit()),
+		}
+	}
+}
 
 /// The key for a fetch of `path` (a Reddit JSON API path with its query), or
 /// `None` if a path segment is longer than `MAX_SEGMENT_LEN`. The key is
-/// `path` with only the parameters in `QUERY_KEYS`, sorted by name and with
-/// the last of any repeated one, as `utils::param` reads them.
+/// `path` with only the parameters in `QUERY_KEYS` that have a valid value,
+/// sorted by name, with the last of any repeated one, as `utils::param` reads
+/// them, and with their values written one way.
 pub fn fetch_key(path: &str) -> Option<String> {
 	let (route, query) = path.split_once('?').unwrap_or((path, ""));
 	if !segments_within_limit(route) {
@@ -42,23 +88,49 @@ pub fn fetch_key(path: &str) -> Option<String> {
 	}
 
 	let mut kept = BTreeMap::new();
-	for pair in query.split('&') {
-		if let Some((key, value)) = pair.split_once('=') {
-			if QUERY_KEYS.contains(&key) {
-				kept.insert(key, value);
+	for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+		if let Some((name, kind)) = QUERY_KEYS.iter().find(|(name, _)| *name == key) {
+			if kind.accepts(&value) {
+				kept.insert(*name, value);
+			} else {
+				// The last one is the one that is read, so an earlier valid one is not
+				kept.remove(name);
 			}
 		}
 	}
 	if kept.is_empty() {
 		return Some(route.to_string());
 	}
-	let query: Vec<String> = kept.into_iter().map(|(key, value)| format!("{key}={value}")).collect();
-	Some(format!("{route}?{}", query.join("&")))
+	let query = form_urlencoded::Serializer::new(String::new()).extend_pairs(kept).finish();
+	Some(format!("{route}?{query}"))
 }
 
-/// The key of the cache entry for `path`, which `fetch_key` made.
+/// The key of the cache entry for `path`, which `fetch_key` made: the same
+/// thread or listing, as Reddit sends it, under any thread slug and any letter
+/// case of the sub.
 pub fn entry_key(path: &str) -> String {
-	path.to_string()
+	let (route, query) = path.split_once('?').map_or((path, None), |(route, query)| (route, Some(query)));
+	let (route, json) = route.strip_suffix(".json").map_or((route, ""), |route| (route, ".json"));
+	let mut segments: Vec<String> = route.split('/').map(str::to_string).collect();
+	if segments.get(1).is_some_and(|first| first == "r") {
+		if let Some(sub) = segments.get_mut(2) {
+			*sub = sub.to_ascii_lowercase();
+		}
+	}
+	// .../comments/<id>/<slug>/<comment id>
+	if let Some(at) = segments.iter().position(|segment| segment == "comments") {
+		let comment = segments.get(at + 3).filter(|comment| !comment.is_empty()).cloned();
+		segments.truncate(at + 2);
+		if let Some(comment) = comment {
+			segments.extend(["_".to_string(), comment]);
+		}
+	}
+	let mut key = format!("{}{json}", segments.join("/"));
+	if let Some(query) = query {
+		key.push('?');
+		key.push_str(query);
+	}
+	key
 }
 
 /// Whether no segment of the path in `path` (up to any `?`) is longer than `MAX_SEGMENT_LEN`.

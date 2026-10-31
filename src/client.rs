@@ -1111,6 +1111,62 @@ mod proxy_response_tests {
 }
 
 #[cfg(test)]
+mod outbound_timeout_tests {
+	use super::*;
+	use std::time::Duration;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	/// A local HTTP server that accepts connections and then goes quiet:
+	/// `/headers` never answers, anything else sends headers and half of
+	/// its body, then stalls.
+	async fn stalling_server() -> SocketAddr {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		tokio::spawn(async move {
+			loop {
+				let Ok((mut stream, _)) = listener.accept().await else { return };
+				tokio::spawn(async move {
+					let mut buf = vec![0u8; 4096];
+					let n = stream.read(&mut buf).await.unwrap_or(0);
+					if !String::from_utf8_lossy(&buf[..n]).starts_with("GET /headers") {
+						let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhalf").await;
+					}
+					// Hold the connection open without another byte.
+					tokio::time::sleep(Duration::from_secs(3600)).await;
+				});
+			}
+		});
+		addr
+	}
+
+	fn client() -> WreqClient {
+		client_for(Profile::Chrome131, Platform::Linux)
+	}
+
+	#[test]
+	fn test_a_peer_that_never_answers_times_out() {
+		block_on_shared(async {
+			let addr = stalling_server().await;
+			let request = client().get(format!("http://{addr}/headers")).send();
+			let result = tokio::time::timeout(Duration::from_secs(10), request).await;
+			assert!(result.is_ok(), "the request waited for a peer that never answers");
+			assert!(result.unwrap().is_err());
+		});
+	}
+
+	#[test]
+	fn test_a_body_that_stalls_times_out() {
+		block_on_shared(async {
+			let addr = stalling_server().await;
+			let response = client().get(format!("http://{addr}/body")).send().await.unwrap();
+			let result = tokio::time::timeout(Duration::from_secs(10), response.bytes()).await;
+			assert!(result.is_ok(), "the body read waited for a peer that went quiet");
+			assert!(result.unwrap().is_err());
+		});
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use {crate::config::get_setting, sealed_test::prelude::*};

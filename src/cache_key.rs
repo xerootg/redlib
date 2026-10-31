@@ -253,6 +253,14 @@ mod normalize_tests {
 		}
 	}
 
+	// post.rs adds .json to the visitor's last segment, which is not the visitor's
+	#[test]
+	fn test_the_limit_on_a_segment_leaves_out_the_json_suffix() {
+		let ok = "a".repeat(MAX_SEGMENT_LEN);
+		assert!(fetch_key(&format!("/r/rust/comments/abc/{ok}.json?raw_json=1")).is_some());
+		assert!(fetch_key(&format!("/r/rust/comments/abc/{ok}a.json?raw_json=1")).is_none());
+	}
+
 	#[test]
 	fn test_a_bare_parameter_is_kept_as_an_empty_one() {
 		// utils::param reads `?include_over_18` as an empty value, and gql only asks if it is there

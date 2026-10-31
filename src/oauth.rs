@@ -210,6 +210,11 @@ fn refresh_delay(expires_in: u64) -> Duration {
 	Duration::from_secs(expires_in.saturating_sub(120)).max(MIN_REFRESH_DELAY)
 }
 
+/// The start of a token, for the log.
+fn token_preview(token: &str) -> &str {
+	&token[..32]
+}
+
 pub async fn token_daemon() {
 	// Monitor for refreshing token
 	loop {
@@ -361,7 +366,7 @@ impl MobileSpoofAuth {
 			.as_u64()
 			.ok_or_else(|| AuthError::Field((json.clone(), "expires_in: as_u64")))?;
 
-		info!("[✅] Success - Retrieved token \"{}...\", expires in {}", &token[..32], expires_in);
+		info!("[✅] Success - Retrieved token \"{}...\", expires in {}", token_preview(&token), expires_in);
 
 		Ok(OauthResponse {
 			token,
@@ -642,6 +647,18 @@ mod retry_tests {
 #[cfg(test)]
 mod hardening_tests {
 	use super::*;
+
+	// Audit info item (oauth.rs:297): `&token[..32]` panics on a token that is
+	// shorter than 32 bytes, or one with a multibyte character at byte 32.
+	#[test]
+	fn test_token_preview_of_short_tokens() {
+		assert_eq!(token_preview(""), "");
+		assert_eq!(token_preview("abc"), "abc");
+		let long = "a".repeat(40);
+		assert_eq!(token_preview(&long), "a".repeat(32));
+		let wide = "\u{20ac}".repeat(40);
+		assert_eq!(token_preview(&wide), "\u{20ac}".repeat(32));
+	}
 
 	// Audit info item: `expires_in - 120` wrapped to a sleep of 584 billion
 	// years in release builds when Reddit answered with a short expiry, which

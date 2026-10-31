@@ -776,6 +776,20 @@ fn compress_body(compressor: CompressionType, body_bytes: Vec<u8>) -> Result<Vec
 }
 
 #[cfg(test)]
+mod boilerplate_tests {
+	use super::*;
+
+	#[test]
+	fn test_error_boilerplate_is_declared_plain_text() {
+		for status in [403, 404, 500] {
+			let res = futures_lite::future::block_on(new_boilerplate(HeaderMap::new(), HeaderMap::new(), status, Body::from("<script>alert(1)</script>"))).unwrap();
+			assert_eq!(res.status().as_u16(), status);
+			assert_eq!(res.headers().get(header::CONTENT_TYPE).map(|v| v.to_str().unwrap()), Some("text/plain; charset=utf-8"));
+		}
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use brotli::Decompressor as BrotliDecompressor;

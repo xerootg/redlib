@@ -822,6 +822,87 @@ mod redirect_limit_tests {
 }
 
 #[cfg(test)]
+mod proxy_target_tests {
+	use super::*;
+	use route_recognizer::Params;
+
+	fn target(format: &str, params: &[(&str, &str)], query: &str) -> Result<wreq::Uri, String> {
+		let mut req = HyperRequest::builder().uri(format!("/x?{query}")).body(Body::empty()).unwrap();
+		let mut route_params = Params::new();
+		for (name, value) in params {
+			route_params.insert((*name).to_string(), (*value).to_string());
+		}
+		req.set_params(route_params);
+		proxy_url(&req, format)
+	}
+
+	const PREVIEW: &str = "https://{loc}view.redd.it/{id}";
+	const AWARD: &str = "https://{loc}view.redd.it/award_images/{fullname}/{id}";
+	const THUMB: &str = "https://{point}.thumbs.redditmedia.com/{id}";
+
+	#[test]
+	fn test_the_routes_still_reach_their_hosts() {
+		type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
+		let cases: &[Case] = &[
+			(PREVIEW, &[("loc", "pre"), ("id", "a.jpg")], "preview.redd.it"),
+			(PREVIEW, &[("loc", "external-pre"), ("id", "a.jpg")], "external-preview.redd.it"),
+			(AWARD, &[("loc", "pre"), ("fullname", "t5_1"), ("id", "a.png")], "preview.redd.it"),
+			(THUMB, &[("point", "a"), ("id", "a.jpg")], "a.thumbs.redditmedia.com"),
+			(THUMB, &[("point", "b"), ("id", "a.jpg")], "b.thumbs.redditmedia.com"),
+			(
+				"https://v.redd.it/{id}/{prefix}_{size}",
+				&[("id", "abc"), ("prefix", "DASH"), ("size", "720.mp4")],
+				"v.redd.it",
+			),
+			("https://v.redd.it/{id}/{path}", &[("id", "abc"), ("path", "HLSPlaylist.m3u8")], "v.redd.it"),
+			("https://packaged-media.redd.it/{path}", &[("path", "abc/pb/m2-res_1080p.mp4")], "packaged-media.redd.it"),
+			(
+				"https://external-packaged-media.redd.it/{path}",
+				&[("path", "abc/pb/m2-res_1080p.mp4")],
+				"external-packaged-media.redd.it",
+			),
+			("https://i.redd.it/{path}", &[("path", "abc.jpg")], "i.redd.it"),
+			("https://emoji.redditmedia.com/{id}/{name}", &[("id", "abc"), ("name", "Emoji")], "emoji.redditmedia.com"),
+			(
+				"https://reddit-econ-prod-assets-permanent.s3.amazonaws.com/asset-manager/{subreddit_id}/{filename}",
+				&[("subreddit_id", "t5_1"), ("filename", "a.png")],
+				"reddit-econ-prod-assets-permanent.s3.amazonaws.com",
+			),
+			("https://styles.redditmedia.com/{path}", &[("path", "t5_1/styles/a.png")], "styles.redditmedia.com"),
+			("https://www.redditstatic.com/{path}", &[("path", "desktop2x/img/a.png")], "www.redditstatic.com"),
+			("https://media.giphy.com/media/{id}/giphy.{ext}", &[("id", "abc"), ("ext", "gif")], "media.giphy.com"),
+			("https://media.redgifs.com/Some.mp4", &[], "media.redgifs.com"),
+		];
+		for (format, params, host) in cases {
+			let uri = target(format, params, "a=b").unwrap_or_else(|e| panic!("{format} {params:?}: {e}"));
+			assert_eq!(uri.host(), Some(*host), "{format} {params:?}");
+			assert_eq!(uri.scheme_str(), Some("https"));
+			assert_eq!(uri.query(), Some("a=b"));
+		}
+	}
+
+	#[test]
+	fn test_ip_literal_in_the_host_slot_is_rejected() {
+		// The audit's payloads: /preview/[::ffff:10.x.x.x]/x and /thumb/[::1]/x.
+		for loc in ["[::ffff:10.0.0.1]", "[::1]", "[2001:db8::1]", "[::ffff:10.0.0.1]:8443", "10.0.0.1"] {
+			assert!(target(PREVIEW, &[("loc", loc), ("id", "x")], "").is_err(), "preview loc {loc}");
+			assert!(target(AWARD, &[("loc", loc), ("fullname", "f"), ("id", "x")], "").is_err(), "award loc {loc}");
+			assert!(target(THUMB, &[("point", loc), ("id", "x")], "").is_err(), "thumb point {loc}");
+		}
+	}
+
+	#[test]
+	fn test_other_hosts_in_the_host_slot_are_rejected() {
+		for loc in ["evil", "x.evil.example/", "pre.", "i", "PRE", "pre@evil.example/", "pre:8443@evil.example/", ""] {
+			assert!(target(PREVIEW, &[("loc", loc), ("id", "x")], "").is_err(), "preview loc {loc}");
+		}
+		for point in ["evil", "c", "a.evil", "", "A", "a@evil.example/#"] {
+			assert!(target(THUMB, &[("point", point), ("id", "x")], "").is_err(), "thumb point {point}");
+		}
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use {crate::config::get_setting, sealed_test::prelude::*};

@@ -15,6 +15,9 @@
 #
 # And .github/dependabot.yml must have a `docker` entry, so the digests above
 # get bumped instead of rotting.
+#
+# Finding #21 also wants an advisory gate: deny.toml must exist and the test
+# job must run cargo-deny.
 
 set -u
 cd "$(dirname "$0")/.." || exit 1
@@ -61,5 +64,8 @@ done < <(awk '
 ' "$df")
 
 grep -qE '^[[:space:]]*-[[:space:]]+package-ecosystem:[[:space:]]*"?docker"?[[:space:]]*$' .github/dependabot.yml || err ".github/dependabot.yml: no docker ecosystem entry"
+
+[ -f deny.toml ] || err "deny.toml: missing (cargo-deny config with the accepted advisories)"
+grep -qE 'cargo-deny-action@[0-9a-f]{40}' "$wf" || err "$wf: test job does not run cargo-deny"
 
 exit "$fail"

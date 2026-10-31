@@ -353,9 +353,9 @@ async fn main() {
 
 	// Configure settings
 	app.at("/settings").get(|r| settings::get(r).boxed()).post(|r| settings::set(r).boxed());
-	app.at("/settings/restore").get(|r| settings::restore(r).boxed());
+	app.at("/settings/restore").get(|r| settings::restore(r).boxed()).post(|r| settings::restore(r).boxed());
 	app.at("/settings/encoded-restore").post(|r| settings::encoded_restore(r).boxed());
-	app.at("/settings/update").get(|r| settings::update(r).boxed());
+	app.at("/settings/update").get(|r| settings::update(r).boxed()).post(|r| settings::update(r).boxed());
 
 	// RSS Subscriptions. Feeds are built from the JSON API, not Reddit's own feeds.
 	// A trailing slash before the extension (`/r/rust/top/.rss`) is normalized away by the server.

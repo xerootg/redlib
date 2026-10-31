@@ -1263,7 +1263,21 @@ a.search_subreddit:hover .search_subreddit_name {
     font-size: 12px;
 }
 
-.post_notification a {
+.post_notification a,
+.post_notification .link-button {
+    text-decoration: underline;
+}
+
+/* A POST button that reads as a link (settings changes must not be GET links) */
+.link-button {
+    display: inline;
+    padding: 0;
+    font: inherit;
+    font-weight: normal;
+    color: inherit;
+}
+
+.link-button:hover {
     text-decoration: underline;
 }
 
@@ -2241,7 +2255,8 @@ body.update_footer_shown {
     width: 100%;
 }
 
-#nsfw_landing a {
+#nsfw_landing a,
+#nsfw_landing .link-button {
     color: var(--accent);
 }
 

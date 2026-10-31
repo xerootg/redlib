@@ -5,7 +5,9 @@
     <div id="wall">
         <h1>Change your settings?</h1>
         <br>
-        <p>A link on another site is asking Redlib to change the settings stored in your browser. Nothing has changed yet.</p>
-        <p><a id="save" href="{{ url }}">Continue</a> or <a href="/">cancel</a>.</p>
+        <p>A link is asking Redlib to change the settings stored in your browser. Restoring replaces all of your settings, subscriptions and filters. Nothing has changed yet.</p>
+        <form method="post" action="{{ url }}">
+            <button id="save" class="link-button" type="submit">Continue</button> or <a href="/">cancel</a>.
+        </form>
     </div>
 {% endblock %}

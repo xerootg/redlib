@@ -1577,13 +1577,6 @@ pub fn is_same_origin_post(req: &Request<Body>) -> bool {
 		.any(|candidate| candidate.eq_ignore_ascii_case(authority))
 }
 
-/// Whether a GET that changes settings was followed by the user on this instance, typed in the
-/// address bar or opened from a bookmark, rather than triggered by a link or redirect on another
-/// site. Requests without `Sec-Fetch-Site` (non-browsers, old browsers) are let through.
-pub fn is_user_navigation(req: &Request<Body>) -> bool {
-	matches!(fetch_site(req), None | Some("same-origin" | "none"))
-}
-
 /// The response for a state-changing request that did not come from this instance, or `None`
 pub fn reject_cross_site_post(req: &Request<Body>) -> Option<Response<Body>> {
 	if is_same_origin_post(req) {
@@ -2041,7 +2034,7 @@ fn get_mime_type(url: &str) -> &'static str {
 
 #[cfg(test)]
 mod origin_check_tests {
-	use super::{is_same_origin_post, is_user_navigation, reject_cross_site_post};
+	use super::{is_same_origin_post, reject_cross_site_post};
 	use crate::body::Body;
 	use hyper::Request;
 
@@ -2098,17 +2091,6 @@ mod origin_check_tests {
 		assert!(reject_cross_site_post(&request("/", &[])).is_none());
 		let res = reject_cross_site_post(&request("/", &[("sec-fetch-site", "cross-site")])).unwrap();
 		assert_eq!(res.status(), 403);
-	}
-
-	#[test]
-	fn get_navigation_is_same_origin_none_or_unlabelled() {
-		assert!(is_user_navigation(&request("/", &[])));
-		for site in ["same-origin", "none"] {
-			assert!(is_user_navigation(&request("/", &[("sec-fetch-site", site)])), "{site:?}");
-		}
-		for site in ["cross-site", "same-site", "", "nonsense"] {
-			assert!(!is_user_navigation(&request("/", &[("sec-fetch-site", site)])), "{site:?}");
-		}
 	}
 }
 

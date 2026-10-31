@@ -6,10 +6,10 @@ use std::collections::HashMap;
 use crate::body::Body;
 use crate::server::ResponseExt;
 use crate::subreddit::join_until_size_limit;
-use crate::utils::{deflate_decompress, is_user_navigation, local_path, redirect, reject_cross_site_post, template, Preferences};
+use crate::utils::{deflate_decompress, local_path, redirect, reject_cross_site_post, template, Preferences};
 use askama::Template;
 use cookie::Cookie;
-use hyper::{Request, Response};
+use hyper::{Method, Request, Response};
 use time::{Duration, OffsetDateTime};
 use tokio::time::timeout;
 use url::form_urlencoded;
@@ -375,15 +375,23 @@ pub async fn set(req: Request<Body>) -> Result<Response<Body>, String> {
 }
 
 fn set_cookies_method(req: Request<Body>, remove_cookies: bool) -> Response<Body> {
-	// A link or redirect on another site must not wipe or change settings. Following the link from
-	// this page is a same-origin request, so the user only has to click once.
-	if !is_user_navigation(&req) {
+	// A link (on another site, in a Reddit comment, in a chat message) must not wipe or change
+	// settings, so a GET only shows what would change and a button that POSTs the same URL back.
+	if req.method() != Method::POST {
 		return template(&ConfirmSettingsTemplate {
 			prefs: Preferences::new(&req),
 			url: req.uri().to_string(),
 		});
 	}
+	if let Some(res) = reject_cross_site_post(&req) {
+		return res;
+	}
 
+	apply_settings(req, remove_cookies)
+}
+
+/// Sets the cookies for the settings in the query string of `req`
+fn apply_settings(req: Request<Body>, remove_cookies: bool) -> Response<Body> {
 	// Split the body into parts
 	let (parts, _) = req.into_parts();
 
@@ -556,7 +564,9 @@ pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, Strin
 		return Ok(res);
 	}
 
-	let body = req.into_body().collect_bytes().await.map_err(|e| format!("Failed to get bytes from request body: {e}"))?;
+	let (parts, body) = req.into_parts();
+	let cookies = parts.headers.get_all("cookie").iter().cloned().collect::<Vec<_>>();
+	let body = body.collect_bytes().await.map_err(|e| format!("Failed to get bytes from request body: {e}"))?;
 
 	if body.len() > 1024 * 1024 {
 		return Err("Request body too large".to_string());
@@ -580,9 +590,14 @@ pub async fn encoded_restore(req: Request<Body>) -> Result<Response<Body>, Strin
 
 	prefs.available_themes = vec![];
 
+	// Already a same-origin POST, so apply the settings here rather than redirecting to a GET link
 	let url = format!("/settings/restore/?{}", prefs.to_urlencoded()?);
+	let mut restore = Request::builder().uri(url);
+	for cookie in cookies {
+		restore = restore.header("cookie", cookie);
+	}
 
-	Ok(redirect(&url))
+	Ok(apply_settings(restore.body(Body::empty()).map_err(|e| e.to_string())?, true))
 }
 
 #[cfg(test)]
@@ -597,6 +612,11 @@ mod redirect_tests {
 
 	fn get_request(uri: String) -> Request<Body> {
 		Request::builder().method("GET").uri(uri).body(Body::empty()).unwrap()
+	}
+
+	// Settings links only change anything when posted back from the confirmation page
+	fn post_request(uri: String) -> Request<Body> {
+		Request::builder().method("POST").uri(uri).body(Body::empty()).unwrap()
 	}
 
 	#[test]
@@ -636,7 +656,7 @@ mod redirect_tests {
 	#[test]
 	fn settings_restore_redirect_stays_on_the_instance() {
 		for payload in OFFSITE_PAYLOADS {
-			let res = block_on(restore(get_request(format!("/settings/restore?redirect={payload}")))).unwrap();
+			let res = block_on(restore(post_request(format!("/settings/restore?redirect={payload}")))).unwrap();
 			assert_local_redirect(&res, payload);
 		}
 	}
@@ -644,7 +664,7 @@ mod redirect_tests {
 	#[test]
 	fn settings_update_redirect_stays_on_the_instance() {
 		for payload in OFFSITE_PAYLOADS {
-			let res = block_on(update(get_request(format!("/settings/update?theme=dark&redirect={payload}")))).unwrap();
+			let res = block_on(update(post_request(format!("/settings/update?theme=dark&redirect={payload}")))).unwrap();
 			assert_local_redirect(&res, payload);
 		}
 	}
@@ -652,9 +672,9 @@ mod redirect_tests {
 	#[test]
 	fn settings_update_redirect_keeps_a_local_path() {
 		// The in-app links pass the current path, with or without the leading slash
-		let res = block_on(update(get_request("/settings/update?use_hls=on&redirect=/r/rust/comments/abc".to_string()))).unwrap();
+		let res = block_on(update(post_request("/settings/update?use_hls=on&redirect=/r/rust/comments/abc".to_string()))).unwrap();
 		assert_eq!(res.headers()["location"], "/r/rust/comments/abc");
-		let res = block_on(update(get_request("/settings/update?use_hls=on&redirect=r/rust".to_string()))).unwrap();
+		let res = block_on(update(post_request("/settings/update?use_hls=on&redirect=r/rust".to_string()))).unwrap();
 		assert_eq!(res.headers()["location"], "/r/rust");
 	}
 }

@@ -1046,59 +1046,44 @@ pub fn param(path: &str, value: &str) -> Option<String> {
 	)
 }
 
+/// The most numbered cookies (`subscriptions1`, `subscriptions2`, ...) read per setting.
+/// A real cookie jar needs a handful; the cap keeps a forged Cookie header cheap.
+const MAX_NUMBERED_COOKIES: usize = 64;
+
+/// Joins the `name` cookie and the `nameN` cookies that follow it (`name1`, `name2`, ...,
+/// stopping at the first missing number) into one string. The Cookie header is parsed once.
+fn joined_numbered_cookies(req: &Request<Body>, name: &str) -> String {
+	let cookies = req.cookies();
+	let mut values: HashMap<&str, &str> = HashMap::new();
+	for cookie in &cookies {
+		// The first cookie of a given name wins, as it does for `req.cookie()`
+		values.entry(cookie.name()).or_insert_with(|| cookie.value());
+	}
+
+	let mut joined = String::new();
+	joined.push_str(values.get(name).copied().unwrap_or_default());
+	for number in 1..=MAX_NUMBERED_COOKIES {
+		match values.get(format!("{name}{number}").as_str()) {
+			Some(value) => joined.push_str(value),
+			None => break,
+		}
+	}
+	joined
+}
+
 /// Retrieve the value of a setting by name
 pub fn setting(req: &Request<Body>, name: &str) -> String {
 	// Parse a cookie value from request
 
 	// If this was called with "subscriptions" and the "subscriptions" cookie has a value
 	if name == "subscriptions" && req.cookie("subscriptions").is_some() {
-		// Create subscriptions string
-		let mut subscriptions = String::new();
-
-		// Default subscriptions cookie
-		if req.cookie("subscriptions").is_some() {
-			subscriptions.push_str(req.cookie("subscriptions").unwrap().value());
-		}
-
-		// Start with first numbered subscription cookie
-		let mut subscriptions_number = 1;
-
-		// While whatever subscriptionsNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("subscriptions{subscriptions_number}")).is_some() {
-			// Push whatever subscriptionsNUMBER cookie we're looking at into the subscriptions string
-			subscriptions.push_str(req.cookie(&format!("subscriptions{subscriptions_number}")).unwrap().value());
-
-			// Increment subscription cookie number
-			subscriptions_number += 1;
-		}
-
 		// Return the subscriptions cookies as one large string
-		subscriptions
+		joined_numbered_cookies(req, "subscriptions")
 	}
 	// If this was called with "filters" and the "filters" cookie has a value
 	else if name == "filters" && req.cookie("filters").is_some() {
-		// Create filters string
-		let mut filters = String::new();
-
-		// Default filters cookie
-		if req.cookie("filters").is_some() {
-			filters.push_str(req.cookie("filters").unwrap().value());
-		}
-
-		// Start with first numbered filters cookie
-		let mut filters_number = 1;
-
-		// While whatever filtersNUMBER cookie we're looking at has a value
-		while req.cookie(&format!("filters{filters_number}")).is_some() {
-			// Push whatever filtersNUMBER cookie we're looking at into the filters string
-			filters.push_str(req.cookie(&format!("filters{filters_number}")).unwrap().value());
-
-			// Increment filters cookie number
-			filters_number += 1;
-		}
-
 		// Return the filters cookies as one large string
-		filters
+		joined_numbered_cookies(req, "filters")
 	}
 	// The above two still come to this if there was no existing value
 	else {

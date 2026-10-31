@@ -1943,6 +1943,31 @@ fn get_mime_type(url: &str) -> &'static str {
 }
 
 #[cfg(test)]
+mod redirect_escape_tests {
+	use super::redirect;
+	use futures_lite::future::block_on;
+
+	fn body_of(res: hyper::Response<crate::body::Body>) -> String {
+		String::from_utf8(block_on(res.into_body().collect_bytes()).unwrap().to_vec()).unwrap()
+	}
+
+	#[test]
+	fn redirect_body_escapes_the_target() {
+		// Audit info item: `redirect()` formatted the target into the HTML body unescaped.
+		let body = body_of(redirect("/x\"><script>alert(1)</script>&'"));
+		assert!(!body.contains("<script>"), "unescaped markup in redirect body: {body}");
+		assert!(!body.contains("\"><"), "attribute can be closed by the target: {body}");
+		assert!(body.contains("&lt;script&gt;"), "target should be HTML-escaped: {body}");
+	}
+
+	#[test]
+	fn redirect_body_keeps_plain_paths_readable() {
+		let body = body_of(redirect("/r/rust/comments/abc/title"));
+		assert!(body.contains("href=\"/r/rust/comments/abc/title\""), "{body}");
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::{deflate_compress, deflate_decompress, format_num, format_url, render_bullet_lists, rewrite_emotes, rewrite_urls, url_path_basename, Post, Preferences};
 	use super::{page_feed_url, prefix_relative_urls, Media};

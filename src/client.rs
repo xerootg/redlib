@@ -1196,6 +1196,92 @@ mod outbound_timeout_tests {
 }
 
 #[cfg(test)]
+mod proxy_stream_tests {
+	use super::*;
+	use http_body_util::BodyExt;
+	use std::time::Duration;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	const BODY_LEN: usize = 1_000_000;
+
+	/// A local image host. `/headers` never answers, `/stall` sends headers
+	/// and half a body and then goes quiet, anything else sends the whole
+	/// body at once.
+	async fn image_host() -> SocketAddr {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let addr = listener.local_addr().unwrap();
+		tokio::spawn(async move {
+			loop {
+				let Ok((mut stream, _)) = listener.accept().await else { return };
+				tokio::spawn(async move {
+					let mut buf = vec![0u8; 4096];
+					let n = stream.read(&mut buf).await.unwrap_or(0);
+					let request = String::from_utf8_lossy(&buf[..n]).to_string();
+					if request.starts_with("GET /headers") {
+						// Never answer.
+					} else if request.starts_with("GET /stall") {
+						let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 10\r\n\r\nhalf").await;
+					} else {
+						let head = format!("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {BODY_LEN}\r\n\r\n");
+						let _ = stream.write_all(head.as_bytes()).await;
+						let _ = stream.write_all(&vec![7u8; BODY_LEN]).await;
+					}
+					tokio::time::sleep(Duration::from_secs(3600)).await;
+				});
+			}
+		});
+		addr
+	}
+
+	fn client() -> WreqClient {
+		client_with_read_timeout(Profile::Chrome131, Platform::Linux, Duration::from_secs(1))
+	}
+
+	/// A browser that stops reading for longer than the idle timeout (a paused
+	/// video, a background tab) while the upstream has data ready must still
+	/// get the whole file.
+	#[test]
+	fn test_a_paused_consumer_still_gets_the_whole_body() {
+		block_on_shared(async {
+			let addr = image_host().await;
+			let res = send_proxied(client().get(format!("http://{addr}/video")), Duration::from_secs(1)).await;
+			assert_eq!(res.status().as_u16(), 200);
+			let mut body = res.into_body();
+			let mut received = 0;
+			let first = body.frame().await.expect("a first frame").unwrap();
+			received += first.into_data().map_or(0, |data| data.len());
+			tokio::time::sleep(Duration::from_millis(2500)).await;
+			while let Some(frame) = body.frame().await {
+				received += frame.expect("the body was cut off after the pause").into_data().map_or(0, |data| data.len());
+			}
+			assert_eq!(received, BODY_LEN);
+		});
+	}
+
+	#[test]
+	fn test_an_upstream_that_never_answers_gets_a_bad_gateway() {
+		block_on_shared(async {
+			let addr = image_host().await;
+			let request = send_proxied(client().get(format!("http://{addr}/headers")), Duration::from_secs(1));
+			let res = tokio::time::timeout(Duration::from_secs(10), request).await.expect("the proxy waited for a peer that never answers");
+			assert_eq!(res.status().as_u16(), 502);
+		});
+	}
+
+	#[test]
+	fn test_an_upstream_that_goes_quiet_mid_body_is_cut_off() {
+		block_on_shared(async {
+			let addr = image_host().await;
+			let res = send_proxied(client().get(format!("http://{addr}/stall")), Duration::from_secs(1)).await;
+			assert_eq!(res.status().as_u16(), 200);
+			let read = tokio::time::timeout(Duration::from_secs(10), res.into_body().collect_bytes());
+			let result = read.await.expect("the body read waited for a peer that went quiet");
+			assert!(result.is_err());
+		});
+	}
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use {crate::config::get_setting, sealed_test::prelude::*};

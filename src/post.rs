@@ -118,9 +118,11 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 	let form = url::form_urlencoded::parse(query_string.as_bytes()).collect::<HashMap<_, _>>();
 	let query = form.get("q").unwrap().clone().to_string();
 
+	// Every comment carries the preferences, so read them from the cookies once, not per comment
+	let prefs = Preferences::new(&req);
 	let comments = match query.as_str() {
-		"" => parse_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &get_filters(&req), &req),
-		_ => query_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &get_filters(&req), &query, &req),
+		"" => parse_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &get_filters(&req), &prefs),
+		_ => query_comments(&response[1], &post.permalink, &post.author.name, highlighted_comment, &get_filters(&req), &query, &prefs),
 	};
 
 	// Use the Post and Comment structs to generate a website to show users
@@ -129,7 +131,7 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 		post,
 		url_without_query: url.clone().trim_end_matches(&format!("?q={query}&type=comment")).to_string(),
 		sort,
-		prefs: Preferences::new(&req),
+		prefs,
 		single_thread,
 		url: req_url,
 		comment_query: query,
@@ -206,7 +208,7 @@ pub(crate) fn parse_comments(
 	post_author: &str,
 	highlighted_comment: &str,
 	filters: &HashSet<String>,
-	req: &Request<Body>,
+	prefs: &Preferences,
 ) -> Vec<Comment> {
 	// Parse the comment JSON into a Vector of Comments
 	let comments = json["data"]["children"].as_array().map_or(Vec::new(), std::borrow::ToOwned::to_owned);
@@ -217,11 +219,11 @@ pub(crate) fn parse_comments(
 		.map(|comment| {
 			let data = &comment["data"];
 			let replies: Vec<Comment> = if data["replies"].is_object() {
-				parse_comments(&data["replies"], post_link, post_author, highlighted_comment, filters, req)
+				parse_comments(&data["replies"], post_link, post_author, highlighted_comment, filters, prefs)
 			} else {
 				Vec::new()
 			};
-			build_comment(&comment, data, replies, post_link, post_author, highlighted_comment, filters, req)
+			build_comment(&comment, data, replies, post_link, post_author, highlighted_comment, filters, prefs)
 		})
 		.collect()
 }
@@ -233,7 +235,7 @@ fn query_comments(
 	highlighted_comment: &str,
 	filters: &HashSet<String>,
 	query: &str,
-	req: &Request<Body>,
+	prefs: &Preferences,
 ) -> Vec<Comment> {
 	let comments = json["data"]["children"].as_array().map_or(Vec::new(), std::borrow::ToOwned::to_owned);
 	let mut results = Vec::new();
@@ -243,10 +245,10 @@ fn query_comments(
 
 		// If this comment contains replies, handle those too
 		if data["replies"].is_object() {
-			results.append(&mut query_comments(&data["replies"], post_link, post_author, highlighted_comment, filters, query, req));
+			results.append(&mut query_comments(&data["replies"], post_link, post_author, highlighted_comment, filters, query, prefs));
 		}
 
-		let c = build_comment(&comment, data, Vec::new(), post_link, post_author, highlighted_comment, filters, req);
+		let c = build_comment(&comment, data, Vec::new(), post_link, post_author, highlighted_comment, filters, prefs);
 		if c.body.to_lowercase().contains(&query.to_lowercase()) {
 			results.push(c);
 		}
@@ -273,7 +275,7 @@ fn build_comment(
 	post_author: &str,
 	highlighted_comment: &str,
 	filters: &HashSet<String>,
-	req: &Request<Body>,
+	prefs: &Preferences,
 ) -> Comment {
 	let id = val(comment, "id");
 
@@ -365,13 +367,13 @@ fn build_comment(
 		is_filtered,
 		more_count,
 		more_href,
-		prefs: Preferences::new(req),
+		prefs: prefs.clone(),
 	}
 }
 
 #[cfg(test)]
 mod comment_cookie_tests {
-	use super::parse_comments;
+	use super::{parse_comments, Preferences};
 	use crate::body::Body;
 	use hyper::Request;
 	use std::collections::HashSet;
@@ -391,7 +393,8 @@ mod comment_cookie_tests {
 		let (done, finished) = mpsc::channel();
 		std::thread::spawn(move || {
 			let req = Request::builder().uri("/").header("Cookie", cookies).body(Body::empty()).unwrap();
-			done.send(parse_comments(&json, "/r/x/comments/1/t/", "a", "", &HashSet::new(), &req).len()).unwrap();
+			let prefs = Preferences::new(&req);
+			done.send(parse_comments(&json, "/r/x/comments/1/t/", "a", "", &HashSet::new(), &prefs).len()).unwrap();
 		});
 		let count = finished.recv_timeout(Duration::from_secs(10)).expect("parse_comments took longer than 10 s");
 		assert_eq!(count, 300);
